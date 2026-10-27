@@ -4136,6 +4136,14 @@ void SelectionDAGBuilder::visitPtrToAddr(const User &I) {
   // By definition the type of the ptrtoaddr must be equal to the address type.
   const auto &TLI = DAG.getTargetLoweringInfo();
   EVT AddrVT = TLI.getValueType(DAG.getDataLayout(), I.getType());
+  if (N.getValueType().isFatPointer()) {
+    // CHERI capabilities are modelled as fat-pointer MVTs (e.g. c64), which
+    // cannot be TRUNCATEd. The address is the low index-width bits, which is
+    // exactly what the target's PTRTOINT lowering already produces for
+    // pure-capability ABIs (an address read, no provenance exposure).
+    setValue(&I, DAG.getNode(ISD::PTRTOINT, getCurSDLoc(), AddrVT, N));
+    return;
+  }
   // The address width must be smaller or equal to the pointer representation
   // width, so we lower ptrtoaddr as a truncate (possibly folded to a no-op).
   N = DAG.getNode(ISD::TRUNCATE, getCurSDLoc(), AddrVT, N);
