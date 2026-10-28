@@ -13,7 +13,7 @@ declare ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(20
 ; OFF-LABEL: @proven_md(
 ; OFF: call {{.*}}@llvm.cheri.cap.bounds.set.i64(
 define i64 @proven_md(ptr addrspace(200) %p, i64 %n, i64 %i) {
-  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n), !cheri.access_narrow !0, !mem.alloc_inbounds !0, !mem.checked !0
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n) [ "mem.checked"(ptr addrspace(200) %p, i64 %n) ], !cheri.access_narrow !0, !mem.alloc_inbounds !0
   %g = getelementptr inbounds i64, ptr addrspace(200) %c, i64 %i
   %v = load i64, ptr addrspace(200) %g
   ret i64 %v
@@ -24,7 +24,7 @@ define i64 @proven_md(ptr addrspace(200) %p, i64 %n, i64 %i) {
 ; CHECK-NOT: bounds.set
 define i64 @proven_arg(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %i) {
   %row = getelementptr inbounds i8, ptr addrspace(200) %p, i64 32
-  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %row, i64 32), !cheri.access_narrow !0, !mem.checked !0
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %row, i64 32) [ "mem.checked"(ptr addrspace(200) %row, i64 32) ], !cheri.access_narrow !0
   %g = getelementptr inbounds i64, ptr addrspace(200) %c, i64 %i
   %v = load i64, ptr addrspace(200) %g
   ret i64 %v
@@ -35,7 +35,7 @@ define i64 @proven_arg(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %i) {
 ; CHECK: bounds.set.exact
 define i64 @plain_gep_kept(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %o) {
   %row = getelementptr i8, ptr addrspace(200) %p, i64 %o
-  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %row, i64 32), !cheri.access_narrow !0, !mem.checked !0
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %row, i64 32) [ "mem.checked"(ptr addrspace(200) %row, i64 32) ], !cheri.access_narrow !0
   %v = load i64, ptr addrspace(200) %c
   ret i64 %v
 }
@@ -55,7 +55,7 @@ define i64 @sole_check_kept(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %i) 
 ; CHECK-LABEL: @checked_only_kept(
 ; CHECK: bounds.set
 define i64 @checked_only_kept(ptr addrspace(200) %p, i64 %n) {
-  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n), !cheri.access_narrow !0, !mem.checked !0
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n) [ "mem.checked"(ptr addrspace(200) %p, i64 %n) ], !cheri.access_narrow !0
   %v = load i64, ptr addrspace(200) %c
   ret i64 %v
 }
@@ -67,5 +67,31 @@ define ptr addrspace(200) @alloc_level_kept(ptr addrspace(200) "mem.alloc_inboun
   %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %p, i64 64), !mem.alloc_inbounds !0
   ret ptr addrspace(200) %c
 }
+
+
+; Legacy operand-less !mem.checked on a narrow is not a proof: kept.
+; CHECK-LABEL: @legacy_md_kept(
+; CHECK: bounds.set
+define i64 @legacy_md_kept(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %n) {
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n), !cheri.access_narrow !0, !mem.checked !0
+  %v = load i64, ptr addrspace(200) %c
+  ret i64 %v
+}
+
+; Bundle inconsistent with the narrow (checks a different length): kept, and
+; the bundle is stripped from the kept call (replaced by !mem.checked !{}).
+; CHECK-LABEL: @inconsistent_kept(
+; CHECK: call {{.*}}bounds.set.i64(ptr addrspace(200) %p, i64 %n), !cheri.access_narrow !0, !mem.checked !0
+; CHECK-NOT: "mem.checked"
+define i64 @inconsistent_kept(ptr addrspace(200) "mem.alloc_inbounds" %p, i64 %n, i64 %m) {
+  %c = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 %n) [ "mem.checked"(ptr addrspace(200) %p, i64 %m) ], !cheri.access_narrow !0
+  %v = load i64, ptr addrspace(200) %c
+  ret i64 %v
+}
+
+; OFF (stronger mode): proven narrows stay, bundle stripped.
+; OFF-LABEL: @proven_arg(
+; OFF: call {{.*}}bounds.set.exact.i64(ptr addrspace(200) %row, i64 32), !cheri.access_narrow !0, !mem.checked !0
+; OFF-NOT: "mem.checked"(
 
 !0 = !{}
