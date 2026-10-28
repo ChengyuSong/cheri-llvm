@@ -178,8 +178,11 @@ void InstCombiner::IRBuilderInstCombineInserter::InsertHelper(
 
 std::optional<Instruction *>
 InstCombiner::targetInstCombineIntrinsic(IntrinsicInst &II) {
-  // Handle target specific intrinsics
-  if (II.getCalledFunction()->isTargetIntrinsic()) {
+  // Handle target specific intrinsics. CHERI: the capability format is target
+  // specific, so the target also folds the generic CRRL/CRAM intrinsics.
+  if (II.getCalledFunction()->isTargetIntrinsic() ||
+      II.getIntrinsicID() == Intrinsic::cheri_round_representable_length ||
+      II.getIntrinsicID() == Intrinsic::cheri_representable_alignment_mask) {
     return TTIForTargetIntrinsicsOnly.instCombineIntrinsic(*this, II);
   }
   return std::nullopt;
@@ -3874,6 +3877,10 @@ isAllocSiteRemovable(Instruction *AI, SmallVectorImpl<Instruction *> &Users,
           case Intrinsic::launder_invariant_group:
           case Intrinsic::strip_invariant_group:
           case Intrinsic::cheri_cap_address_get:
+          // CHERI: narrowing the bounds of the allocation does not escape it;
+          // the bounded capability may be compared, accessed or freed.
+          case Intrinsic::cheri_cap_bounds_set:
+          case Intrinsic::cheri_cap_bounds_set_exact:
             Users.emplace_back(I);
             Worklist.push_back(I);
             continue;
