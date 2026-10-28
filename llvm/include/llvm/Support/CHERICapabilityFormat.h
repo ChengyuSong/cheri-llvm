@@ -55,6 +55,9 @@ struct RVYCapabilityFormat
 
 private:
   LLVM_ABI static AddressType getAlignmentMaskImpl(uint64_t Length);
+  /// Alignment mask for the exponent of \p Length itself, without accounting
+  /// for a carry when the length is rounded up.
+  static AddressType getAlignmentMaskForExponentOf(uint64_t Length);
 };
 
 using RV32YCapabilityFormat = RVYCapabilityFormat<uint32_t, 10, 24>;
