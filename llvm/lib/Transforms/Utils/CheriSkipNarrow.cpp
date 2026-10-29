@@ -120,12 +120,15 @@ static bool isAllocBoundedCap(const Value *V, SmallPtrSetImpl<const Value *> &Se
     switch (II->getIntrinsicID()) {
     case Intrinsic::cheri_cap_address_set:
     case Intrinsic::cheri_cap_offset_set:
+    case Intrinsic::ptrmask:
+      return isAllocBoundedCap(II->getArgOperand(0), Seen, Depth + 1);
     case Intrinsic::cheri_cap_bounds_set:
     case Intrinsic::cheri_cap_bounds_set_exact:
-    case Intrinsic::ptrmask:
-      // Look through prior setbounds (e.g. stack/heap allocation bound) so a
-      // later contract_narrow on a GEP of that capability can discharge.
-      return isAllocBoundedCap(II->getArgOperand(0), Seen, Depth + 1);
+      // The result of setbounds is itself allocation-bounded (bounds have been
+      // established). A later contract_narrow on a GEP of it is redundant under
+      // the allocation-level threat model. Do NOT look through to the operand:
+      // that may be an untrusted alloc/load, but the setbounds result is not.
+      return true;
     default:
       return false;
     }

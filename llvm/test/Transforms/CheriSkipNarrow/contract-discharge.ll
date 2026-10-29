@@ -117,4 +117,20 @@ define i64 @through_alloc_bound() {
   ret i64 %v
 }
 
+
+; Heap alloc + setbounds.exact (no MD), like CheriBoundedAlloc: setbounds result
+; is the proof, so the contract_narrow on a GEP discharges.
+; CHECK-LABEL: @through_heap_bound(
+; CHECK: bounds.set.exact
+; CHECK-NOT: !cheri.contract_narrow
+; CHECK: ret
+define i64 @through_heap_bound() {
+  %c = call ptr addrspace(200) @source()
+  %b = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %c, i64 24)
+  %p = getelementptr i64, ptr addrspace(200) %b, i64 1
+  %q = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 8), !cheri.contract_narrow !0, !mem.alloc_inbounds !0
+  %v = load i64, ptr addrspace(200) %q
+  ret i64 %v
+}
+
 !0 = !{}
