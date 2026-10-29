@@ -48,20 +48,20 @@ target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S
 ; CHECK-NOT: @s.slice =
 ; CHECK-NOT: @a.slice_u64 =
 
-; RS_SLICE(1, 2, uint64_t): spatial + trusted, borrow for the call.
-; CHECK: declare i64 @c_sum(ptr addrspace(200) noalias nofree noundef nonnull readonly align 8 captures(none) "mem.alloc_inbounds" "mem.range"="1:8", i64 noundef range(i64 0, 1152921504606846976)) addrspace(200) [[SUM:#[0-9]+]]
+; RS_SLICE(1, 2, uint64_t): spatial + trusted, borrow for the call (address may escape, provenance not).
+; CHECK: declare i64 @c_sum(ptr addrspace(200) noalias nofree noundef nonnull readonly align 8 captures(address) "mem.alloc_inbounds" "mem.range"="1:8", i64 noundef range(i64 0, 1152921504606846976)) addrspace(200) [[SUM:#[0-9]+]]
 ; SPATIAL: declare i64 @c_sum(ptr addrspace(200) nonnull align 8 "mem.alloc_inbounds" "mem.range"="1:8", i64 range(i64 0, 1152921504606846976))
 declare i64 @c_sum(ptr addrspace(200), i64)
 ; RS_SLICE_MUT(1, 2, uint8_t): noalias, no readonly; u8 length range is [0, 2^63).
-; CHECK: declare void @c_fill(ptr addrspace(200) noalias nofree noundef nonnull captures(none) "mem.alloc_inbounds" "mem.range"="1:1", i64 noundef range(i64 0, -9223372036854775808))
+; CHECK: declare void @c_fill(ptr addrspace(200) noalias nofree noundef nonnull captures(address) "mem.alloc_inbounds" "mem.range"="1:1", i64 noundef range(i64 0, -9223372036854775808))
 ; SPATIAL: declare void @c_fill(ptr addrspace(200) nonnull "mem.alloc_inbounds" "mem.range"="1:1", i64 range(i64 0, -9223372036854775808))
 declare void @c_fill(ptr addrspace(200), i64)
 ; RS_REF(1, uint32_t)
-; CHECK: declare i32 @c_peek(ptr addrspace(200) noalias nofree noundef nonnull readonly align 4 captures(none) dereferenceable(4) "mem.alloc_inbounds")
+; CHECK: declare i32 @c_peek(ptr addrspace(200) noalias nofree noundef nonnull readonly align 4 captures(address) dereferenceable(4) "mem.alloc_inbounds")
 ; SPATIAL: declare i32 @c_peek(ptr addrspace(200) nonnull align 4 dereferenceable(4) "mem.alloc_inbounds")
 declare i32 @c_peek(ptr addrspace(200))
 ; RS_REF_MUT(1, pair_t)
-; CHECK: declare void @c_bump(ptr addrspace(200) noalias nofree noundef nonnull align 8 captures(none) dereferenceable(16) "mem.alloc_inbounds")
+; CHECK: declare void @c_bump(ptr addrspace(200) noalias nofree noundef nonnull align 8 captures(address) dereferenceable(16) "mem.alloc_inbounds")
 ; SPATIAL: declare void @c_bump(ptr addrspace(200) nonnull align 8 dereferenceable(16) "mem.alloc_inbounds")
 declare void @c_bump(ptr addrspace(200))
 ; RS_BOX(1, pair_t): ownership moves; no dereferenceable, nofree or captures.
@@ -69,14 +69,14 @@ declare void @c_bump(ptr addrspace(200))
 ; SPATIAL: declare void @c_drop_box(ptr addrspace(200) nonnull align 8 "mem.alloc_inbounds")
 declare void @c_drop_box(ptr addrspace(200))
 ; RS_CSTR(1)
-; CHECK: declare i64 @c_strlen(ptr addrspace(200) noalias nofree noundef nonnull readonly captures(none) "mem.alloc_inbounds" "mem.cstr")
+; CHECK: declare i64 @c_strlen(ptr addrspace(200) noalias nofree noundef nonnull readonly captures(address) "mem.alloc_inbounds" "mem.cstr")
 ; SPATIAL: declare i64 @c_strlen(ptr addrspace(200) nonnull "mem.alloc_inbounds" "mem.cstr")
 declare i64 @c_strlen(ptr addrspace(200))
 ; RS_REF(1, uint32_t) RS_KEEP(1): retained, only the frozen-shared read claim.
 ; CHECK: declare void @c_register(ptr addrspace(200) noalias nofree noundef nonnull readonly align 4 captures(address, read_provenance) dereferenceable(4) "mem.alloc_inbounds")
 declare void @c_register(ptr addrspace(200))
 ; RS_SLICE(1,2,uint8_t) RS_RET_REF(uint8_t) RS_RET_BORROWS(1)
-; CHECK: declare noundef nonnull "mem.alloc_inbounds" ptr addrspace(200) @c_first(ptr addrspace(200) noalias nofree noundef nonnull readonly captures(ret: address, provenance) "mem.alloc_inbounds" "mem.range"="1:1", i64 noundef range(i64 0, -9223372036854775808)) addrspace(200) [[FIRST:#[0-9]+]]
+; CHECK: declare noundef nonnull "mem.alloc_inbounds" ptr addrspace(200) @c_first(ptr addrspace(200) noalias nofree noundef nonnull readonly captures(address, ret: address, provenance) "mem.alloc_inbounds" "mem.range"="1:1", i64 noundef range(i64 0, -9223372036854775808)) addrspace(200) [[FIRST:#[0-9]+]]
 ; SPATIAL: declare nonnull "mem.alloc_inbounds" ptr addrspace(200) @c_first(ptr addrspace(200) nonnull "mem.alloc_inbounds" "mem.range"="1:1", i64 range(i64 0, -9223372036854775808))
 declare ptr addrspace(200) @c_first(ptr addrspace(200), i64)
 ; RS_RET_SLICE(1, uint32_t): extent of the return is arg 0 elements of 4 bytes.

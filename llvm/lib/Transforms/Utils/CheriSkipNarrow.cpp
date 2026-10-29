@@ -474,14 +474,17 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
                          Ctx, CaptureInfo(CaptureComponents::Address |
                                           CaptureComponents::ReadProvenance)));
       } else if (RetBorrowSet.contains(Ip)) {
+        // Tied to the return: only the address escapes otherwise (as rustc).
         F->addParamAttr(ArgNo, Attribute::getWithCaptureInfo(
-                                   Ctx, CaptureInfo::retOnly(
-                                            CaptureComponents::Address |
-                                            CaptureComponents::Provenance)));
+                                   Ctx, CaptureInfo(CaptureComponents::Address,
+                                                    CaptureComponents::Address |
+                                                        CaptureComponents::Provenance)));
       } else {
-        // Borrow for the call only: the lifetime ends with the call.
-        F->addParamAttr(ArgNo,
-                        Attribute::getWithCaptureInfo(Ctx, CaptureInfo::none()));
+        // Borrow for the call only: the lifetime ends with the call, so the
+        // provenance cannot escape; the address may (a Rust callee may store
+        // `p as usize`). M3.2: matches rustc's lifetime-derived claim.
+        F->addParamAttr(ArgNo, Attribute::getWithCaptureInfo(
+                                   Ctx, CaptureInfo(CaptureComponents::Address)));
       }
     }
     F->addFnAttr("mem.contract", Canon);
