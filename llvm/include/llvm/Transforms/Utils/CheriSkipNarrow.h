@@ -60,6 +60,23 @@ struct MemAnnotateCPass : PassInfoMixin<MemAnnotateCPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static bool isRequired() { return true; }
 };
+
+/// M3.1: lowers the C header mirror of the Rust type contracts
+/// (mem_contract.h: RS_SLICE, RS_SLICE_MUT, RS_REF, RS_REF_MUT, RS_BOX,
+/// RS_CSTR, RS_RET_*, RS_KEEP, RS_RET_BORROWS). They are function-level
+/// annotate("mem.contract.<kind>", idx..., sizeof(T), _Alignof(T)) entries in
+/// @llvm.global.annotations (C indices 1-based, 0 = return). Each contract
+/// becomes its spatial IR facts ("mem.alloc_inbounds", nonnull, align,
+/// dereferenceable, "mem.range", len range, "mem.cstr") and, unless
+/// -mem-contract-spatial-only, its trusted facts (noundef, noalias, readonly,
+/// captures derived from the lifetime modifiers, "mem.box_family"). The
+/// function also gets a canonical "mem.contract" attribute (0-based indices)
+/// and the consumed annotation entries are removed. Works on declarations
+/// and definitions.
+struct MemContractCPass : PassInfoMixin<MemContractCPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
 } // namespace llvm
 
 #endif
