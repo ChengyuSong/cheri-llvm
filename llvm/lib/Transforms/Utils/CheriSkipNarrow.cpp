@@ -120,7 +120,11 @@ static bool isAllocBoundedCap(const Value *V, SmallPtrSetImpl<const Value *> &Se
     switch (II->getIntrinsicID()) {
     case Intrinsic::cheri_cap_address_set:
     case Intrinsic::cheri_cap_offset_set:
+    case Intrinsic::cheri_cap_bounds_set:
+    case Intrinsic::cheri_cap_bounds_set_exact:
     case Intrinsic::ptrmask:
+      // Look through prior setbounds (e.g. stack/heap allocation bound) so a
+      // later contract_narrow on a GEP of that capability can discharge.
       return isAllocBoundedCap(II->getArgOperand(0), Seen, Depth + 1);
     default:
       return false;

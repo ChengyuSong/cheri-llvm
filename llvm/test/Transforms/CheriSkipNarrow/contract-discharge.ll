@@ -7,6 +7,7 @@
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
 declare ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200), i64)
+declare ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200), i64)
 declare ptr addrspace(200) @source()
 @g = addrspace(200) global [4 x i64] zeroinitializer
 
@@ -96,6 +97,21 @@ b:
   br label %m
 m:
   %p = phi ptr addrspace(200) [ %s, %a ], [ %raw, %b ]
+  %q = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 8), !cheri.contract_narrow !0, !mem.alloc_inbounds !0
+  %v = load i64, ptr addrspace(200) %q
+  ret i64 %v
+}
+
+; Prior allocation-bound setbounds (no MD) on an alloca: look through and discharge.
+; The exact allocation bound stays; only the contract_narrow is removed.
+; CHECK-LABEL: @through_alloc_bound(
+; CHECK: bounds.set.exact
+; CHECK-NOT: !cheri.contract_narrow
+; CHECK: ret
+define i64 @through_alloc_bound() {
+  %a = alloca [4 x i64], addrspace(200)
+  %b = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %a, i64 32)
+  %p = getelementptr i64, ptr addrspace(200) %b, i64 1
   %q = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) %p, i64 8), !cheri.contract_narrow !0, !mem.alloc_inbounds !0
   %v = load i64, ptr addrspace(200) %q
   ret i64 %v
