@@ -417,8 +417,10 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
         addAt(*F, ArgNo, IsRet,
               Attribute::getWithAlignment(Ctx, llvm::Align(Align)));
       // Box: no dereferenceable (the callee may free it; rustc omits it too).
+      // Returns: none either; rustc ties dereferenceable to nofree, which is
+      // not valid on returns (M3.2: the Rust declaration is the reference).
       if (!IsSlice && C.Kind != CKind::CStr && C.Kind != CKind::Box &&
-          Size > 0)
+          !IsRet && Size > 0)
         addAt(*F, ArgNo, IsRet,
               Attribute::getWithDereferenceableBytes(Ctx, Size));
       if (C.Kind == CKind::CStr)
