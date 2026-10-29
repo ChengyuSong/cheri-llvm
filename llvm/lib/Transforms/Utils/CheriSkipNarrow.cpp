@@ -8,6 +8,7 @@
 #include "llvm/Transforms/Utils/CheriSkipNarrow.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -67,6 +68,103 @@ static bool isAllocInboundsBase(const Value *V) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// M3.3 conversion narrows (LLM-generated). rustc emits a raw->typed conversion
+// (from_raw_parts, &*p, Box::from_raw, C return values, ...) as
+//   %q = llvm.cheri.cap.bounds.set(%p, bytes), !cheri.contract_narrow, !mem.alloc_inbounds
+// The narrow is redundant -- *discharged* -- when %p is provably bounded to one
+// allocation already (allocation-level threat model): then %q is replaced by %p.
+// Proof sources (rustc-proven only; a stated `requires` is not one):
+//  - an argument with "mem.alloc_inbounds" (typed Rust-ABI parameter),
+//  - an instruction rustc tagged !mem.alloc_inbounds (access/entry/conversion
+//    narrows, trusted call results),
+//  - an alloca or a global variable (bounded by the CHERI backend / capreloc),
+// propagated through GEPs, phis, selects and bounds-preserving cheri intrinsics.
+// Loads and untagged call results are never proofs.
+// ---------------------------------------------------------------------------
+STATISTIC(NumContractSeen, "Conversion narrows seen");
+STATISTIC(NumContractDischarged, "Conversion narrows discharged from provenance");
+
+static cl::opt<bool> EnableContractDischarge(
+    "cheri-contract-discharge", cl::init(true), cl::Hidden,
+    cl::desc("Remove !cheri.contract_narrow conversion narrows whose operand is "
+             "provably allocation-bounded (also off with -cheri-skip-narrow=false)"));
+
+static bool isAllocBoundedCap(const Value *V, SmallPtrSetImpl<const Value *> &Seen,
+                              unsigned Depth) {
+  if (Depth > 32)
+    return false;
+  V = V->stripPointerCasts();
+  if (!Seen.insert(V).second)
+    return true; // a cycle through phis: optimistic, every other input is checked
+  if (const auto *A = dyn_cast<Argument>(V))
+    return A->getParent()->getAttributes().hasParamAttr(A->getArgNo(),
+                                                        "mem.alloc_inbounds");
+  if (isa<AllocaInst>(V) || isa<GlobalVariable>(V))
+    return true;
+  if (const auto *I = dyn_cast<Instruction>(V))
+    if (I->getMetadata("mem.alloc_inbounds"))
+      return true;
+  if (const auto *GEP = dyn_cast<GEPOperator>(V))
+    return isAllocBoundedCap(GEP->getPointerOperand(), Seen, Depth + 1);
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    for (const Value *In : PN->incoming_values())
+      if (!isAllocBoundedCap(In, Seen, Depth + 1))
+        return false;
+    return true;
+  }
+  if (const auto *SI = dyn_cast<SelectInst>(V))
+    return isAllocBoundedCap(SI->getTrueValue(), Seen, Depth + 1) &&
+           isAllocBoundedCap(SI->getFalseValue(), Seen, Depth + 1);
+  if (const auto *II = dyn_cast<IntrinsicInst>(V)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::cheri_cap_address_set:
+    case Intrinsic::cheri_cap_offset_set:
+    case Intrinsic::ptrmask:
+      return isAllocBoundedCap(II->getArgOperand(0), Seen, Depth + 1);
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+/// Discharge the conversion narrows of F. Returns whether anything changed.
+static bool dischargeContractNarrows(Function &F) {
+  SmallVector<IntrinsicInst *, 8> ToRemove;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      auto *II = dyn_cast<IntrinsicInst>(&I);
+      if (!II || !II->getMetadata("cheri.contract_narrow"))
+        continue;
+      Intrinsic::ID ID = II->getIntrinsicID();
+      if (ID != Intrinsic::cheri_cap_bounds_set &&
+          ID != Intrinsic::cheri_cap_bounds_set_exact)
+        continue;
+      ++NumContractSeen;
+      SmallPtrSet<const Value *, 16> Seen;
+      Seen.insert(II); // a phi cycle back through the narrow itself proves nothing
+      if (isAllocBoundedCap(II->getArgOperand(0), Seen, 0))
+        ToRemove.push_back(II);
+    }
+  for (IntrinsicInst *II : ToRemove) {
+    LLVM_DEBUG(dbgs() << "cheri-contract-discharge: removing " << *II << "\n");
+    II->replaceAllUsesWith(II->getArgOperand(0));
+    II->eraseFromParent();
+    ++NumContractDischarged;
+  }
+  return !ToRemove.empty();
+}
+
+PreservedAnalyses CheriContractDischargePass::run(Function &F,
+                                                  FunctionAnalysisManager &) {
+  if (!EnableSkipNarrow || !EnableContractDischarge || !dischargeContractNarrows(F))
+    return PreservedAnalyses::all();
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
+}
+
 /// The "mem.checked"(B, L) bundle, if present and consistent with the narrow.
 static bool hasConsistentChecked(const CallBase &CB) {
   auto B = CB.getOperandBundle(CheckedTag);
@@ -78,6 +176,8 @@ static bool hasConsistentChecked(const CallBase &CB) {
 
 PreservedAnalyses CheriSkipNarrowPass::run(Function &F,
                                            FunctionAnalysisManager &) {
+  bool Discharged =
+      EnableSkipNarrow && EnableContractDischarge && dischargeContractNarrows(F);
   SmallVector<IntrinsicInst *, 8> ToRemove, ToStrip;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
@@ -122,7 +222,7 @@ PreservedAnalyses CheriSkipNarrowPass::run(Function &F,
       II->eraseFromParent();
     }
   }
-  if (ToRemove.empty() && ToStrip.empty())
+  if (ToRemove.empty() && ToStrip.empty() && !Discharged)
     return PreservedAnalyses::all();
   PreservedAnalyses PA;
   PA.preserveSet<CFGAnalyses>();

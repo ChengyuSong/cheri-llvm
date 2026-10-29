@@ -56,6 +56,14 @@ struct CheriSkipNarrowPass : PassInfoMixin<CheriSkipNarrowPass> {
 /// (pointer in a non-zero address space) or the identity elsewhere, and
 /// llvm.var.annotation(..., "mem.alloc_inbounds") on a parameter's spill slot
 /// becomes the "mem.alloc_inbounds" parameter attribute.
+/// M3.3: discharge `!cheri.contract_narrow` conversion narrows whose operand is
+/// provably allocation-bounded (rustc-proven provenance). Run late, after inlining
+/// and SROA; CheriSkipNarrowPass does the same at pipeline start.
+struct CheriContractDischargePass : PassInfoMixin<CheriContractDischargePass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  static bool isRequired() { return true; }
+};
+
 struct MemAnnotateCPass : PassInfoMixin<MemAnnotateCPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static bool isRequired() { return true; }
