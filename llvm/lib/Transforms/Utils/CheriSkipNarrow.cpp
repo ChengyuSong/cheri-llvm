@@ -336,7 +336,7 @@ static cl::opt<bool> ContractSpatialOnly(
              "readonly, captures, mem.box_family)"));
 
 namespace {
-enum class CKind { Slice, SliceMut, Ref, RefMut, Box, CStr, Keep, RetBorrows };
+enum class CKind { Slice, SliceMut, Ref, RefMut, Box, CStr, Keep, RetBorrows, ChecksTag };
 
 struct Contract {
   CKind Kind;
@@ -353,6 +353,7 @@ std::optional<CKind> parseKind(StringRef S) {
       .Case("cstr", CKind::CStr)
       .Case("keep", CKind::Keep)
       .Case("ret_borrows", CKind::RetBorrows)
+      .Case("checks_tag", CKind::ChecksTag)
       .Default(std::nullopt);
 }
 
@@ -366,6 +367,7 @@ const char *kindName(CKind K) {
   case CKind::CStr: return "cstr";
   case CKind::Keep: return "keep";
   case CKind::RetBorrows: return "ret_borrows";
+  case CKind::ChecksTag: return "checks_tag";
   }
   llvm_unreachable("kind");
 }
@@ -380,6 +382,7 @@ unsigned expectedArgs(CKind K) {
   case CKind::CStr:
   case CKind::Keep:
   case CKind::RetBorrows: return 1; // ip
+  case CKind::ChecksTag: return 4; // ip, tag offset, tag size, expected value
   }
   llvm_unreachable("kind");
 }
@@ -461,7 +464,10 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
     auto &Cs = KV.second;
     FunctionType *FT = F->getFunctionType();
     SmallSet<unsigned, 4> KeepSet, RetBorrowSet;
+    bool HasChecksTag = false;
     for (const Contract &C : Cs) {
+      if (C.Kind == CKind::ChecksTag)
+        HasChecksTag = true;
       if (C.Kind == CKind::Keep)
         KeepSet.insert(C.Args[0]);
       if (C.Kind == CKind::RetBorrows)
@@ -488,6 +494,16 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
       Canon += kindName(C.Kind);
       Canon += "(";
       Canon += IsRet ? std::string("ret") : std::to_string(ArgNo);
+      if (C.Kind == CKind::ChecksTag) {
+        // M4.0 typed accessor: the function reads the tag at (param + off,
+        // size bytes) and returns its typed pointer only when it equals the
+        // expected value (else NULL / trap). A claim about the body, verified
+        // by mc-check --verify-tag; no IR facts.
+        Canon += "," + std::to_string(C.Args[1]) + "," +
+                 std::to_string(C.Args[2]) + "," + std::to_string(C.Args[3]) +
+                 ")";
+        continue;
+      }
       if (C.Kind == CKind::Keep || C.Kind == CKind::RetBorrows) {
         Canon += ")";
         continue; // modifiers: consumed by the captures rule below
@@ -519,7 +535,10 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
 
       // Spatial part: what CHERI can establish and enforce (narrow-once).
       addAt(*F, ArgNo, IsRet, Attribute::get(Ctx, "mem.alloc_inbounds"));
-      addAt(*F, ArgNo, IsRet, Attribute::get(Ctx, Attribute::NonNull));
+      // M4.0: a tag-checking accessor returns NULL on mismatch, so its return
+      // is ref-or-null (Rust: Option<&T>), not nonnull.
+      if (!(IsRet && HasChecksTag))
+        addAt(*F, ArgNo, IsRet, Attribute::get(Ctx, Attribute::NonNull));
       if (Align > 1 && isPowerOf2_64(Align))
         addAt(*F, ArgNo, IsRet,
               Attribute::getWithAlignment(Ctx, llvm::Align(Align)));
