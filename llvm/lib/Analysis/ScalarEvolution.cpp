@@ -7691,6 +7691,12 @@ ScalarEvolution::getLoopProperties(const Loop *L) {
       if (isa<MemIntrinsic>(I) && !I->isVolatile())
         return false;
 
+      // [LLM-generated] M5r: llvm.mem.fact annotations are not side effects
+      // for forward progress either.
+      if (auto *II = dyn_cast<IntrinsicInst>(I);
+          II && II->getIntrinsicID() == Intrinsic::mem_fact)
+        return false;
+
       return I->mayWriteToMemory();
     };
 

@@ -512,6 +512,196 @@ loop:
 exit:
   ret float %max.next
 }
+
+; Parallel loop (llvm.loop.parallel_accesses): the fact has no access group
+; and must not make the loop non-parallel.
+define void @parallel(ptr %a, ptr %idx, i64 %n) {
+; LV-LABEL: define void @parallel(
+; LV-SAME: ptr [[A:%.*]], ptr [[IDX:%.*]], i64 [[N:%.*]]) {
+; LV-NEXT:  [[ENTRY:.*]]:
+; LV-NEXT:    [[TMP0:%.*]] = call i64 @llvm.umax.i64(i64 [[N]], i64 1)
+; LV-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[TMP0]], 4
+; LV-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]
+; LV:       [[VECTOR_PH]]:
+; LV-NEXT:    [[N_MOD_VF:%.*]] = urem i64 [[TMP0]], 4
+; LV-NEXT:    [[N_VEC:%.*]] = sub i64 [[TMP0]], [[N_MOD_VF]]
+; LV-NEXT:    br label %[[VECTOR_BODY:.*]]
+; LV:       [[VECTOR_BODY]]:
+; LV-NEXT:    [[INDEX:%.*]] = phi i64 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]
+; LV-NEXT:    [[TMP1:%.*]] = add i64 [[INDEX]], 1
+; LV-NEXT:    [[TMP2:%.*]] = add i64 [[INDEX]], 2
+; LV-NEXT:    [[TMP3:%.*]] = add i64 [[INDEX]], 3
+; LV-NEXT:    [[TMP4:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[INDEX]]
+; LV-NEXT:    [[TMP5:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[TMP1]]
+; LV-NEXT:    [[TMP6:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[TMP2]]
+; LV-NEXT:    [[TMP7:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[TMP3]]
+; LV-NEXT:    [[TMP8:%.*]] = load i64, ptr [[TMP4]], align 8, !llvm.access.group [[ACC_GRP9:![0-9]+]]
+; LV-NEXT:    [[TMP9:%.*]] = load i64, ptr [[TMP5]], align 8, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[TMP10:%.*]] = load i64, ptr [[TMP6]], align 8, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[TMP11:%.*]] = load i64, ptr [[TMP7]], align 8, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[TMP12:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP8]]
+; LV-NEXT:    [[TMP13:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP9]]
+; LV-NEXT:    [[TMP14:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP10]]
+; LV-NEXT:    [[TMP15:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP11]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP12]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP13]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP14]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP15]], i64 4, i64 0) ]
+; LV-NEXT:    store i32 1, ptr [[TMP12]], align 4, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    store i32 1, ptr [[TMP13]], align 4, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    store i32 1, ptr [[TMP14]], align 4, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    store i32 1, ptr [[TMP15]], align 4, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[INDEX]], 4
+; LV-NEXT:    [[TMP16:%.*]] = icmp eq i64 [[INDEX_NEXT]], [[N_VEC]]
+; LV-NEXT:    br i1 [[TMP16]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP10:![0-9]+]]
+; LV:       [[MIDDLE_BLOCK]]:
+; LV-NEXT:    [[CMP_N:%.*]] = icmp eq i64 [[TMP0]], [[N_VEC]]
+; LV-NEXT:    br i1 [[CMP_N]], label %[[EXIT:.*]], label %[[SCALAR_PH]]
+; LV:       [[SCALAR_PH]]:
+; LV-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i64 [ [[N_VEC]], %[[MIDDLE_BLOCK]] ], [ 0, %[[ENTRY]] ]
+; LV-NEXT:    br label %[[LOOP:.*]]
+; LV:       [[LOOP]]:
+; LV-NEXT:    [[I:%.*]] = phi i64 [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ], [ [[I1:%.*]], %[[LOOP]] ]
+; LV-NEXT:    [[PI:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[I]]
+; LV-NEXT:    [[J:%.*]] = load i64, ptr [[PI]], align 8, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[PA:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[J]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[PA]], i64 4, i64 0) ]
+; LV-NEXT:    store i32 1, ptr [[PA]], align 4, !llvm.access.group [[ACC_GRP9]]
+; LV-NEXT:    [[I1]] = add nuw nsw i64 [[I]], 1
+; LV-NEXT:    [[C:%.*]] = icmp ult i64 [[I1]], [[N]]
+; LV-NEXT:    br i1 [[C]], label %[[LOOP]], label %[[EXIT]], !llvm.loop [[LOOP12:![0-9]+]]
+; LV:       [[EXIT]]:
+; LV-NEXT:    ret void
+;
+; SLP-LABEL: define void @parallel(
+; SLP-SAME: ptr [[A:%.*]], ptr [[IDX:%.*]], i64 [[N:%.*]]) {
+; SLP-NEXT:  [[ENTRY:.*]]:
+; SLP-NEXT:    br label %[[LOOP:.*]]
+; SLP:       [[LOOP]]:
+; SLP-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[LOOP]] ]
+; SLP-NEXT:    [[PI:%.*]] = getelementptr inbounds i64, ptr [[IDX]], i64 [[I]]
+; SLP-NEXT:    [[J:%.*]] = load i64, ptr [[PI]], align 8, !llvm.access.group [[ACC_GRP0:![0-9]+]]
+; SLP-NEXT:    [[PA:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[J]]
+; SLP-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[PA]], i64 4, i64 0) ]
+; SLP-NEXT:    store i32 1, ptr [[PA]], align 4, !llvm.access.group [[ACC_GRP0]]
+; SLP-NEXT:    [[I1]] = add nuw nsw i64 [[I]], 1
+; SLP-NEXT:    [[C:%.*]] = icmp ult i64 [[I1]], [[N]]
+; SLP-NEXT:    br i1 [[C]], label %[[LOOP]], label %[[EXIT:.*]], !llvm.loop [[LOOP1:![0-9]+]]
+; SLP:       [[EXIT]]:
+; SLP-NEXT:    ret void
+;
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %pi = getelementptr inbounds i64, ptr %idx, i64 %i
+  %j = load i64, ptr %pi, align 8, !llvm.access.group !1
+  %pa = getelementptr inbounds i32, ptr %a, i64 %j
+  call void @llvm.mem.fact() [ "mem.claim"(ptr %pa, i64 4, i64 0) ]
+  store i32 1, ptr %pa, align 4, !llvm.access.group !1
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit, !llvm.loop !2
+exit:
+  ret void
+}
+
+; Zero-able stride + mustprogress: SCEV's forward-progress reasoning must
+; not treat the fact as a side effect.
+define void @zext_stride(i1 %g, ptr %dst) mustprogress {
+; LV-LABEL: define void @zext_stride(
+; LV-SAME: i1 [[G:%.*]], ptr [[DST:%.*]]) #[[ATTR1:[0-9]+]] {
+; LV-NEXT:  [[ENTRY:.*:]]
+; LV-NEXT:    [[G16:%.*]] = zext i1 [[G]] to i16
+; LV-NEXT:    [[G64:%.*]] = zext i1 [[G]] to i64
+; LV-NEXT:    br label %[[VECTOR_SCEVCHECK:.*]]
+; LV:       [[VECTOR_SCEVCHECK]]:
+; LV-NEXT:    [[IDENT_CHECK:%.*]] = icmp ne i1 [[G]], true
+; LV-NEXT:    br i1 [[IDENT_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]
+; LV:       [[VECTOR_PH]]:
+; LV-NEXT:    br label %[[VECTOR_BODY:.*]]
+; LV:       [[VECTOR_BODY]]:
+; LV-NEXT:    [[INDEX:%.*]] = phi i64 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]
+; LV-NEXT:    [[TMP0:%.*]] = add i64 [[INDEX]], 1
+; LV-NEXT:    [[TMP1:%.*]] = add i64 [[INDEX]], 2
+; LV-NEXT:    [[TMP2:%.*]] = add i64 [[INDEX]], 3
+; LV-NEXT:    [[TMP3:%.*]] = add i64 [[INDEX]], 4
+; LV-NEXT:    [[TMP4:%.*]] = add i64 [[INDEX]], 5
+; LV-NEXT:    [[TMP5:%.*]] = add i64 [[INDEX]], 6
+; LV-NEXT:    [[TMP6:%.*]] = add i64 [[INDEX]], 7
+; LV-NEXT:    [[TMP7:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[INDEX]]
+; LV-NEXT:    [[TMP8:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP0]]
+; LV-NEXT:    [[TMP9:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP1]]
+; LV-NEXT:    [[TMP10:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP2]]
+; LV-NEXT:    [[TMP11:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP3]]
+; LV-NEXT:    [[TMP12:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP4]]
+; LV-NEXT:    [[TMP13:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP5]]
+; LV-NEXT:    [[TMP14:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[TMP6]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP7]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP8]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP9]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP10]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP11]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP12]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP13]], i64 2, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP14]], i64 2, i64 0) ]
+; LV-NEXT:    [[TMP15:%.*]] = getelementptr inbounds i16, ptr [[TMP7]], i64 4
+; LV-NEXT:    store <4 x i16> splat (i16 1), ptr [[TMP7]], align 2
+; LV-NEXT:    store <4 x i16> splat (i16 1), ptr [[TMP15]], align 2
+; LV-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[INDEX]], 8
+; LV-NEXT:    [[TMP16:%.*]] = icmp eq i64 [[INDEX_NEXT]], 16
+; LV-NEXT:    br i1 [[TMP16]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP13:![0-9]+]]
+; LV:       [[MIDDLE_BLOCK]]:
+; LV-NEXT:    br label %[[EXIT:.*]]
+; LV:       [[SCALAR_PH]]:
+; LV-NEXT:    br label %[[LOOP:.*]]
+; LV:       [[LOOP]]:
+; LV-NEXT:    [[IV:%.*]] = phi i64 [ 0, %[[SCALAR_PH]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]
+; LV-NEXT:    [[GEP:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[IV]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[GEP]], i64 2, i64 0) ]
+; LV-NEXT:    store i16 [[G16]], ptr [[GEP]], align 2
+; LV-NEXT:    [[IV_NEXT]] = add nuw nsw i64 [[IV]], [[G64]]
+; LV-NEXT:    [[CMP:%.*]] = icmp ult i64 [[IV_NEXT]], 16
+; LV-NEXT:    br i1 [[CMP]], label %[[LOOP]], label %[[EXIT]], !llvm.loop [[LOOP14:![0-9]+]]
+; LV:       [[EXIT]]:
+; LV-NEXT:    ret void
+;
+; SLP-LABEL: define void @zext_stride(
+; SLP-SAME: i1 [[G:%.*]], ptr [[DST:%.*]]) #[[ATTR1:[0-9]+]] {
+; SLP-NEXT:  [[ENTRY:.*]]:
+; SLP-NEXT:    [[G16:%.*]] = zext i1 [[G]] to i16
+; SLP-NEXT:    [[G64:%.*]] = zext i1 [[G]] to i64
+; SLP-NEXT:    br label %[[LOOP:.*]]
+; SLP:       [[LOOP]]:
+; SLP-NEXT:    [[IV:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]
+; SLP-NEXT:    [[GEP:%.*]] = getelementptr inbounds i16, ptr [[DST]], i64 [[IV]]
+; SLP-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[GEP]], i64 2, i64 0) ]
+; SLP-NEXT:    store i16 [[G16]], ptr [[GEP]], align 2
+; SLP-NEXT:    [[IV_NEXT]] = add nuw nsw i64 [[IV]], [[G64]]
+; SLP-NEXT:    [[CMP:%.*]] = icmp ult i64 [[IV_NEXT]], 16
+; SLP-NEXT:    br i1 [[CMP]], label %[[LOOP]], label %[[EXIT:.*]]
+; SLP:       [[EXIT]]:
+; SLP-NEXT:    ret void
+;
+entry:
+  %g16 = zext i1 %g to i16
+  %g64 = zext i1 %g to i64
+  br label %loop
+loop:
+  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]
+  %gep = getelementptr inbounds i16, ptr %dst, i64 %iv
+  call void @llvm.mem.fact() [ "mem.claim"(ptr %gep, i64 2, i64 0) ]
+  store i16 %g16, ptr %gep, align 2
+  %iv.next = add nuw nsw i64 %iv, %g64
+  %cmp = icmp ult i64 %iv.next, 16
+  br i1 %cmp, label %loop, label %exit
+exit:
+  ret void
+}
+
+!1 = distinct !{}
+!2 = distinct !{!2, !3}
+!3 = !{!"llvm.loop.parallel_accesses", !1}
 ;.
 ; LV: [[LOOP0]] = distinct !{[[LOOP0]], [[META1:![0-9]+]], [[META2:![0-9]+]]}
 ; LV: [[META1]] = !{!"llvm.loop.isvectorized", i32 1}
@@ -522,4 +712,14 @@ exit:
 ; LV: [[LOOP6]] = distinct !{[[LOOP6]], [[META1]], [[META2]]}
 ; LV: [[LOOP7]] = distinct !{[[LOOP7]], [[META1]], [[META2]]}
 ; LV: [[LOOP8]] = distinct !{[[LOOP8]], [[META2]], [[META1]]}
+; LV: [[ACC_GRP9]] = distinct !{}
+; LV: [[LOOP10]] = distinct !{[[LOOP10]], [[META11:![0-9]+]], [[META1]], [[META2]]}
+; LV: [[META11]] = !{!"llvm.loop.parallel_accesses", [[ACC_GRP9]]}
+; LV: [[LOOP12]] = distinct !{[[LOOP12]], [[META11]], [[META2]], [[META1]]}
+; LV: [[LOOP13]] = distinct !{[[LOOP13]], [[META1]], [[META2]]}
+; LV: [[LOOP14]] = distinct !{[[LOOP14]], [[META1]]}
+;.
+; SLP: [[ACC_GRP0]] = distinct !{}
+; SLP: [[LOOP1]] = distinct !{[[LOOP1]], [[META2:![0-9]+]]}
+; SLP: [[META2]] = !{!"llvm.loop.parallel_accesses", [[ACC_GRP0]]}
 ;.

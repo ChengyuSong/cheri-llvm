@@ -29,6 +29,7 @@
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -616,6 +617,11 @@ bool Loop::isAnnotatedParallel() const {
   for (BasicBlock *BB : this->blocks()) {
     for (Instruction &I : *BB) {
       if (!I.mayReadOrWriteMemory())
+        continue;
+      // [LLM-generated] M5r: llvm.mem.fact annotations carry no access group
+      // and do not access memory.
+      if (auto *II = dyn_cast<IntrinsicInst>(&I);
+          II && II->getIntrinsicID() == Intrinsic::mem_fact)
         continue;
 
       if (MDNode *AccessGroup = I.getMetadata(LLVMContext::MD_access_group)) {
