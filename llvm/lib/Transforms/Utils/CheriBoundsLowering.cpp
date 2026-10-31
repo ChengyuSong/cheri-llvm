@@ -71,6 +71,10 @@ static cl::opt<bool> ClaimCoalesce(
     "cheri-claim-coalesce", cl::init(true), cl::Hidden,
     cl::desc("R3 (D20): one narrow for constant-size claims of one base in a "
              "block whose ranges form one contiguous extent"));
+static cl::opt<bool> SingleTagTest(
+    "cheri-bounds-single-tag-test", cl::init(true), cl::Hidden,
+    cl::desc("R4 (D22): two-version sites merge the exact and rounded "
+             "capability with a PHI (one tag test) instead of a select"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -83,6 +87,7 @@ struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
+  unsigned TwoVersionInLoop = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
@@ -513,6 +518,7 @@ struct Lowering {
     if (Markers.empty())
       return;
     DominatorTree DT(F);
+    LoopInfo LI(DT); // computed before this pass changes the CFG
     relink(Markers, DT, Guards, F);
     // Guards this pass will narrow (for the coverage check): every marker's
     // own guards and the re-linked group guards.
@@ -676,23 +682,53 @@ struct Lowering {
         Function *TagF = Intrinsic::getOrInsertDeclaration(
             &M, Intrinsic::cheri_cap_tag_get);
         Value *Tag = B.CreateCall(TagF, {Exact});
-        Value *Rounded = NarrowAt(B, false, Bytes, Base);
-        Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
-        rewriteGuards(OnEdge, Cap, Done);
         // M5.0 shape: branch on the tag first; only the untagged (inexact)
-        // path keeps the software check:
-        //   Pred: br tag, Ok, Slow      Slow: br cond, Ok, Panic (original)
+        // path keeps the software check and computes the rounded narrow:
+        //   Pred: br tag, Join, Slow   Slow: rounded; br cond, Join, Panic
+        //   Join: cap = phi [exact, Pred], [rounded, Slow]
+        // R4 (D22): the capability is a PHI, not a select on the tag, so the
+        // tag is tested once (R2/R3 lowered the select to a second branch).
         auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
         BasicBlock *P = Mk.Panic->getParent();
         BasicBlock *Slow = BasicBlock::Create(F.getContext(), "cheri.slowcheck",
                                               &F, P);
+        BasicBlock *Join = Mk.Ok;
+        bool NeedJoin = !SingleTagTest || Mk.Ok->getSinglePredecessor() != Mk.Pred;
+        if (SingleTagTest && NeedJoin) {
+          Join = BasicBlock::Create(F.getContext(), "cheri.twoversion", &F,
+                                    Mk.Ok);
+          UncondBrInst::Create(Mk.Ok, Join);
+          for (PHINode &PN : Mk.Ok->phis())
+            PN.replaceIncomingBlockWith(Mk.Pred, Join);
+        }
         Br->removeFromParent();
         Br->insertInto(Slow, Slow->end());
-        CondBrInst::Create(Tag, Mk.Ok, Slow, Mk.Pred);
-        for (PHINode &PN : Mk.Ok->phis())
-          PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
+        if (Join != Mk.Ok)
+          for (unsigned K = 0; K < 2; ++K)
+            if (Br->getSuccessor(K) == Mk.Ok)
+              Br->setSuccessor(K, Join);
+        CondBrInst::Create(Tag, Join, Slow, Mk.Pred);
         for (PHINode &PN : P->phis())
           PN.replaceIncomingBlockWith(Mk.Pred, Slow);
+        if (SingleTagTest) {
+          if (Join == Mk.Ok)
+            for (PHINode &PN : Mk.Ok->phis())
+              PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
+          Value *Rounded = NarrowAt(mk(Br), false, Bytes, Base);
+          PHINode *Cap = PHINode::Create(Exact->getType(), 2, "cheri.cap",
+                                         Join->begin());
+          Cap->addIncoming(Exact, Mk.Pred);
+          Cap->addIncoming(Rounded, Slow);
+          rewriteGuards(OnEdge, Cap, Done);
+        } else {
+          Value *Rounded = NarrowAt(B, false, Bytes, Base);
+          Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
+          rewriteGuards(OnEdge, Cap, Done);
+          for (PHINode &PN : Mk.Ok->phis())
+            PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
+        }
+        if (LI.getLoopFor(Mk.Pred))
+          ++S.TwoVersionInLoop;
         ++S.TwoVersion;
       } else { // elide, Never: rounded narrow, keep the check
         NarrowKeep(false);
@@ -988,7 +1024,8 @@ struct Lowering {
            << " borrow=" << S.Borrow << " unlinked=" << S.Unlinked
            << " guards=" << S.Guards << " narrowed=" << S.Narrowed
            << " skipped=" << S.Skipped << " removed=" << S.Removed
-           << " twoversion=" << S.TwoVersion << " noedge=" << S.NoEdge
+           << " twoversion=" << S.TwoVersion
+           << " twoversion_loop=" << S.TwoVersionInLoop << " noedge=" << S.NoEdge
            << " kept=" << S.Kept << " hoisted=" << S.Hoisted
            << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
            << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked

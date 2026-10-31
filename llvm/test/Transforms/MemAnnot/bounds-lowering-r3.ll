@@ -337,14 +337,14 @@ define i32 @subrange(ptr addrspace(200) %pa, i64 %pn, i64 %lo, i64 %n, i64 %i) {
 ; ELIDE-NEXT:    [[TMP7:%.*]] = getelementptr i8, ptr addrspace(200) [[TMP3]], i64 [[TMP6]]
 ; ELIDE-NEXT:    [[TMP8:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    [[TMP9:%.*]] = call addrspace(200) i1 @llvm.cheri.cap.tag.get(ptr addrspace(200) [[TMP8]])
-; ELIDE-NEXT:    [[TMP10:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
-; ELIDE-NEXT:    [[TMP11:%.*]] = select i1 [[TMP9]], ptr addrspace(200) [[TMP8]], ptr addrspace(200) [[TMP10]]
 ; ELIDE-NEXT:    br i1 [[TMP9]], label %[[OK:.*]], label %[[CHERI_SLOWCHECK:.*]]
 ; ELIDE:       [[OK]]:
+; ELIDE-NEXT:    [[TMP11:%.*]] = phi ptr addrspace(200) [ [[TMP8]], [[TMP0:%.*]] ], [ [[TMP10:%.*]], %[[CHERI_SLOWCHECK]] ]
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP11]], i64 [[I]]
 ; ELIDE-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; ELIDE-NEXT:    ret i32 [[V]]
 ; ELIDE:       [[CHERI_SLOWCHECK]]:
+; ELIDE-NEXT:    [[TMP10]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL:.*]]
 ; ELIDE:       [[FAIL]]:
 ; ELIDE-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
@@ -401,14 +401,14 @@ define i32 @subrange(ptr addrspace(200) %pa, i64 %pn, i64 %lo, i64 %n, i64 %i) {
 ; LEGACY-NEXT:    [[TMP7:%.*]] = getelementptr i8, ptr addrspace(200) [[TMP3]], i64 [[TMP6]]
 ; LEGACY-NEXT:    [[TMP8:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; LEGACY-NEXT:    [[TMP9:%.*]] = call addrspace(200) i1 @llvm.cheri.cap.tag.get(ptr addrspace(200) [[TMP8]])
-; LEGACY-NEXT:    [[TMP10:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
-; LEGACY-NEXT:    [[TMP11:%.*]] = select i1 [[TMP9]], ptr addrspace(200) [[TMP8]], ptr addrspace(200) [[TMP10]]
 ; LEGACY-NEXT:    br i1 [[TMP9]], label %[[OK:.*]], label %[[CHERI_SLOWCHECK:.*]]
 ; LEGACY:       [[OK]]:
+; LEGACY-NEXT:    [[TMP11:%.*]] = phi ptr addrspace(200) [ [[TMP8]], [[TMP0:%.*]] ], [ [[TMP10:%.*]], %[[CHERI_SLOWCHECK]] ]
 ; LEGACY-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP11]], i64 [[I]]
 ; LEGACY-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; LEGACY-NEXT:    ret i32 [[V]]
 ; LEGACY:       [[CHERI_SLOWCHECK]]:
+; LEGACY-NEXT:    [[TMP10]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[TMP7]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; LEGACY-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL:.*]]
 ; LEGACY:       [[FAIL]]:
 ; LEGACY-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])

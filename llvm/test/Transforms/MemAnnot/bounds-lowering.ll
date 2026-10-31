@@ -33,7 +33,7 @@ define i32 @arr(ptr addrspace(200) %a, i64 %i) {
 ; NARROW-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 8
 ; NARROW-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NARROW:       [[OK]]:
-; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0:![0-9]+]]
 ; NARROW-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NARROW-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; NARROW-NEXT:    ret i32 [[V]]
@@ -46,7 +46,7 @@ define i32 @arr(ptr addrspace(200) %a, i64 %i) {
 ; NOSKIP-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 8
 ; NOSKIP-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NOSKIP:       [[OK]]:
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0:![0-9]+]]
 ; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NOSKIP-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; NOSKIP-NEXT:    ret i32 [[V]]
@@ -56,7 +56,7 @@ define i32 @arr(ptr addrspace(200) %a, i64 %i) {
 ;
 ; ELIDE-LABEL: define i32 @arr(
 ; ELIDE-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0:![0-9]+]]
 ; ELIDE-NEXT:    br label %[[OK:.*]]
 ; ELIDE:       [[OK]]:
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -65,7 +65,7 @@ define i32 @arr(ptr addrspace(200) %a, i64 %i) {
 ;
 ; UB-LABEL: define i32 @arr(
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0:![0-9]+]]
 ; UB-NEXT:    br label %[[OK:.*]]
 ; UB:       [[OK]]:
 ; UB-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -122,7 +122,7 @@ define i32 @arr_proved(ptr addrspace(200) %a, i64 %i) {
 ; NOSKIP-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 8
 ; NOSKIP-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NOSKIP:       [[OK]]:
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NOSKIP-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; NOSKIP-NEXT:    ret i32 [[V]]
@@ -132,7 +132,7 @@ define i32 @arr_proved(ptr addrspace(200) %a, i64 %i) {
 ;
 ; ELIDE-LABEL: define i32 @arr_proved(
 ; ELIDE-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    br label %[[OK:.*]]
 ; ELIDE:       [[OK]]:
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -141,7 +141,7 @@ define i32 @arr_proved(ptr addrspace(200) %a, i64 %i) {
 ;
 ; UB-LABEL: define i32 @arr_proved(
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; UB-NEXT:    br label %[[OK:.*]]
 ; UB:       [[OK]]:
 ; UB-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -188,7 +188,7 @@ define i32 @slice(ptr addrspace(200) %a, i64 %n, i64 %i) {
 ; NARROW-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NARROW:       [[OK]]:
 ; NARROW-NEXT:    [[TMP1:%.*]] = mul nuw nsw i64 [[N]], 4
-; NARROW-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]])
+; NARROW-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; NARROW-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP2]], i64 [[I]]
 ; NARROW-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; NARROW-NEXT:    ret i32 [[V]]
@@ -202,7 +202,7 @@ define i32 @slice(ptr addrspace(200) %a, i64 %n, i64 %i) {
 ; NOSKIP-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NOSKIP:       [[OK]]:
 ; NOSKIP-NEXT:    [[TMP1:%.*]] = mul nuw nsw i64 [[N]], 4
-; NOSKIP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]])
+; NOSKIP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP2]], i64 [[I]]
 ; NOSKIP-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; NOSKIP-NEXT:    ret i32 [[V]]
@@ -214,16 +214,16 @@ define i32 @slice(ptr addrspace(200) %a, i64 %n, i64 %i) {
 ; ELIDE-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[I:%.*]]) addrspace(200) {
 ; ELIDE-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
 ; ELIDE-NEXT:    [[TMP1:%.*]] = mul nuw nsw i64 [[N]], 4
-; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP1]])
+; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    [[TMP3:%.*]] = call addrspace(200) i1 @llvm.cheri.cap.tag.get(ptr addrspace(200) [[TMP2]])
-; ELIDE-NEXT:    [[TMP4:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]])
-; ELIDE-NEXT:    [[TMP5:%.*]] = select i1 [[TMP3]], ptr addrspace(200) [[TMP2]], ptr addrspace(200) [[TMP4]]
 ; ELIDE-NEXT:    br i1 [[TMP3]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; ELIDE:       [[OK]]:
+; ELIDE-NEXT:    [[TMP5:%.*]] = phi ptr addrspace(200) [ [[TMP2]], [[TMP0:%.*]] ], [ [[TMP4:%.*]], %[[FAIL]] ]
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP5]], i64 [[I]]
 ; ELIDE-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; ELIDE-NEXT:    ret i32 [[V]]
 ; ELIDE:       [[FAIL]]:
+; ELIDE-NEXT:    [[TMP4]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL1:.*]]
 ; ELIDE:       [[FAIL1]]:
 ; ELIDE-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
@@ -232,7 +232,7 @@ define i32 @slice(ptr addrspace(200) %a, i64 %n, i64 %i) {
 ; UB-LABEL: define i32 @slice(
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[I:%.*]]) addrspace(200) {
 ; UB-NEXT:    [[TMP1:%.*]] = mul nuw nsw i64 [[N]], 4
-; UB-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP1]])
+; UB-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP1]]), !cheri.access_narrow [[META0]]
 ; UB-NEXT:    br label %[[OK:.*]]
 ; UB:       [[OK]]:
 ; UB-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP2]], i64 [[I]]
@@ -277,7 +277,7 @@ define i8 @never(ptr addrspace(200) %a, i64 %i) {
 ; NARROW-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 4097
 ; NARROW-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NARROW:       [[OK]]:
-; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097)
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097), !cheri.access_narrow [[META0]]
 ; NARROW-NEXT:    [[G:%.*]] = getelementptr inbounds i8, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NARROW-NEXT:    [[V:%.*]] = load i8, ptr addrspace(200) [[G]], align 1
 ; NARROW-NEXT:    ret i8 [[V]]
@@ -290,7 +290,7 @@ define i8 @never(ptr addrspace(200) %a, i64 %i) {
 ; NOSKIP-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 4097
 ; NOSKIP-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NOSKIP:       [[OK]]:
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097)
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097), !cheri.access_narrow [[META0]]
 ; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i8, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NOSKIP-NEXT:    [[V:%.*]] = load i8, ptr addrspace(200) [[G]], align 1
 ; NOSKIP-NEXT:    ret i8 [[V]]
@@ -303,7 +303,7 @@ define i8 @never(ptr addrspace(200) %a, i64 %i) {
 ; ELIDE-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 4097
 ; ELIDE-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; ELIDE:       [[OK]]:
-; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097)
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr inbounds i8, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; ELIDE-NEXT:    [[V:%.*]] = load i8, ptr addrspace(200) [[G]], align 1
 ; ELIDE-NEXT:    ret i8 [[V]]
@@ -313,7 +313,7 @@ define i8 @never(ptr addrspace(200) %a, i64 %i) {
 ;
 ; UB-LABEL: define i8 @never(
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097)
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 4097), !cheri.access_narrow [[META0]]
 ; UB-NEXT:    br label %[[OK:.*]]
 ; UB:       [[OK]]:
 ; UB-NEXT:    [[G:%.*]] = getelementptr i8, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -391,7 +391,7 @@ define i32 @raw(ptr addrspace(200) %a, i64 %i) {
 ;
 ; UB-LABEL: define i32 @raw(
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[I:%.*]]) addrspace(200) {
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; UB-NEXT:    br label %[[OK:.*]]
 ; UB:       [[OK]]:
 ; UB-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
@@ -435,7 +435,7 @@ define ptr addrspace(200) @borrow(ptr addrspace(200) %a, i64 %i) {
 ; NARROW-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 8
 ; NARROW-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NARROW:       [[OK]]:
-; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; NARROW-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NARROW-NEXT:    ret ptr addrspace(200) [[G]]
 ; NARROW:       [[FAIL]]:
@@ -447,7 +447,7 @@ define ptr addrspace(200) @borrow(ptr addrspace(200) %a, i64 %i) {
 ; NOSKIP-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 8
 ; NOSKIP-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
 ; NOSKIP:       [[OK]]:
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32)
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 32), !cheri.access_narrow [[META0]]
 ; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
 ; NOSKIP-NEXT:    ret ptr addrspace(200) [[G]]
 ; NOSKIP:       [[FAIL]]:
@@ -499,36 +499,36 @@ define void @claims(ptr addrspace(200) %p, ptr addrspace(200) %q) {
 ; OFF-LABEL: define void @claims(
 ; OFF-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; OFF-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; OFF-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; OFF-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0:![0-9]+]]
 ; OFF-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
 ; OFF-NEXT:    store i32 2, ptr addrspace(200) [[Q]], align 4
 ; OFF-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; OFF-NEXT:    store i32 3, ptr addrspace(200) [[E]], align 4
-; OFF-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; OFF-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.entry_narrow [[META0]]
 ; OFF-NEXT:    store i32 4, ptr addrspace(200) [[TMP2]], align 4
 ; OFF-NEXT:    ret void
 ;
 ; NARROW-LABEL: define void @claims(
 ; NARROW-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; NARROW-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0]]
 ; NARROW-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
 ; NARROW-NEXT:    store i32 2, ptr addrspace(200) [[Q]], align 4
 ; NARROW-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; NARROW-NEXT:    store i32 3, ptr addrspace(200) [[E]], align 4
-; NARROW-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; NARROW-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.entry_narrow [[META0]]
 ; NARROW-NEXT:    store i32 4, ptr addrspace(200) [[TMP2]], align 4
 ; NARROW-NEXT:    ret void
 ;
 ; NOSKIP-LABEL: define void @claims(
 ; NOSKIP-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; NOSKIP-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0]]
 ; NOSKIP-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
-; NOSKIP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[Q]], i64 16)
+; NOSKIP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[Q]], i64 16), !cheri.contract_narrow [[META0]]
 ; NOSKIP-NEXT:    store i32 2, ptr addrspace(200) [[TMP2]], align 4
 ; NOSKIP-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
-; NOSKIP-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; NOSKIP-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.contract_narrow [[META0]]
 ; NOSKIP-NEXT:    store i32 3, ptr addrspace(200) [[TMP3]], align 4
 ; NOSKIP-NEXT:    store i32 4, ptr addrspace(200) [[TMP3]], align 4
 ; NOSKIP-NEXT:    ret void
@@ -536,36 +536,36 @@ define void @claims(ptr addrspace(200) %p, ptr addrspace(200) %q) {
 ; ELIDE-LABEL: define void @claims(
 ; ELIDE-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; ELIDE-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0]]
 ; ELIDE-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
 ; ELIDE-NEXT:    store i32 2, ptr addrspace(200) [[Q]], align 4
 ; ELIDE-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; ELIDE-NEXT:    store i32 3, ptr addrspace(200) [[E]], align 4
-; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.entry_narrow [[META0]]
 ; ELIDE-NEXT:    store i32 4, ptr addrspace(200) [[TMP2]], align 4
 ; ELIDE-NEXT:    ret void
 ;
 ; UB-LABEL: define void @claims(
 ; UB-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; UB-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0]]
 ; UB-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
 ; UB-NEXT:    store i32 2, ptr addrspace(200) [[Q]], align 4
 ; UB-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; UB-NEXT:    store i32 3, ptr addrspace(200) [[E]], align 4
-; UB-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; UB-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.entry_narrow [[META0]]
 ; UB-NEXT:    store i32 4, ptr addrspace(200) [[TMP2]], align 4
 ; UB-NEXT:    ret void
 ;
 ; DROP-LABEL: define void @claims(
 ; DROP-SAME: ptr addrspace(200) [[P:%.*]], ptr addrspace(200) [[Q:%.*]]) addrspace(200) {
 ; DROP-NEXT:    [[S:%.*]] = alloca [4 x i32], align 4, addrspace(200)
-; DROP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16)
+; DROP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 16), !cheri.contract_narrow [[META0:![0-9]+]]
 ; DROP-NEXT:    store i32 1, ptr addrspace(200) [[TMP1]], align 4
 ; DROP-NEXT:    store i32 2, ptr addrspace(200) [[Q]], align 4
 ; DROP-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; DROP-NEXT:    store i32 3, ptr addrspace(200) [[E]], align 4
-; DROP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
+; DROP-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4), !cheri.entry_narrow [[META0]]
 ; DROP-NEXT:    store i32 4, ptr addrspace(200) [[TMP2]], align 4
 ; DROP-NEXT:    ret void
 ;
@@ -610,7 +610,7 @@ define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
 ; NARROW-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
 ; NARROW-NEXT:  [[ENTRY:.*]]:
 ; NARROW-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
-; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]]), !cheri.access_narrow [[META0]]
 ; NARROW-NEXT:    br label %[[HEAD:.*]]
 ; NARROW:       [[HEAD]]:
 ; NARROW-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
@@ -634,7 +634,7 @@ define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
 ; NOSKIP-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
 ; NOSKIP-NEXT:  [[ENTRY:.*]]:
 ; NOSKIP-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
-; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]]), !cheri.access_narrow [[META0]]
 ; NOSKIP-NEXT:    br label %[[HEAD:.*]]
 ; NOSKIP:       [[HEAD]]:
 ; NOSKIP-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
@@ -658,10 +658,9 @@ define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
 ; ELIDE-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
 ; ELIDE-NEXT:  [[ENTRY:.*]]:
 ; ELIDE-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
-; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) i1 @llvm.cheri.cap.tag.get(ptr addrspace(200) [[TMP1]])
-; ELIDE-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
-; ELIDE-NEXT:    [[TMP4:%.*]] = select i1 [[TMP2]], ptr addrspace(200) [[TMP1]], ptr addrspace(200) [[TMP3]]
+; ELIDE-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]]), !cheri.access_narrow [[META0]]
 ; ELIDE-NEXT:    br label %[[HEAD:.*]]
 ; ELIDE:       [[HEAD]]:
 ; ELIDE-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
@@ -669,6 +668,7 @@ define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
 ; ELIDE-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
 ; ELIDE-NEXT:    br i1 [[TMP2]], label %[[OK]], label %[[FAIL:.*]]
 ; ELIDE:       [[OK]]:
+; ELIDE-NEXT:    [[TMP4:%.*]] = phi ptr addrspace(200) [ [[TMP1]], %[[HEAD]] ], [ [[TMP3]], %[[FAIL]] ]
 ; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP4]], i64 [[I]]
 ; ELIDE-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
 ; ELIDE-NEXT:    [[S1]] = add i32 [[S]], [[V]]
@@ -687,7 +687,7 @@ define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
 ; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
 ; UB-NEXT:  [[ENTRY:.*]]:
 ; UB-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
-; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]]), !cheri.access_narrow [[META0]]
 ; UB-NEXT:    br label %[[HEAD:.*]]
 ; UB:       [[HEAD]]:
 ; UB-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
@@ -843,3 +843,16 @@ fail:
 !5 = !{i64 6}
 !6 = !{i64 7}
 !7 = !{i64 8}
+;.
+; OFF: [[META0]] = !{}
+;.
+; NARROW: [[META0]] = !{}
+;.
+; NOSKIP: [[META0]] = !{}
+;.
+; ELIDE: [[META0]] = !{}
+;.
+; UB: [[META0]] = !{}
+;.
+; DROP: [[META0]] = !{}
+;.
