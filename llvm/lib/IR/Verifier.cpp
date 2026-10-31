@@ -4133,7 +4133,6 @@ void Verifier::visitCallBase(CallBase &Call) {
     unsigned NumMem = 0;
     auto IsPtr = [](Value *V) { return V->getType()->isPointerTy(); };
     auto IsInt = [](Value *V) { return V->getType()->isIntegerTy(); };
-    auto IsCInt = [](Value *V) { return isa<ConstantInt>(V); };
     for (unsigned i = 0, e = Call.getNumOperandBundles(); i < e; ++i) {
       OperandBundleUse BU = Call.getOperandBundleAt(i);
       StringRef T = BU.getTagName();
@@ -4155,23 +4154,25 @@ void Verifier::visitCallBase(CallBase &Call) {
               "i64 site, i64 kind [, ptr parent, iN parentlen])", Call);
         continue;
       }
+      if (T == memannot::TagFree) {
+        // R1: "mem.free"(ptr base) on the real deallocation call.
+        Check(!IsFact, "\"mem.free\" belongs on the deallocation call, not on "
+                       "llvm.mem.fact", Call);
+        Check(In.size() == 1 && IsPtr(In[0]),
+              "\"mem.free\" bundle must be (ptr base)", Call);
+        continue;
+      }
       Check(IsFact, "\"mem.\" fact bundles may only appear on llvm.mem.fact",
             Call);
       if (T == memannot::TagClaim)
-        Check(In.size() == 3 && IsPtr(In[0]) && IsInt(In[1]) && IsCInt(In[2]),
-              "\"mem.claim\" must be (ptr, iN bytes, i64 flags)", Call);
+        CheckFailed("\"mem.claim\" is not a fact bundle; use the value-"
+                    "returning llvm.mem.claim intrinsic", &Call);
       else if (T == memannot::TagAllocInbounds)
         Check(In.size() == 1 && IsPtr(In[0]),
               "\"mem.alloc_inbounds\" must be (ptr)", Call);
       else if (T == memannot::TagInbounds)
         Check(In.size() == 3 && IsPtr(In[0]) && IsPtr(In[1]) && IsInt(In[2]),
               "\"mem.inbounds\" must be (ptr, ptr base, iN bytes)", Call);
-      else if (T == memannot::TagFree)
-        Check(In.size() == 2 && IsPtr(In[0]) && IsPtr(In[1]),
-              "\"mem.free\" must be (ptr, ptr ownerslot-or-null)", Call);
-      else if (T == memannot::TagInvalidate)
-        Check(In.size() == 2 && IsPtr(In[0]) && IsCInt(In[1]),
-              "\"mem.invalidate\" must be (ptr, i64 kind)", Call);
       else
         Check(T == memannot::TagDropped, "unknown \"mem.\" bundle tag", Call);
     }
@@ -5751,6 +5752,17 @@ void Verifier::visitInstruction(Instruction &I) {
     Check(G->getNumOperands() == 1 &&
               mdconst::dyn_extract_or_null<ConstantInt>(G->getOperand(0)),
           "!mem.guard must be !{i64 site}", &I);
+  }
+  // [LLM-generated] M5r R1: !mem.last_use !{i64 loan, ...} on the last use of
+  // each loan: an access or a call passing the reference.
+  if (MDNode *LU = I.getMetadata(memannot::LastUseMD)) {
+    Check(isa<LoadInst>(I) || isa<StoreInst>(I) || isa<CallBase>(I) ||
+              isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I),
+          "!mem.last_use only on load, store, atomic or call instructions", &I);
+    bool OK = LU->getNumOperands() > 0;
+    for (const MDOperand &Op : LU->operands())
+      OK &= mdconst::dyn_extract_or_null<ConstantInt>(Op) != nullptr;
+    Check(OK, "!mem.last_use must be a non-empty list of i64 loan ids", &I);
   }
 
   if (!isa<PHINode>(I)) {   // Check that non-phi nodes are not self referential

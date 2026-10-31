@@ -496,9 +496,10 @@ void RISCVPassConfig::addIRPasses() {
   }
 
   addPass(createCheriotZeroSRetPass());
-  addPass(createCheriBoundAllocasLegacyPass());
-  // [LLM-generated] M5r: the late CHERI pass sits just before LSR.
+  // [LLM-generated] M5r R1: the late CHERI pass runs before CheriBoundAllocas
+  // (which then sees the lowered, annotation-free IR) and before LSR.
   addPass(createRISCVCheriBoundsLoweringPass());
+  addPass(createCheriBoundAllocasLegacyPass());
   TargetPassConfig::addIRPasses();
 
   if (getOptLevel() == CodeGenOptLevel::Aggressive && EnableSelectOpt)

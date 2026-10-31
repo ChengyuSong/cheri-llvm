@@ -1,18 +1,22 @@
 //===- MemAnnotCensus.h - M5r annotation census and late stub ---*- C++ -*-===//
-// [LLM-generated] CHERI M5r R0.
+// [LLM-generated] CHERI M5r R0/R1.
 //
-// MemAnnotCensusPass<start>: counts llvm.mem.fact facts, "mem.check" bundles
-//   and !mem.guard hints, tags each fact/check with !mem.annot.id and records
-//   it (with a weak handle on its block) for the late census.
+// MemAnnotCensusPass<start>: counts llvm.mem.fact facts, llvm.mem.claim
+//   calls, "mem.check" / "mem.free" bundles and !mem.guard / !mem.last_use
+//   hints, tags each fact/claim/check/free with !mem.annot.id and records it
+//   (with a weak handle on its block; claims also with a callback handle that
+//   sees a RAUW) for the late census.
 // MemAnnotCensusPass<late>: counts again and reports, per kind, survivors and
 //   losses classified as block-deleted, unreachable-block, dropped (renamed
 //   "mem.dropped" by a promote/SROA drop) or unexplained. With
 //   -mem-annot-census-strict an unexplained loss of a check, claim or free is
-//   a fatal error. !mem.guard losses are always allowed (fail-safe).
+//   a fatal error; a claim replaced by a non-claim value (folded into its
+//   operand) is unexplained, a claim deleted while unused is "dead".
+//   !mem.guard / !mem.last_use losses are always allowed (fail-safe).
 // CheriBoundsLoweringPass: the R0 stub of the late CHERI pass. It runs the
-//   late census, then strips every annotation (facts, "mem." bundles,
-//   !mem.guard, !mem.annot.id) so instruction selection sees the same IR as
-//   without annotations. No CHERI decisions are made in R0.
+//   late census, then strips every annotation (facts, claims -> operand,
+//   "mem." bundles, !mem.guard, !mem.last_use, !mem.annot.id) so instruction
+//   selection sees the same IR as without annotations. No CHERI decisions.
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_TRANSFORMS_UTILS_MEMANNOTCENSUS_H
 #define LLVM_TRANSFORMS_UTILS_MEMANNOTCENSUS_H
@@ -46,6 +50,9 @@ LLVM_ABI bool stripAnnotations(Module &M);
 LLVM_ABI bool runCheriBoundsLoweringStub(Module &M);
 /// Set by -mem-annot-census: add the start census at pipeline start.
 LLVM_ABI bool censusAtPipelineStart();
+/// True while a start census is pending for \p M (D14: InstCombine keeps
+/// "mem.dropped" placeholders only then).
+LLVM_ABI bool censusActive(const Module &M);
 } // namespace memannot
 } // namespace llvm
 #endif

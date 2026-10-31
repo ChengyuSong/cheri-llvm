@@ -98,6 +98,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Operator.h"
@@ -7974,6 +7975,10 @@ ScalarEvolution::getOperandsToCreate(Value *V, SmallVectorImpl<Value *> &Ops) {
       Ops.push_back(RV);
       return nullptr;
     }
+    if (memannot::isMemClaim(U)) { // [LLM-generated] M5r
+      Ops.push_back(cast<CallBase>(U)->getArgOperand(0));
+      return nullptr;
+    }
 
     if (auto *II = dyn_cast<IntrinsicInst>(U)) {
       switch (II->getIntrinsicID()) {
@@ -8434,6 +8439,9 @@ const SCEV *ScalarEvolution::createSCEV(Value *V) {
   case Instruction::Invoke:
     if (Value *RV = cast<CallBase>(U)->getReturnedArgOperand())
       return getSCEV(RV);
+    // [LLM-generated] M5r: llvm.mem.claim returns its pointer operand.
+    if (memannot::isMemClaim(U))
+      return getSCEV(cast<CallBase>(U)->getArgOperand(0));
 
     if (auto *II = dyn_cast<IntrinsicInst>(U)) {
       switch (II->getIntrinsicID()) {

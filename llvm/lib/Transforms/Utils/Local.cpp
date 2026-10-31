@@ -2957,9 +2957,17 @@ static void combineMetadata(Instruction *K, const Instruction *J,
 
     // TODO: Assert that this switch is exhaustive for fixed MD kinds.
     switch (Kind) {
-      default:
+      default: {
+        // [LLM-generated] M5r: !mem.last_use / !mem.guard survive a merge only
+        // when both instructions carry the identical node (fail-safe drop).
+        LLVMContext &Ctx = K->getContext();
+        if ((Kind == Ctx.getMDKindID("mem.last_use") ||
+             Kind == Ctx.getMDKindID("mem.guard")) &&
+            KMD == JMD)
+          break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata
         break;
+      }
       case LLVMContext::MD_dbg:
         llvm_unreachable("getAllMetadataOtherThanDebugLoc returned a MD_dbg");
       case LLVMContext::MD_DIAssignID:

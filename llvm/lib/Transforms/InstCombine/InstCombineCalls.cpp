@@ -84,6 +84,8 @@
 
 #define DEBUG_TYPE "instcombine"
 #include "llvm/Transforms/Utils/InstructionWorklist.h"
+#include "llvm/IR/MemAnnot.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 
 using namespace llvm;
 using namespace PatternMatch;
@@ -4040,6 +4042,15 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
         }))
       return nullptr;
     break;
+  case Intrinsic::mem_fact: {
+    // [LLM-generated] M5r D14: a "mem.dropped" placeholder only exists for the
+    // census; erase it when no census is running on this module.
+    if (II->getNumOperandBundles() == 1 &&
+        II->getOperandBundleAt(0).getTagName() == memannot::TagDropped &&
+        !memannot::censusActive(*II->getModule()))
+      return eraseInstFromFunction(*II);
+    break;
+  }
   case Intrinsic::assume: {
     for (auto [Idx, OBU] : llvm::enumerate(II->operand_bundles())) {
       auto RemoveBundle = [&, Idx = Idx]() -> Instruction * {

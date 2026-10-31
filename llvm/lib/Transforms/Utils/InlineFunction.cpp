@@ -1822,12 +1822,13 @@ static void AddAlignmentAssumptions(CallBase &CB, InlineFunctionInfo &IFI) {
 }
 
 // [LLM-generated] M5r: parameter/return facts carried as attributes are lost
-// when the callee is inlined; re-express them as llvm.mem.fact at the call
-// site. Return facts are attached to the call value itself and follow the
-// inliner's RAUW to the returned value.
-//   "mem.alloc_inbounds"                 -> "mem.alloc_inbounds"(v)
-//   "mem.untrusted" + dereferenceable(N) -> "mem.claim"(v, N, Param|Untrusted)
-//   "mem.claim"="N"                      -> "mem.claim"(v, N, Param|Untrusted)
+// when the callee is inlined; re-express them at the call site.
+//   "mem.alloc_inbounds"                 -> llvm.mem.fact "mem.alloc_inbounds"(v)
+//   "mem.untrusted" + dereferenceable(N) -> v' = llvm.mem.claim(v, N, Param|Untrusted)
+//   "mem.claim"="N"                      -> v' = llvm.mem.claim(v, N, Param|Untrusted)
+// A parameter claim replaces the call argument (so the inlined body uses v');
+// a return claim replaces the uses of the call value. Return facts are
+// attached to the call value and follow the inliner's RAUW.
 static void addMemFact(IRBuilderBase &B, StringRef Tag,
                        ArrayRef<Value *> Ops) {
   Module *M = B.GetInsertBlock()->getModule();
@@ -1836,23 +1837,14 @@ static void addMemFact(IRBuilderBase &B, StringRef Tag,
   B.CreateCall(Fact, {}, {OB});
 }
 
-// [LLM-generated] M5r: the legacy M2 "mem.alloc_inbounds" argument/return
-// attribute (emitted by local/m5 rustc on most Rust-ABI pointer params and
-// consumed by CheriSkipNarrow before inlining) is only turned into a fact on
-// request, so R0 codegen for existing rustc output is unchanged. The M5r
-// attributes ("mem.claim"="N", "mem.untrusted") always are.
+// D13 (R1): the legacy M2 "mem.alloc_inbounds" attribute is converted by
+// default; -mem-annot-inline-legacy-alloc-inbounds=false restores R0.
 static cl::opt<bool> MemAnnotInlineLegacyAllocInbounds(
-    "mem-annot-inline-legacy-alloc-inbounds", cl::init(false), cl::Hidden,
+    "mem-annot-inline-legacy-alloc-inbounds", cl::init(true), cl::Hidden,
     cl::desc("M5r: when inlining, turn the legacy mem.alloc_inbounds "
              "argument/return attribute into a mem.alloc_inbounds fact"));
 
-static void addMemFactsFor(IRBuilderBase &B, Value *V, const AttributeSet &A1,
-                           const AttributeSet &A2, uint64_t Kind) {
-  auto Has = [&](StringRef K) {
-    return A1.hasAttribute(K) || A2.hasAttribute(K);
-  };
-  if (MemAnnotInlineLegacyAllocInbounds && Has("mem.alloc_inbounds"))
-    addMemFact(B, memannot::TagAllocInbounds, {V});
+static uint64_t claimBytes(const AttributeSet &A1, const AttributeSet &A2) {
   uint64_t Bytes = 0;
   for (const AttributeSet &A : {A1, A2}) {
     if (A.hasAttribute("mem.claim")) {
@@ -1861,36 +1853,46 @@ static void addMemFactsFor(IRBuilderBase &B, Value *V, const AttributeSet &A1,
         Bytes = std::max(Bytes, N);
     }
   }
-  if (!Bytes && Has("mem.untrusted"))
+  if (!Bytes && (A1.hasAttribute("mem.untrusted") ||
+                 A2.hasAttribute("mem.untrusted")))
     Bytes = std::max(A1.getDereferenceableBytes(), A2.getDereferenceableBytes());
-  if (Bytes) {
-    Type *I64 = B.getInt64Ty();
-    addMemFact(B, memannot::TagClaim,
-               {V, ConstantInt::get(I64, Bytes),
-                ConstantInt::get(I64, Kind | memannot::CF_Untrusted)});
-  }
+  return Bytes;
+}
+
+static Value *createMemClaim(IRBuilderBase &B, Value *V, uint64_t Bytes,
+                             uint64_t Kind) {
+  Type *I64 = B.getInt64Ty();
+  return B.CreateIntrinsic(Intrinsic::mem_claim, {V->getType()},
+                           {V, ConstantInt::get(I64, Bytes),
+                            ConstantInt::get(I64, Kind | memannot::CF_Untrusted)});
 }
 
 static void AddMemFactsFromAttributes(CallBase &CB) {
   Function *Callee = CB.getCalledFunction();
   AttributeList CalleeAL = Callee->getAttributes(), CallAL = CB.getAttributes();
   IRBuilder<> B(&CB);
+  auto HasAI = [](const AttributeSet &A1, const AttributeSet &A2) {
+    return MemAnnotInlineLegacyAllocInbounds &&
+           (A1.hasAttribute("mem.alloc_inbounds") ||
+            A2.hasAttribute("mem.alloc_inbounds"));
+  };
   for (Argument &Arg : Callee->args()) {
-    if (!Arg.getType()->isPointerTy())
+    if (!Arg.getType()->isPointerTy() || Arg.hasPassPointeeByValueCopyAttr() ||
+        Arg.hasInAllocaAttr() || Arg.hasPreallocatedAttr())
       continue;
     unsigned N = Arg.getArgNo();
-    addMemFactsFor(B, CB.getArgOperand(N), CalleeAL.getParamAttrs(N),
-                   CallAL.getParamAttrs(N), memannot::CK_Param);
+    AttributeSet A1 = CalleeAL.getParamAttrs(N), A2 = CallAL.getParamAttrs(N);
+    Value *V = CB.getArgOperand(N);
+    if (HasAI(A1, A2))
+      addMemFact(B, memannot::TagAllocInbounds, {V});
+    if (uint64_t Bytes = claimBytes(A1, A2))
+      CB.setArgOperand(N, createMemClaim(B, V, Bytes, memannot::CK_Param));
   }
   if (!CB.getType()->isPointerTy())
     return;
   AttributeSet R1 = CalleeAL.getRetAttrs(), R2 = CallAL.getRetAttrs();
-  bool AI = MemAnnotInlineLegacyAllocInbounds;
-  if (!(AI && R1.hasAttribute("mem.alloc_inbounds")) &&
-      !(AI && R2.hasAttribute("mem.alloc_inbounds")) &&
-      !R1.hasAttribute("mem.claim") &&
-      !R2.hasAttribute("mem.claim") && !R1.hasAttribute("mem.untrusted") &&
-      !R2.hasAttribute("mem.untrusted"))
+  uint64_t RetBytes = claimBytes(R1, R2);
+  if (!HasAI(R1, R2) && !RetBytes)
     return;
   BasicBlock::iterator IP;
   if (auto *II = dyn_cast<InvokeInst>(&CB)) {
@@ -1902,7 +1904,49 @@ static void AddMemFactsFromAttributes(CallBase &CB) {
     IP = std::next(CB.getIterator());
   }
   IRBuilder<> RB(IP->getParent(), IP);
-  addMemFactsFor(RB, &CB, R1, R2, memannot::CK_Ret);
+  if (HasAI(R1, R2))
+    addMemFact(RB, memannot::TagAllocInbounds, {&CB});
+  if (RetBytes) {
+    Value *C = createMemClaim(RB, &CB, RetBytes, memannot::CK_Ret);
+    CB.replaceUsesWithIf(C, [&](Use &U) {
+      return U.getUser() != C && !memannot::isMemFact(cast<Instruction>(U.getUser()));
+    });
+  }
+}
+
+// [LLM-generated] M5r: move a "mem.check" / "mem.free" bundle that sat on the
+// inlined call onto the matching calls of the inlined body (noreturn calls for
+// a check, deallocation calls for a free), with the census id.
+static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
+                                         Function::iterator FirstNewBlock,
+                                         Function *Caller) {
+  std::optional<OperandBundleUse> MB = CB.getOperandBundle(Tag);
+  if (!MB)
+    return;
+  OperandBundleDef Def(*MB);
+  MDNode *Id = CB.getMetadata(memannot::IdMD);
+  SmallVector<CallBase *, 4> Targets;
+  for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+    for (Instruction &I : *BI)
+      if (auto *C = dyn_cast<CallBase>(&I)) {
+        if (C->getOperandBundle(Tag))
+          continue;
+        if (Tag == memannot::TagCheck ? C->doesNotReturn()
+                                      : memannot::isDeallocCall(*C))
+          Targets.push_back(C);
+      }
+  for (CallBase *C : Targets) {
+    SmallVector<OperandBundleDef, 2> OBs;
+    C->getOperandBundlesAsDefs(OBs);
+    OBs.push_back(Def);
+    CallBase *NewC = CallBase::Create(C, OBs, C->getIterator());
+    NewC->takeName(C);
+    NewC->copyMetadata(*C);
+    if (Id && !NewC->getMetadata(memannot::IdMD))
+      NewC->setMetadata(memannot::IdMD, Id);
+    C->replaceAllUsesWith(NewC);
+    C->eraseFromParent();
+  }
 }
 
 static void HandleByValArgumentInit(Type *ByValType, Value *Dst, Value *Src,
@@ -2702,7 +2746,8 @@ llvm::InlineResult llvm::CanInlineCallSite(const CallBase &CB,
       }
       // [LLM-generated] M5r: a "mem.check" marker is moved onto the inlined
       // body's noreturn calls (see InlineFunctionImpl).
-      if (OBUse.getTagName() == memannot::TagCheck)
+      if (OBUse.getTagName() == memannot::TagCheck ||
+          OBUse.getTagName() == memannot::TagFree)
         continue;
 
       return InlineResult::failure("unsupported operand bundle");
@@ -3010,27 +3055,10 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
       }
     }
 
-    // [LLM-generated] M5r: keep a "mem.check" marker that sat on the call.
-    if (std::optional<OperandBundleUse> MC =
-            CB.getOperandBundle(memannot::TagCheck)) {
-      OperandBundleDef Def(*MC);
-      SmallVector<CallBase *, 4> Targets;
-      for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
-        for (Instruction &I : *BI)
-          if (auto *C = dyn_cast<CallBase>(&I))
-            if (C->doesNotReturn() && !memannot::hasMemCheck(*C))
-              Targets.push_back(C);
-      for (CallBase *C : Targets) {
-        SmallVector<OperandBundleDef, 2> OBs;
-        C->getOperandBundlesAsDefs(OBs);
-        OBs.push_back(Def);
-        CallBase *NewC = CallBase::Create(C, OBs, C->getIterator());
-        NewC->takeName(C);
-        NewC->copyMetadata(*C);
-        C->replaceAllUsesWith(NewC);
-        C->eraseFromParent();
-      }
-    }
+    // [LLM-generated] M5r: keep "mem.check" / "mem.free" markers that sat on
+    // the call.
+    moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
+    moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
 
     // For 'nodebug' functions, the associated DISubprogram is always null.
     // Conservatively avoid propagating the callsite debug location to

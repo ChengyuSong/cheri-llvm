@@ -1,5 +1,5 @@
 //===- MemAnnotCensus.cpp - M5r annotation census and late stub -----------===//
-// [LLM-generated] CHERI M5r R0. See MemAnnotCensus.h.
+// [LLM-generated] CHERI M5r R0/R1. See MemAnnotCensus.h.
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -44,30 +44,44 @@ static cl::opt<bool> CensusVerbose(
 
 static cl::opt<bool> CensusTestErase(
     "mem-annot-census-test-erase", cl::init(false), cl::Hidden,
-    cl::desc("M5r (testing only): after the start census, erase the first "
-             "mem.claim fact to simulate a pass that loses it"));
+    cl::desc("M5r (testing only): after the start census, fold the first "
+             "llvm.mem.claim into its operand to simulate a pass that loses "
+             "it"));
 
 bool memannot::censusAtPipelineStart() { return CensusAtStart; }
 
 namespace {
 enum Kind : unsigned {
   K_Check, K_Guard, K_Claim, K_AllocInbounds, K_Inbounds, K_Free,
-  K_Invalidate, K_Dropped, K_NumKinds
+  K_LastUse, K_Dropped, K_NumKinds
 };
-const char *KindName[K_NumKinds] = {"check",      "guard",  "claim",
+const char *KindName[K_NumKinds] = {"check",    "guard",  "claim",
                                     "alloc_inbounds", "inbounds", "free",
-                                    "invalidate", "dropped"};
+                                    "last_use", "dropped"};
+// Kinds counted only (fail-safe hints; cloning may add some).
+bool isHintKind(unsigned K) { return K == K_Guard || K == K_LastUse; }
 
 bool kindFromTag(StringRef T, Kind &K) {
-  if (T == memannot::TagClaim) K = K_Claim;
-  else if (T == memannot::TagAllocInbounds) K = K_AllocInbounds;
+  if (T == memannot::TagAllocInbounds) K = K_AllocInbounds;
   else if (T == memannot::TagInbounds) K = K_Inbounds;
-  else if (T == memannot::TagFree) K = K_Free;
-  else if (T == memannot::TagInvalidate) K = K_Invalidate;
   else if (T == memannot::TagDropped) K = K_Dropped;
   else return false;
   return true;
 }
+
+// Watches a claim: a RAUW to a non-claim value means a pass folded the claim
+// into its operand (a real loss); deletion without RAUW means it was unused.
+struct ClaimVH final : CallbackVH {
+  bool FoldedAway = false;
+  explicit ClaimVH(Value *V) : CallbackVH(V) {}
+  void allUsesReplacedWith(Value *New) override {
+    if (!memannot::isMemClaim(New) && !isa<PoisonValue>(New) &&
+        !isa<UndefValue>(New))
+      FoldedAway = true;
+    setValPtr(New);
+  }
+  void deleted() override { setValPtr(nullptr); }
+};
 
 struct Entry {
   Kind K;
@@ -102,6 +116,7 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
 
 struct State {
   std::map<uint64_t, Entry> Entries; // id -> entry
+  std::map<uint64_t, std::unique_ptr<ClaimVH>> Claims; // id -> watcher
   uint64_t NextId = 1;
   unsigned Start[K_NumKinds] = {};
   StringMap<unsigned> CheckCallees; // callee -> calls with mem.check at start
@@ -166,6 +181,8 @@ bool memannot::runCensusStart(Module &M) {
     std::optional<uint64_t> Site;
     if (K == K_Check)
       Site = constSite(cast<CallBase>(I));
+    if (K == K_Claim)
+      S.Claims[Id] = std::make_unique<ClaimVH>(&I);
     S.Entries[Id] = Entry{K, WeakVH(I.getParent()),
                           I.getFunction()->getName().str(), Site};
     ++S.Start[K];
@@ -175,6 +192,8 @@ bool memannot::runCensusStart(Module &M) {
     for (Instruction &I : instructions(F)) {
       if (I.getMetadata(memannot::GuardMD))
         ++S.Start[K_Guard];
+      if (I.getMetadata(memannot::LastUseMD))
+        ++S.Start[K_LastUse];
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -185,9 +204,18 @@ bool memannot::runCensusStart(Module &M) {
           Tag(I, K);
         continue;
       }
+      if (memannot::isMemClaim(CB)) {
+        Tag(I, K_Claim);
+        continue;
+      }
       if (memannot::hasMemCheck(*CB)) {
         ++S.CheckCallees[calleeName(*CB)];
         Tag(I, K_Check);
+        if (CB->getOperandBundle(memannot::TagFree))
+          ++S.Start[K_Free]; // untracked (one id per call)
+      } else if (CB->getOperandBundle(memannot::TagFree)) {
+        ++S.PlainCallees[calleeName(*CB)];
+        Tag(I, K_Free);
       } else {
         ++S.PlainCallees[calleeName(*CB)];
       }
@@ -195,9 +223,8 @@ bool memannot::runCensusStart(Module &M) {
   if (CensusTestErase)
     for (Function &F : M)
       for (Instruction &I : instructions(F))
-        if (auto *II = dyn_cast<IntrinsicInst>(&I);
-            II && II->getIntrinsicID() == Intrinsic::mem_fact &&
-            II->getOperandBundleAt(0).getTagName() == memannot::TagClaim) {
+        if (memannot::isMemClaim(&I)) {
+          I.replaceAllUsesWith(cast<CallBase>(I).getArgOperand(0));
           I.eraseFromParent();
           return true;
         }
@@ -221,6 +248,8 @@ static void runCensusLateImpl(Module &M) {
     for (Instruction &I : instructions(F)) {
       if (I.getMetadata(memannot::GuardMD))
         ++Late[K_Guard];
+      if (I.getMetadata(memannot::LastUseMD))
+        ++Late[K_LastUse];
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -231,12 +260,20 @@ static void runCensusLateImpl(Module &M) {
         if (!factKind(II, K))
           continue;
         IsAnnot = true;
+      } else if (memannot::isMemClaim(CB)) {
+        K = K_Claim;
+        IsAnnot = true;
       } else if (memannot::hasMemCheck(*CB)) {
         K = K_Check;
         IsAnnot = true;
         SmallPtrSet<Value *, 8> Visited;
         collectSites(CB->getOperandBundle(memannot::TagCheck)->Inputs[3],
                      SeenSites, Visited);
+        if (CB->getOperandBundle(memannot::TagFree))
+          ++Late[K_Free];
+      } else if (CB->getOperandBundle(memannot::TagFree)) {
+        K = K_Free;
+        IsAnnot = true;
       } else if (SP && SP->CheckCallees.count(calleeName(*CB)) &&
                  !SP->PlainCallees.count(calleeName(*CB))) {
         ++Stripped;
@@ -279,10 +316,10 @@ static void runCensusLateImpl(Module &M) {
   Line("late", Late);
 
   // Classify the losses.
-  enum { R_BlockDeleted, R_Unreachable, R_Dropped, R_IdStripped,
+  enum { R_BlockDeleted, R_Unreachable, R_Dropped, R_Dead, R_IdStripped,
          R_Unexplained, R_Num };
   const char *RName[R_Num] = {"block-deleted", "unreachable-block", "dropped",
-                              "id-stripped", "unexplained"};
+                              "dead",          "id-stripped",       "unexplained"};
   unsigned Lost[K_NumKinds][R_Num] = {};
   DenseMap<const Function *, SmallPtrSet<const BasicBlock *, 32>> Reach;
   auto Reachable = [&](BasicBlock *BB) {
@@ -307,13 +344,25 @@ static void runCensusLateImpl(Module &M) {
       continue; // merged into another failure call (site PHI) or id dropped
     BasicBlock *BB = cast_or_null<BasicBlock>((Value *)E.BB);
     unsigned R;
-    if (!BB || !BB->getParent())
+    ClaimVH *CV = nullptr;
+    if (E.K == K_Claim) {
+      auto CI = SP->Claims.find(Id);
+      if (CI != SP->Claims.end())
+        CV = CI->second.get();
+    }
+    if (CV && CV->FoldedAway) {
+      R = R_Unexplained;
+      Unexplained.push_back("claim #" + std::to_string(Id) + " in " + E.Fn +
+                            " (folded into a non-claim value)");
+    } else if (!BB || !BB->getParent())
       R = R_BlockDeleted;
     else if (!Reachable(BB))
       R = R_Unreachable;
     else if (NoId[E.K]) {
       --NoId[E.K];
       R = R_IdStripped;
+    } else if (E.K == K_Claim) {
+      R = R_Dead; // deleted while unused (trivially dead)
     } else {
       R = R_Unexplained;
       Unexplained.push_back(std::string(KindName[E.K]) + " #" +
@@ -324,12 +373,12 @@ static void runCensusLateImpl(Module &M) {
   std::string LostStr;
   raw_string_ostream LOS(LostStr);
   for (unsigned K = 0; K < K_NumKinds; ++K) {
-    if (K == K_Guard) {
-      // Guards are not tracked individually (cloning may add some); a net
+    if (isHintKind(K)) {
+      // Hints are not tracked individually (cloning may add some); a net
       // decrease is reported as fail-safe.
       unsigned S = SP->Start[K], L = Late[K];
       if (S > L)
-        LOS << " guard=" << (S - L) << "(fail-safe)";
+        LOS << " " << KindName[K] << "=" << (S - L) << "(fail-safe)";
       continue;
     }
     unsigned Sum = 0;
@@ -371,21 +420,29 @@ void memannot::runCensusLate(Module &M) {
       I.setMetadata(memannot::IdMD, nullptr);
 }
 
+bool memannot::censusActive(const Module &M) {
+  std::lock_guard<std::mutex> G(stateLock());
+  return states().count(&M) != 0;
+}
+
 bool memannot::stripAnnotations(Module &M) {
   bool Changed = false;
   SmallVector<Instruction *, 32> Facts;
   SmallVector<CallBase *, 32> Bundled;
+  SmallVector<Instruction *, 32> Claims;
   unsigned GuardKind = M.getContext().getMDKindID(memannot::GuardMD);
+  unsigned LastUseKind = M.getContext().getMDKindID(memannot::LastUseMD);
   unsigned IdKind = M.getContext().getMDKindID(memannot::IdMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
-      if (I.getMetadata(GuardKind)) {
-        I.setMetadata(GuardKind, nullptr);
-        Changed = true;
-      }
-      if (I.getMetadata(IdKind)) {
-        I.setMetadata(IdKind, nullptr);
-        Changed = true;
+      for (unsigned MK : {GuardKind, LastUseKind, IdKind})
+        if (I.getMetadata(MK)) {
+          I.setMetadata(MK, nullptr);
+          Changed = true;
+        }
+      if (memannot::isMemClaim(&I)) {
+        Claims.push_back(&I);
+        continue;
       }
       if (memannot::isMemFact(&I)) {
         Facts.push_back(&I);
@@ -415,6 +472,11 @@ bool memannot::stripAnnotations(Module &M) {
     NoteOps(cast<CallBase>(I), true);
     I->eraseFromParent();
   }
+  // A claim is the identity on its pointer: replace it with its operand.
+  for (Instruction *I : Claims) {
+    I->replaceAllUsesWith(cast<CallBase>(I)->getArgOperand(0));
+    I->eraseFromParent();
+  }
   for (CallBase *CB : Bundled) {
     SmallVector<OperandBundleDef, 2> Keep;
     for (unsigned B = 0, E = CB->getNumOperandBundles(); B != E; ++B) {
@@ -432,11 +494,14 @@ bool memannot::stripAnnotations(Module &M) {
   if (Function *Decl = M.getFunction("llvm.mem.fact"))
     if (Decl->use_empty())
       Decl->eraseFromParent();
-  return Changed || !Facts.empty() || !Bundled.empty();
+  for (Function &F : make_early_inc_range(M))
+    if (F.getIntrinsicID() == Intrinsic::mem_claim && F.use_empty())
+      F.eraseFromParent();
+  return Changed || !Facts.empty() || !Bundled.empty() || !Claims.empty();
 }
 
 bool memannot::runCheriBoundsLoweringStub(Module &M) {
-  // R0: no decisions. Census, then strip so ISel is unchanged.
+  // R0/R1: no decisions. Census, then strip so ISel is unchanged.
   runCensusLate(M);
   return stripAnnotations(M);
 }

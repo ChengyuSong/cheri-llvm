@@ -1621,6 +1621,14 @@ private:
       return;
     }
 
+    // [LLM-generated] M5r: llvm.mem.claim returns its pointer operand; slice
+    // through it like a no-op cast. A claim on a promoted slot is vacuous.
+    if (II.getIntrinsicID() == Intrinsic::mem_claim && U->getOperandNo() == 0) {
+      if (II.use_empty())
+        return markAsDead(II);
+      return enqueueUsers(II);
+    }
+
     if (!IsOffsetKnown)
       return PI.setAborted(&II);
 

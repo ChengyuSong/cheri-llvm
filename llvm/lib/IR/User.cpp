@@ -127,8 +127,8 @@ bool User::isDroppable() const {
     case Intrinsic::experimental_noalias_scope_decl:
       return true;
     case Intrinsic::mem_fact: {
-      // [LLM-generated] M5r: only fail-safe facts are droppable; a claim or
-      // free must survive (it would otherwise lose a narrow / a free).
+      // [LLM-generated] M5r: every R1 fact is fail-safe (claims and frees are
+      // no longer facts); keep the tag check for robustness.
       for (unsigned I = 0, E = II->getNumOperandBundles(); I != E; ++I)
         if (!memannot::isDroppableFactTag(
                 II->getOperandBundleAt(I).getTagName()))

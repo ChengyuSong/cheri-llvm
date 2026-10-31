@@ -1069,14 +1069,25 @@ def int_assume : DefaultAttrsIntrinsic<[], [llvm_i1_ty],
                    [IntrWriteMem, IntrInaccessibleMemOnly,
                     NoUndef<ArgIndex<0>>]>;
 
-// 'llvm.mem.fact' (CHERI M5r, target-neutral): carries memory-safety facts
-// from the front end to late lowering in operand bundles ("mem.claim",
-// "mem.alloc_inbounds", "mem.inbounds", "mem.free", "mem.invalidate").
+// 'llvm.mem.fact' (CHERI M5r, target-neutral): carries proved memory-safety
+// facts from the front end to late lowering in operand bundles
+// ("mem.alloc_inbounds", "mem.inbounds"; "mem.dropped" after promotion).
 // Like llvm.assume it only touches inaccessible memory, so it orders against
 // other facts but not against ordinary loads/stores, and its bundle operands
 // are captures(none). See llvm/IR/MemAnnot.h. [LLM-generated]
 def int_mem_fact : DefaultAttrsIntrinsic<[], [],
                    [IntrWriteMem, IntrInaccessibleMemOnly]>;
+
+// 'llvm.mem.claim' (CHERI M5r, D11): %q = llvm.mem.claim(%p, len, flags)
+// returns %p, claimed valid for 'len' bytes (D15: nothing more). Later uses
+// of the claimed pointer use %q, so the claim's scope is a data dependence.
+// It is a pure, speculatable no-op for generic passes (AA/SCEV look through
+// it like launder.invariant.group); the late CHERI pass lowers it and the
+// R0/R1 stub replaces it with %p. No 'returned' attribute on purpose, so
+// InstCombine does not fold it away. [LLM-generated]
+def int_mem_claim : DefaultAttrsIntrinsic<[llvm_anyptr_ty],
+                    [LLVMMatchType<0>, llvm_i64_ty, llvm_i64_ty],
+                    [IntrNoMem, IntrSpeculatable, ImmArg<ArgIndex<2>>]>;
 
 // 'llvm.experimental.noalias.scope.decl' intrinsic: Inserted at the location of
 // noalias scope declaration. Makes it possible to identify that a noalias scope

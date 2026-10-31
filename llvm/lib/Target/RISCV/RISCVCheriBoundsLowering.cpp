@@ -1,6 +1,7 @@
 //===- RISCVCheriBoundsLowering.cpp - M5r late CHERI pass (R0 stub) -------===//
-// [LLM-generated] CHERI M5r R0. Placed just before LoopStrengthReduce in the
-// RISC-V IR pipeline (at every opt level). In R0 it makes no CHERI decisions:
+// [LLM-generated] CHERI M5r R0/R1. Placed just before CheriBoundAllocas (and
+// so before LoopStrengthReduce) in the RISC-V IR pipeline (at every opt
+// level). In R0/R1 it makes no CHERI decisions:
 // it runs the late annotation census and strips the annotations so ISel sees
 // the same IR as without them. See llvm/Transforms/Utils/MemAnnotCensus.h.
 #include "RISCV.h"
