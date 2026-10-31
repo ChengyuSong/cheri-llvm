@@ -62,10 +62,19 @@ enum ClaimFlags : uint64_t {
   CF_KindMask = 0xff,
   CF_Untrusted = 1u << 8,
   CF_Nullable = 1u << 9,
+  /// R1: the claimed pointer comes from a rustc-verified producer (inlined
+  /// Vec/Box Global scope); the late pass may discharge the claim.
+  CF_Verified = 1u << 10,
 };
 enum CheckKind : uint64_t {
   CHK_Index = 0, CHK_RangeStart, CHK_RangeEnd, CHK_RangeOrder, CHK_CopyLen,
   CHK_RawChecked
+};
+enum CheckFlags : uint64_t {
+  CHKF_KindMask = 0xff,
+  /// R1: the guarded operation is a borrow (&a[i]), not an access; the check
+  /// cannot be replaced by the hardware fault at the access.
+  CHKF_Borrow = 1u << 8,
 };
 
 /// Any "mem." bundle tag (fact tags and "mem.check").
