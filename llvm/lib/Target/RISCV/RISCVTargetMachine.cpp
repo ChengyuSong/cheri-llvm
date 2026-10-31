@@ -132,6 +132,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVQCRelaxMarkingPass(*PR);
   initializeRISCVGatherScatterLoweringPass(*PR);
   initializeRISCVCodeGenPrepareLegacyPassPass(*PR);
+  initializeRISCVCheriBoundsLoweringPass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
   initializeRISCVMergeBaseOffsetOptPass(*PR);
   initializeRISCVOptWInstrsPass(*PR);
@@ -496,6 +497,8 @@ void RISCVPassConfig::addIRPasses() {
 
   addPass(createCheriotZeroSRetPass());
   addPass(createCheriBoundAllocasLegacyPass());
+  // [LLM-generated] M5r: the late CHERI pass sits just before LSR.
+  addPass(createRISCVCheriBoundsLoweringPass());
   TargetPassConfig::addIRPasses();
 
   if (getOptLevel() == CodeGenOptLevel::Aggressive && EnableSelectOpt)

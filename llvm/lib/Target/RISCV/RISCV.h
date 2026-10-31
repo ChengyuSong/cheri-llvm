@@ -43,6 +43,9 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };
 FunctionPass *createRISCVCodeGenPrepareLegacyPass();
+// [LLM-generated] M5r late CHERI pass (R0: census + strip annotations).
+ModulePass *createRISCVCheriBoundsLoweringPass();
+void initializeRISCVCheriBoundsLoweringPass(PassRegistry &);
 void initializeRISCVCodeGenPrepareLegacyPassPass(PassRegistry &);
 
 FunctionPass *createRISCVDeadRegisterDefinitionsPass();

@@ -369,6 +369,7 @@
 #include "llvm/Transforms/Utils/CanonicalizeFreezeInLoops.h"
 #include "llvm/Transforms/Utils/CheriLogSetBounds.h"
 #include "llvm/Transforms/Utils/CheriSkipNarrow.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/Transforms/Utils/CountVisits.h"
 #include "llvm/Transforms/Utils/DXILUpgrade.h"
 #include "llvm/Transforms/Utils/Debugify.h"

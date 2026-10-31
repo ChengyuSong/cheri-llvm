@@ -138,6 +138,7 @@
 #include "llvm/Transforms/Scalar/SpeculativeExecution.h"
 #include "llvm/Transforms/Scalar/TailRecursionElimination.h"
 #include "llvm/Transforms/Scalar/WarnMissedTransforms.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/Transforms/Utils/AddDiscriminators.h"
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
@@ -1793,6 +1794,10 @@ PassBuilder::buildPerModuleDefaultPipeline(OptimizationLevel Level,
   if (PGOOpt && PGOOpt->DebugInfoForProfiling)
     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
 
+  // [LLM-generated] M5r: annotation census at pipeline start.
+  if (memannot::censusAtPipelineStart())
+    MPM.addPass(MemAnnotCensusPass(/*Late=*/false));
+
   // Apply module pipeline start EP callback.
   invokePipelineStartEPCallbacks(MPM, Level);
 
@@ -2428,6 +2433,10 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
   // Instrument function entry and exit before all inlining.
   MPM.addPass(createModuleToFunctionPassAdaptor(
       EntryExitInstrumenterPass(/*PostInlining=*/false)));
+
+  // [LLM-generated] M5r: annotation census at pipeline start.
+  if (memannot::censusAtPipelineStart())
+    MPM.addPass(MemAnnotCensusPass(/*Late=*/false));
 
   invokePipelineStartEPCallbacks(MPM, Level);
 
