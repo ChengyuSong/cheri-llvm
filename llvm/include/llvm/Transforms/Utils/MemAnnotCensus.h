@@ -60,6 +60,8 @@ LLVM_ABI bool censusActive(const Module &M);
 LLVM_ABI void noteRedundantFact(const Instruction &I);
 /// -mem-annot-census-per-pass: attribute annotation count changes to passes.
 LLVM_ABI bool censusPerPass();
+/// The pass now running (set by the per-pass instrumentation; for loss reports).
+LLVM_ABI void setCurrentPass(StringRef Pass);
 /// Number of annotation kinds counted by countAnnotations.
 inline constexpr unsigned NumCensusKinds = 8;
 /// Count annotations in \p F (check, guard, claim, alloc_inbounds, inbounds,

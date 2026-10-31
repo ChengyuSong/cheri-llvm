@@ -78,8 +78,11 @@ bool kindFromTag(StringRef T, Kind &K) {
 
 // Watches a claim: a RAUW to a non-claim value means a pass folded the claim
 // into its operand (a real loss); deletion without RAUW means it was unused.
+static thread_local std::string CurrentPass;
+
 struct ClaimVH final : CallbackVH {
   bool FoldedAway = false;
+  std::string FoldInfo;
   bool ObjectExact = false;
   explicit ClaimVH(Value *V) : CallbackVH(V) {}
   void allUsesReplacedWith(Value *New) override {
@@ -87,8 +90,14 @@ struct ClaimVH final : CallbackVH {
     if (Old && Old->getMetadata(memannot::ObjectExactMD))
       ObjectExact = true;
     else if (!memannot::isMemClaim(New) && !isa<PoisonValue>(New) &&
-             !isa<UndefValue>(New))
+             !isa<UndefValue>(New)) {
       FoldedAway = true;
+      std::string K = isa<Instruction>(New)
+                          ? cast<Instruction>(New)->getOpcodeName()
+                          : isa<Argument>(New) ? "argument" : "constant";
+      FoldInfo = (CurrentPass.empty() ? std::string("?") : CurrentPass) +
+                 " -> " + K;
+    }
     setValPtr(New);
   }
   void deleted() override { setValPtr(nullptr); }
@@ -385,7 +394,7 @@ static void runCensusLateImpl(Module &M) {
     } else if (CV && CV->FoldedAway) {
       R = R_Unexplained;
       Unexplained.push_back("claim #" + std::to_string(Id) + " in " + E.Fn +
-                            " (folded into a non-claim value)");
+                            " (folded into a non-claim value: " + CV->FoldInfo + ")");
     } else if (!BB || !BB->getParent())
       R = R_BlockDeleted;
     else if (!Reachable(BB))
@@ -621,3 +630,5 @@ static void reportPassDeltas(Module &M, raw_ostream &OS) {
   }
   passDeltas().erase(It);
 }
+
+void memannot::setCurrentPass(StringRef Pass) { CurrentPass = Pass.str(); }

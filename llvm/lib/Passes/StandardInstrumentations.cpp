@@ -2552,6 +2552,7 @@ void registerMemAnnotPerPass(PassInstrumentationCallbacks &PIC) {
   PIC.registerBeforeNonSkippedPassCallback([Stack](StringRef P, Any IR) {
     if (memAnnotSkipPass(P))
       return;
+    memannot::setCurrentPass(P);
     Stack->push_back(countMemAnnotUnit(IR));
   });
   PIC.registerAfterPassCallback(
