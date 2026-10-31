@@ -1704,6 +1704,10 @@ bool LoopVectorizationLegality::isVectorizableEarlyExitLoop() {
   bool HasSideEffects = false;
   for (auto *BB : TheLoop->blocks())
     for (auto &I : *BB) {
+      // [LLM-generated] M5r: llvm.mem.fact annotations neither write memory
+      // nor trap; they are replicated per lane like any other fact.
+      if (match(&I, m_Intrinsic<Intrinsic::mem_fact>()))
+        continue;
       if (I.mayWriteToMemory()) {
         if (isa<StoreInst>(&I) && cast<StoreInst>(&I)->isSimple()) {
           HasSideEffects = true;

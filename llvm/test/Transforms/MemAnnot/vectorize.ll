@@ -322,6 +322,196 @@ define void @slp(ptr %a, ptr %b) {
   store i32 %y1, ptr %b1
   ret void
 }
+
+; Early-exit loop: the fact must not count as a write (it is re-executed
+; harmlessly in the scalar tail).
+define i64 @early_exit(ptr dereferenceable(1024) align 4 %a) {
+; LV-LABEL: define i64 @early_exit(
+; LV-SAME: ptr align 4 dereferenceable(1024) [[A:%.*]]) {
+; LV-NEXT:  [[ENTRY:.*:]]
+; LV-NEXT:    br label %[[LOOP:.*]]
+; LV:       [[LOOP]]:
+; LV-NEXT:    br label %[[VECTOR_BODY:.*]]
+; LV:       [[VECTOR_BODY]]:
+; LV-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[LOOP]] ], [ [[INDEX_NEXT:%.*]], %[[LATCH:.*]] ]
+; LV-NEXT:    [[TMP0:%.*]] = add i64 [[I]], 1
+; LV-NEXT:    [[TMP1:%.*]] = add i64 [[I]], 2
+; LV-NEXT:    [[TMP2:%.*]] = add i64 [[I]], 3
+; LV-NEXT:    [[P:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[I]]
+; LV-NEXT:    [[TMP4:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP0]]
+; LV-NEXT:    [[TMP5:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP1]]
+; LV-NEXT:    [[TMP6:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[TMP2]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[P]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP4]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP5]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP6]], i64 4, i64 0) ]
+; LV-NEXT:    [[WIDE_LOAD:%.*]] = load <4 x i32>, ptr [[P]], align 4
+; LV-NEXT:    [[TMP7:%.*]] = icmp eq <4 x i32> [[WIDE_LOAD]], splat (i32 7)
+; LV-NEXT:    [[TMP8:%.*]] = freeze <4 x i1> [[TMP7]]
+; LV-NEXT:    [[F:%.*]] = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> [[TMP8]])
+; LV-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[I]], 4
+; LV-NEXT:    [[TMP10:%.*]] = icmp eq i64 [[INDEX_NEXT]], 256
+; LV-NEXT:    br i1 [[F]], label %[[EXIT:.*]], label %[[LATCH]]
+; LV:       [[LATCH]]:
+; LV-NEXT:    br i1 [[TMP10]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP6:![0-9]+]]
+; LV:       [[MIDDLE_BLOCK]]:
+; LV-NEXT:    br label %[[EXIT1:.*]]
+; LV:       [[EXIT]]:
+; LV-NEXT:    [[TMP11:%.*]] = call i64 @llvm.experimental.cttz.elts.i64.v4i1(<4 x i1> [[TMP7]], i1 false)
+; LV-NEXT:    [[TMP12:%.*]] = add i64 [[I]], [[TMP11]]
+; LV-NEXT:    br label %[[EXIT1]]
+; LV:       [[EXIT1]]:
+; LV-NEXT:    [[R:%.*]] = phi i64 [ [[TMP12]], %[[EXIT]] ], [ -1, %[[MIDDLE_BLOCK]] ]
+; LV-NEXT:    ret i64 [[R]]
+;
+; SLP-LABEL: define i64 @early_exit(
+; SLP-SAME: ptr align 4 dereferenceable(1024) [[A:%.*]]) {
+; SLP-NEXT:  [[ENTRY:.*]]:
+; SLP-NEXT:    br label %[[LOOP:.*]]
+; SLP:       [[LOOP]]:
+; SLP-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[LATCH:.*]] ]
+; SLP-NEXT:    [[P:%.*]] = getelementptr inbounds i32, ptr [[A]], i64 [[I]]
+; SLP-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[P]], i64 4, i64 0) ]
+; SLP-NEXT:    [[V:%.*]] = load i32, ptr [[P]], align 4
+; SLP-NEXT:    [[F:%.*]] = icmp eq i32 [[V]], 7
+; SLP-NEXT:    br i1 [[F]], label %[[EXIT:.*]], label %[[LATCH]]
+; SLP:       [[LATCH]]:
+; SLP-NEXT:    [[I1]] = add nuw nsw i64 [[I]], 1
+; SLP-NEXT:    [[C:%.*]] = icmp ult i64 [[I1]], 256
+; SLP-NEXT:    br i1 [[C]], label %[[LOOP]], label %[[EXIT]]
+; SLP:       [[EXIT]]:
+; SLP-NEXT:    [[R:%.*]] = phi i64 [ [[I]], %[[LOOP]] ], [ -1, %[[LATCH]] ]
+; SLP-NEXT:    ret i64 [[R]]
+;
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %latch ]
+  %p = getelementptr inbounds i32, ptr %a, i64 %i
+  call void @llvm.mem.fact() [ "mem.claim"(ptr %p, i64 4, i64 0) ]
+  %v = load i32, ptr %p, align 4
+  %f = icmp eq i32 %v, 7
+  br i1 %f, label %exit, label %latch
+latch:
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 256
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = phi i64 [ %i, %loop ], [ -1, %latch ]
+  ret i64 %r
+}
+
+; maxnum reduction without fast-math (NaN-propagating handling bails on
+; writes; the fact must not count).
+define float @fmaxnum(ptr %src, i64 %n) {
+; LV-LABEL: define float @fmaxnum(
+; LV-SAME: ptr [[SRC:%.*]], i64 [[N:%.*]]) {
+; LV-NEXT:  [[ENTRY:.*]]:
+; LV-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[N]], 8
+; LV-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]
+; LV:       [[VECTOR_PH]]:
+; LV-NEXT:    [[N_MOD_VF:%.*]] = urem i64 [[N]], 8
+; LV-NEXT:    [[N_VEC:%.*]] = sub i64 [[N]], [[N_MOD_VF]]
+; LV-NEXT:    br label %[[VECTOR_BODY:.*]]
+; LV:       [[VECTOR_BODY]]:
+; LV-NEXT:    [[INDEX:%.*]] = phi i64 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]
+; LV-NEXT:    [[VEC_PHI:%.*]] = phi <4 x float> [ splat (float -1.000000e+07), %[[VECTOR_PH]] ], [ [[TMP16:%.*]], %[[VECTOR_BODY]] ]
+; LV-NEXT:    [[VEC_PHI1:%.*]] = phi <4 x float> [ splat (float -1.000000e+07), %[[VECTOR_PH]] ], [ [[TMP17:%.*]], %[[VECTOR_BODY]] ]
+; LV-NEXT:    [[TMP0:%.*]] = add i64 [[INDEX]], 1
+; LV-NEXT:    [[TMP1:%.*]] = add i64 [[INDEX]], 2
+; LV-NEXT:    [[TMP2:%.*]] = add i64 [[INDEX]], 3
+; LV-NEXT:    [[TMP3:%.*]] = add i64 [[INDEX]], 4
+; LV-NEXT:    [[TMP4:%.*]] = add i64 [[INDEX]], 5
+; LV-NEXT:    [[TMP5:%.*]] = add i64 [[INDEX]], 6
+; LV-NEXT:    [[TMP6:%.*]] = add i64 [[INDEX]], 7
+; LV-NEXT:    [[TMP7:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[INDEX]]
+; LV-NEXT:    [[TMP8:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP0]]
+; LV-NEXT:    [[TMP9:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP1]]
+; LV-NEXT:    [[TMP10:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP2]]
+; LV-NEXT:    [[TMP11:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP3]]
+; LV-NEXT:    [[TMP12:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP4]]
+; LV-NEXT:    [[TMP13:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP5]]
+; LV-NEXT:    [[TMP14:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[TMP6]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP7]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP8]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP9]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP10]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP11]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP12]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP13]], i64 4, i64 0) ]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[TMP14]], i64 4, i64 0) ]
+; LV-NEXT:    [[TMP15:%.*]] = getelementptr inbounds nuw float, ptr [[TMP7]], i64 4
+; LV-NEXT:    [[WIDE_LOAD:%.*]] = load <4 x float>, ptr [[TMP7]], align 4
+; LV-NEXT:    [[WIDE_LOAD2:%.*]] = load <4 x float>, ptr [[TMP15]], align 4
+; LV-NEXT:    [[TMP16]] = call <4 x float> @llvm.maxnum.v4f32(<4 x float> [[VEC_PHI]], <4 x float> [[WIDE_LOAD]])
+; LV-NEXT:    [[TMP17]] = call <4 x float> @llvm.maxnum.v4f32(<4 x float> [[VEC_PHI1]], <4 x float> [[WIDE_LOAD2]])
+; LV-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[INDEX]], 8
+; LV-NEXT:    [[TMP18:%.*]] = fcmp uno <4 x float> [[WIDE_LOAD]], [[WIDE_LOAD2]]
+; LV-NEXT:    [[TMP19:%.*]] = freeze <4 x i1> [[TMP18]]
+; LV-NEXT:    [[TMP20:%.*]] = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> [[TMP19]])
+; LV-NEXT:    [[TMP21:%.*]] = icmp eq i64 [[INDEX_NEXT]], [[N_VEC]]
+; LV-NEXT:    [[TMP22:%.*]] = or i1 [[TMP20]], [[TMP21]]
+; LV-NEXT:    br i1 [[TMP22]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP7:![0-9]+]]
+; LV:       [[MIDDLE_BLOCK]]:
+; LV-NEXT:    [[TMP23:%.*]] = select i1 [[TMP20]], <4 x float> [[VEC_PHI]], <4 x float> [[TMP16]]
+; LV-NEXT:    [[TMP24:%.*]] = select i1 [[TMP20]], <4 x float> [[VEC_PHI1]], <4 x float> [[TMP17]]
+; LV-NEXT:    [[TMP25:%.*]] = select i1 [[TMP20]], i64 [[INDEX]], i64 [[N_VEC]]
+; LV-NEXT:    [[RDX_MINMAX:%.*]] = call <4 x float> @llvm.maxnum.v4f32(<4 x float> [[TMP23]], <4 x float> [[TMP24]])
+; LV-NEXT:    [[TMP26:%.*]] = call float @llvm.vector.reduce.fmax.v4f32(<4 x float> [[RDX_MINMAX]])
+; LV-NEXT:    [[CMP_N:%.*]] = icmp eq i64 [[N]], [[N_VEC]]
+; LV-NEXT:    [[TMP27:%.*]] = xor i1 [[TMP20]], true
+; LV-NEXT:    [[TMP28:%.*]] = and i1 [[CMP_N]], [[TMP27]]
+; LV-NEXT:    br i1 [[TMP28]], label %[[EXIT:.*]], label %[[SCALAR_PH]]
+; LV:       [[SCALAR_PH]]:
+; LV-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i64 [ [[TMP25]], %[[MIDDLE_BLOCK]] ], [ 0, %[[ENTRY]] ]
+; LV-NEXT:    [[BC_MERGE_RDX:%.*]] = phi float [ [[TMP26]], %[[MIDDLE_BLOCK]] ], [ -1.000000e+07, %[[ENTRY]] ]
+; LV-NEXT:    br label %[[LOOP:.*]]
+; LV:       [[LOOP]]:
+; LV-NEXT:    [[IV:%.*]] = phi i64 [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]
+; LV-NEXT:    [[MAX:%.*]] = phi float [ [[BC_MERGE_RDX]], %[[SCALAR_PH]] ], [ [[MAX_NEXT:%.*]], %[[LOOP]] ]
+; LV-NEXT:    [[GEP:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[IV]]
+; LV-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[GEP]], i64 4, i64 0) ]
+; LV-NEXT:    [[L:%.*]] = load float, ptr [[GEP]], align 4
+; LV-NEXT:    [[MAX_NEXT]] = call float @llvm.maxnum.f32(float [[MAX]], float [[L]])
+; LV-NEXT:    [[IV_NEXT]] = add nuw nsw i64 [[IV]], 1
+; LV-NEXT:    [[EC:%.*]] = icmp eq i64 [[IV_NEXT]], [[N]]
+; LV-NEXT:    br i1 [[EC]], label %[[EXIT]], label %[[LOOP]], !llvm.loop [[LOOP8:![0-9]+]]
+; LV:       [[EXIT]]:
+; LV-NEXT:    [[MAX_NEXT_LCSSA:%.*]] = phi float [ [[MAX_NEXT]], %[[LOOP]] ], [ [[TMP26]], %[[MIDDLE_BLOCK]] ]
+; LV-NEXT:    ret float [[MAX_NEXT_LCSSA]]
+;
+; SLP-LABEL: define float @fmaxnum(
+; SLP-SAME: ptr [[SRC:%.*]], i64 [[N:%.*]]) {
+; SLP-NEXT:  [[ENTRY:.*]]:
+; SLP-NEXT:    br label %[[LOOP:.*]]
+; SLP:       [[LOOP]]:
+; SLP-NEXT:    [[IV:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]
+; SLP-NEXT:    [[MAX:%.*]] = phi float [ -1.000000e+07, %[[ENTRY]] ], [ [[MAX_NEXT:%.*]], %[[LOOP]] ]
+; SLP-NEXT:    [[GEP:%.*]] = getelementptr inbounds nuw float, ptr [[SRC]], i64 [[IV]]
+; SLP-NEXT:    call void @llvm.mem.fact() [ "mem.claim"(ptr [[GEP]], i64 4, i64 0) ]
+; SLP-NEXT:    [[L:%.*]] = load float, ptr [[GEP]], align 4
+; SLP-NEXT:    [[MAX_NEXT]] = call float @llvm.maxnum.f32(float [[MAX]], float [[L]])
+; SLP-NEXT:    [[IV_NEXT]] = add nuw nsw i64 [[IV]], 1
+; SLP-NEXT:    [[EC:%.*]] = icmp eq i64 [[IV_NEXT]], [[N]]
+; SLP-NEXT:    br i1 [[EC]], label %[[EXIT:.*]], label %[[LOOP]]
+; SLP:       [[EXIT]]:
+; SLP-NEXT:    ret float [[MAX_NEXT]]
+;
+entry:
+  br label %loop
+loop:
+  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]
+  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]
+  %gep = getelementptr inbounds nuw float, ptr %src, i64 %iv
+  call void @llvm.mem.fact() [ "mem.claim"(ptr %gep, i64 4, i64 0) ]
+  %l = load float, ptr %gep, align 4
+  %max.next = call float @llvm.maxnum.f32(float %max, float %l)
+  %iv.next = add nuw nsw i64 %iv, 1
+  %ec = icmp eq i64 %iv.next, %n
+  br i1 %ec, label %exit, label %loop
+exit:
+  ret float %max.next
+}
 ;.
 ; LV: [[LOOP0]] = distinct !{[[LOOP0]], [[META1:![0-9]+]], [[META2:![0-9]+]]}
 ; LV: [[META1]] = !{!"llvm.loop.isvectorized", i32 1}
@@ -329,4 +519,7 @@ define void @slp(ptr %a, ptr %b) {
 ; LV: [[LOOP3]] = distinct !{[[LOOP3]], [[META2]], [[META1]]}
 ; LV: [[LOOP4]] = distinct !{[[LOOP4]], [[META1]], [[META2]]}
 ; LV: [[LOOP5]] = distinct !{[[LOOP5]], [[META2]], [[META1]]}
+; LV: [[LOOP6]] = distinct !{[[LOOP6]], [[META1]], [[META2]]}
+; LV: [[LOOP7]] = distinct !{[[LOOP7]], [[META1]], [[META2]]}
+; LV: [[LOOP8]] = distinct !{[[LOOP8]], [[META2]], [[META1]]}
 ;.

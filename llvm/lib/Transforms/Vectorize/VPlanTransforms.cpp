@@ -6105,7 +6105,8 @@ VPlanTransforms::narrowInterleaveGroups(VPlan &Plan,
       return nullptr;
 
     auto *InterleaveR = dyn_cast<VPInterleaveRecipe>(&R);
-    if (R.mayWriteToMemory() && !InterleaveR)
+    if (R.mayWriteToMemory() && !InterleaveR &&
+        !match(&R, m_Intrinsic<Intrinsic::mem_fact>())) // [LLM-generated] M5r
       return nullptr;
 
     // Bail out if any recipe defines a vector value used outside the
