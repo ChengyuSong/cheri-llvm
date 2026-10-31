@@ -83,6 +83,11 @@ static cl::opt<bool> AdoptOrphans(
     "cheri-bounds-adopt", cl::init(true), cl::Hidden,
     cl::desc("R4 (D26): a marker adopts guards of proved-away sites that "
              "index its base with its checked index"));
+static cl::opt<bool> BorrowDeref(
+    "cheri-bounds-borrow-deref", cl::init(true), cl::Hidden,
+    cl::desc("R4: a borrow check whose borrow is only dereferenced in the Ok "
+             "block, with no side effect before the access, is treated as an "
+             "access check (Vec/SmallVec Index borrows after inlining)"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -95,7 +100,7 @@ struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
-  unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0;
+  unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0, BorrowDeref = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
@@ -328,6 +333,61 @@ struct Lowering {
     Value *Index = nullptr; // the checked index, from Pred's compare (R3)
     SmallVector<GetElementPtrInst *, 2> Group; // re-linked shared guards
   };
+
+  // R4: the borrow made by each guard is only used as the address of loads
+  // and stores (directly or through constant-offset GEPs) in the Ok block,
+  // and nothing before the last such access in that block can write memory,
+  // unwind or not return. A fault at the access is then indistinguishable
+  // from the panic at the borrow (nothing observable happens in between).
+  static bool borrowOnlyDereferenced(const Marker &Mk,
+                                     ArrayRef<GetElementPtrInst *> Gs) {
+    if (!Mk.Ok || Gs.empty() || !Mk.Group.empty())
+      return false;
+    SmallPtrSet<const Instruction *, 8> Acc;
+    for (GetElementPtrInst *G : Gs) {
+      if (G->getParent() != Mk.Ok)
+        return false;
+      SmallVector<const Value *, 8> WL{G};
+      while (!WL.empty()) {
+        const Value *V = WL.pop_back_val();
+        for (const User *U : V->users()) {
+          auto *I = dyn_cast<Instruction>(U);
+          if (!I || I->getParent() != Mk.Ok)
+            return false;
+          if (auto *GG = dyn_cast<GetElementPtrInst>(I)) {
+            if (GG->getPointerOperand() != V || !GG->hasAllConstantIndices())
+              return false;
+            WL.push_back(GG);
+          } else if (auto *L = dyn_cast<LoadInst>(I)) {
+            if (L->isVolatile())
+              return false;
+            Acc.insert(L);
+          } else if (auto *St = dyn_cast<StoreInst>(I)) {
+            if (St->getPointerOperand() != V || St->isVolatile())
+              return false;
+            Acc.insert(St);
+          } else
+            return false;
+        }
+      }
+    }
+    if (Acc.empty())
+      return false;
+    unsigned Left = Acc.size();
+    for (const Instruction &I : *Mk.Ok) {
+      if (Acc.count(&I)) {
+        if (--Left == 0)
+          return true;
+        continue;
+      }
+      if (isa<DbgInfoIntrinsic>(I) || I.isLifetimeStartOrEnd() ||
+          isa<AssumeInst>(I) || memannot::isMemClaim(&I))
+        continue;
+      if (I.mayWriteToMemory() || I.mayThrow() || !I.willReturn())
+        return false;
+    }
+    return false;
+  }
 
   // R3: the index X of `X <u Len` (or `Len >u X`) that holds on the Ok edge.
   static Value *checkedIndex(const Marker &Mk) {
@@ -640,6 +700,11 @@ struct Lowering {
       }
       if (Borrow)
         ++S.Borrow;
+      if (Borrow && BorrowDeref && Pol != P_Narrow &&
+          borrowOnlyDereferenced(Mk, Mine)) {
+        Borrow = false;
+        ++S.BorrowDeref;
+      }
       if (RawSite)
         ++S.Raw;
       if (Mine.empty() && Mk.Group.empty()) {
@@ -1125,7 +1190,7 @@ struct Lowering {
            << " skipped=" << S.Skipped << " removed=" << S.Removed
            << " twoversion=" << S.TwoVersion
            << " twoversion_loop=" << S.TwoVersionInLoop
-           << " split=" << S.SplitMarkers << " adopted=" << S.Adopted << " noedge=" << S.NoEdge
+           << " split=" << S.SplitMarkers << " adopted=" << S.Adopted << " borrow_deref=" << S.BorrowDeref << " noedge=" << S.NoEdge
            << " kept=" << S.Kept << " hoisted=" << S.Hoisted
            << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
            << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked
