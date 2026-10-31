@@ -700,11 +700,6 @@ struct Lowering {
       }
       if (Borrow)
         ++S.Borrow;
-      if (Borrow && BorrowDeref && Pol != P_Narrow &&
-          borrowOnlyDereferenced(Mk, Mine)) {
-        Borrow = false;
-        ++S.BorrowDeref;
-      }
       if (RawSite)
         ++S.Raw;
       if (Mine.empty() && Mk.Group.empty()) {
@@ -713,6 +708,16 @@ struct Lowering {
       }
       std::optional<uint64_t> CB;
       Exactness Ex = exactness(Mk.Base, Mk.Len, Mk.Esz, CB);
+      // R4: a dereference-only borrow is lowered as an access check when the
+      // check can then be removed outright (ub, or an exact narrow). Under
+      // elide a Dynamic site would be two-versioned, which costs more than
+      // the kept compare (measured: k_vec_hist +1173 instret).
+      if (Borrow && BorrowDeref && Pol != P_Narrow &&
+          (Pol == P_UB || Ex == E_Always) &&
+          borrowOnlyDereferenced(Mk, Mine)) {
+        Borrow = false;
+        ++S.BorrowDeref;
+      }
       bool Proved = hasAllocInbounds(Mk.Base);
       auto BytesAt = [&](Builder &B) -> Value * {
         if (CB)
