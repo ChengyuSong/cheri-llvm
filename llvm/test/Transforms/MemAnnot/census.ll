@@ -66,5 +66,5 @@ define i32 @local() {
 ; OPT: late: check=1 guard=2 claim=1 alloc_inbounds=0 inbounds=0 free=1 last_use=1 dropped=1
 ; OPT: lost: check=1(block-deleted=1) claim=2(dead=2) alloc_inbounds=1(dropped=1)
 ; OPT-NOT: unexplained
-; STRICT: unexplained loss: claim #{{[0-9]+}} in f (folded into a non-claim value)
+; STRICT: unexplained loss: claim #{{[0-9]+}} in f (folded into a non-claim value: ? -> argument)
 ; LOSS: lost:{{.*}}claim=1(unexplained=1)
