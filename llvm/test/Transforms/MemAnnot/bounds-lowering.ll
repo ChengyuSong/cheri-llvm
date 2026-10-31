@@ -529,8 +529,7 @@ define void @claims(ptr addrspace(200) %p, ptr addrspace(200) %q) {
 ; NOSKIP-NEXT:    [[E:%.*]] = getelementptr i8, ptr addrspace(200) [[S]], i64 4
 ; NOSKIP-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
 ; NOSKIP-NEXT:    store i32 3, ptr addrspace(200) [[TMP3]], align 4
-; NOSKIP-NEXT:    [[TMP4:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[E]], i64 4)
-; NOSKIP-NEXT:    store i32 4, ptr addrspace(200) [[TMP4]], align 4
+; NOSKIP-NEXT:    store i32 4, ptr addrspace(200) [[TMP3]], align 4
 ; NOSKIP-NEXT:    ret void
 ;
 ; ELIDE-LABEL: define void @claims(
@@ -582,9 +581,169 @@ define void @claims(ptr addrspace(200) %p, ptr addrspace(200) %q) {
   ret void
 }
 
+; Loop: the narrow of an invariant base/length is hoisted to the preheader.
+define i32 @loop(ptr addrspace(200) %a, i64 %n, i64 %m) {
+; OFF-LABEL: define i32 @loop(
+; OFF-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; OFF-NEXT:  [[ENTRY:.*]]:
+; OFF-NEXT:    br label %[[HEAD:.*]]
+; OFF:       [[HEAD]]:
+; OFF-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; OFF-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; OFF-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
+; OFF-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL:.*]]
+; OFF:       [[OK]]:
+; OFF-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[A]], i64 [[I]]
+; OFF-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; OFF-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; OFF-NEXT:    [[I1]] = add i64 [[I]], 1
+; OFF-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; OFF-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; OFF:       [[EXIT]]:
+; OFF-NEXT:    ret i32 [[S1]]
+; OFF:       [[FAIL]]:
+; OFF-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
+; OFF-NEXT:    unreachable
+;
+; NARROW-LABEL: define i32 @loop(
+; NARROW-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; NARROW-NEXT:  [[ENTRY:.*]]:
+; NARROW-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; NARROW-NEXT:    br label %[[HEAD:.*]]
+; NARROW:       [[HEAD]]:
+; NARROW-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; NARROW-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; NARROW-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
+; NARROW-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL:.*]]
+; NARROW:       [[OK]]:
+; NARROW-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
+; NARROW-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; NARROW-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; NARROW-NEXT:    [[I1]] = add i64 [[I]], 1
+; NARROW-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; NARROW-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; NARROW:       [[EXIT]]:
+; NARROW-NEXT:    ret i32 [[S1]]
+; NARROW:       [[FAIL]]:
+; NARROW-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
+; NARROW-NEXT:    unreachable
+;
+; NOSKIP-LABEL: define i32 @loop(
+; NOSKIP-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; NOSKIP-NEXT:  [[ENTRY:.*]]:
+; NOSKIP-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
+; NOSKIP-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; NOSKIP-NEXT:    br label %[[HEAD:.*]]
+; NOSKIP:       [[HEAD]]:
+; NOSKIP-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; NOSKIP-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; NOSKIP-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
+; NOSKIP-NEXT:    br i1 [[C]], label %[[OK]], label %[[FAIL:.*]]
+; NOSKIP:       [[OK]]:
+; NOSKIP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
+; NOSKIP-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; NOSKIP-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; NOSKIP-NEXT:    [[I1]] = add i64 [[I]], 1
+; NOSKIP-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; NOSKIP-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; NOSKIP:       [[EXIT]]:
+; NOSKIP-NEXT:    ret i32 [[S1]]
+; NOSKIP:       [[FAIL]]:
+; NOSKIP-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
+; NOSKIP-NEXT:    unreachable
+;
+; ELIDE-LABEL: define i32 @loop(
+; ELIDE-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; ELIDE-NEXT:  [[ENTRY:.*]]:
+; ELIDE-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) i1 @llvm.cheri.cap.tag.get(ptr addrspace(200) [[TMP1]])
+; ELIDE-NEXT:    [[TMP3:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; ELIDE-NEXT:    [[TMP4:%.*]] = select i1 [[TMP2]], ptr addrspace(200) [[TMP1]], ptr addrspace(200) [[TMP3]]
+; ELIDE-NEXT:    br label %[[HEAD:.*]]
+; ELIDE:       [[HEAD]]:
+; ELIDE-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; ELIDE-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; ELIDE-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], [[N]]
+; ELIDE-NEXT:    [[TMP5:%.*]] = or i1 [[C]], [[TMP2]]
+; ELIDE-NEXT:    br i1 [[TMP5]], label %[[OK]], label %[[FAIL:.*]]
+; ELIDE:       [[OK]]:
+; ELIDE-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP4]], i64 [[I]]
+; ELIDE-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; ELIDE-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; ELIDE-NEXT:    [[I1]] = add i64 [[I]], 1
+; ELIDE-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; ELIDE-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; ELIDE:       [[EXIT]]:
+; ELIDE-NEXT:    ret i32 [[S1]]
+; ELIDE:       [[FAIL]]:
+; ELIDE-NEXT:    call addrspace(200) void @panic(i64 [[I]], i64 [[N]])
+; ELIDE-NEXT:    unreachable
+;
+; UB-LABEL: define i32 @loop(
+; UB-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; UB-NEXT:  [[ENTRY:.*]]:
+; UB-NEXT:    [[TMP0:%.*]] = mul nuw nsw i64 [[N]], 4
+; UB-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) [[A]], i64 [[TMP0]])
+; UB-NEXT:    br label %[[HEAD:.*]]
+; UB:       [[HEAD]]:
+; UB-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; UB-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; UB-NEXT:    br label %[[OK]]
+; UB:       [[OK]]:
+; UB-NEXT:    [[G:%.*]] = getelementptr i32, ptr addrspace(200) [[TMP1]], i64 [[I]]
+; UB-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; UB-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; UB-NEXT:    [[I1]] = add i64 [[I]], 1
+; UB-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; UB-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; UB:       [[EXIT]]:
+; UB-NEXT:    ret i32 [[S1]]
+;
+; DROP-LABEL: define i32 @loop(
+; DROP-SAME: ptr addrspace(200) [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) addrspace(200) {
+; DROP-NEXT:  [[ENTRY:.*]]:
+; DROP-NEXT:    br label %[[HEAD:.*]]
+; DROP:       [[HEAD]]:
+; DROP-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I1:%.*]], %[[OK:.*]] ]
+; DROP-NEXT:    [[S:%.*]] = phi i32 [ 0, %[[ENTRY]] ], [ [[S1:%.*]], %[[OK]] ]
+; DROP-NEXT:    br label %[[OK]]
+; DROP:       [[OK]]:
+; DROP-NEXT:    [[G:%.*]] = getelementptr inbounds i32, ptr addrspace(200) [[A]], i64 [[I]]
+; DROP-NEXT:    [[V:%.*]] = load i32, ptr addrspace(200) [[G]], align 4
+; DROP-NEXT:    [[S1]] = add i32 [[S]], [[V]]
+; DROP-NEXT:    [[I1]] = add i64 [[I]], 1
+; DROP-NEXT:    [[D:%.*]] = icmp eq i64 [[I1]], [[M]]
+; DROP-NEXT:    br i1 [[D]], label %[[EXIT:.*]], label %[[HEAD]]
+; DROP:       [[EXIT]]:
+; DROP-NEXT:    ret i32 [[S1]]
+;
+entry:
+  br label %head
+head:
+  %i = phi i64 [ 0, %entry ], [ %i1, %ok ]
+  %s = phi i32 [ 0, %entry ], [ %s1, %ok ]
+  %c = icmp ult i64 %i, %n
+  br i1 %c, label %ok, label %fail
+ok:
+  %g = getelementptr inbounds i32, ptr addrspace(200) %a, i64 %i, !mem.guard !6
+  %v = load i32, ptr addrspace(200) %g
+  %s1 = add i32 %s, %v
+  %i1 = add i64 %i, 1
+  %d = icmp eq i64 %i1, %m
+  br i1 %d, label %exit, label %head
+exit:
+  ret i32 %s1
+fail:
+  call void @panic(i64 %i, i64 %n) [ "mem.check"(ptr addrspace(200) %a, i64 %n, i64 4, i64 7, i64 0) ]
+  unreachable
+}
+
 !0 = !{i64 1}
 !1 = !{i64 2}
 !2 = !{i64 3}
 !3 = !{i64 4}
 !4 = !{i64 5}
 !5 = !{i64 6}
+!6 = !{i64 7}

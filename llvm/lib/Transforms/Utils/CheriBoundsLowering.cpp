@@ -22,7 +22,9 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -66,7 +68,7 @@ enum Exactness { E_Always, E_Never, E_Dynamic };
 struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
-           Kept = 0, Guards = 0, NoEdge = 0;
+           Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0;
 };
 
@@ -97,8 +99,16 @@ Exactness constExactness(unsigned AddrBits, uint64_t Bytes, uint64_t Align) {
   return Bytes <= 511 ? E_Always : E_Dynamic; // CHERIoT
 }
 
+using Builder = IRBuilder<ConstantFolder, IRBuilderCallbackInserter>;
+
 struct Lowering {
   Module &M;
+  SmallVector<Instruction *, 32> Created; // pure instructions this pass made
+  Builder Bld;
+  Builder &mk(Instruction *At) {
+    Bld.SetInsertPoint(At);
+    return Bld;
+  }
   const DataLayout &DL;
   Policy Pol;
   bool Skip;
@@ -106,7 +116,11 @@ struct Lowering {
   DenseSet<const Value *> Facts; // values with a mem.alloc_inbounds fact
 
   Lowering(Module &M, Policy Pol, bool Skip)
-      : M(M), DL(M.getDataLayout()), Pol(Pol), Skip(Skip) {}
+      : M(M),
+        Bld(M.getContext(), ConstantFolder(),
+            IRBuilderCallbackInserter(
+                [this](Instruction *I) { Created.push_back(I); })),
+        DL(M.getDataLayout()), Pol(Pol), Skip(Skip) {}
 
   // ---- proofs -------------------------------------------------------------
   bool hasAllocInbounds(const Value *V) {
@@ -173,7 +187,7 @@ struct Lowering {
   }
 
   // ---- IR helpers ---------------------------------------------------------
-  Value *narrow(IRBuilder<> &B, Value *Base, Value *Bytes, bool Exact) {
+  Value *narrow(Builder &B, Value *Base, Value *Bytes, bool Exact) {
     Function *F = Intrinsic::getOrInsertDeclaration(
         &M,
         Exact ? Intrinsic::cheri_cap_bounds_set_exact
@@ -290,7 +304,7 @@ struct Lowering {
       std::optional<uint64_t> CB;
       Exactness Ex = exactness(Mk.Base, Mk.Len, Mk.Esz, CB);
       bool Proved = hasAllocInbounds(Mk.Base);
-      auto BytesAt = [&](IRBuilder<> &B) -> Value * {
+      auto BytesAt = [&](Builder &B) -> Value * {
         if (CB)
           return B.getInt64(*CB);
         Value *L = Mk.Len;
@@ -307,7 +321,7 @@ struct Lowering {
           return;
         }
         for (GetElementPtrInst *G : Mine) {
-          IRBuilder<> B(G);
+          Builder &B = mk(G);
           G->setOperand(0, narrow(B, Mk.Base, BytesAt(B), Exact));
           Done.insert(G);
         }
@@ -331,7 +345,7 @@ struct Lowering {
         ++S.Kept;
         continue;
       }
-      IRBuilder<> B(Mk.Pred->getTerminator());
+      Builder &B = mk(Mk.Pred->getTerminator());
       Value *Bytes = BytesAt(B);
       if (Ex == E_Always || (Pol == P_UB && Ex == E_Dynamic)) {
         rewriteGuards(OnEdge, narrow(B, Mk.Base, Bytes, true), Done);
@@ -426,7 +440,7 @@ struct Lowering {
           continue;
         }
       }
-      IRBuilder<> B(C);
+      Builder &B = mk(C);
       Value *Bytes = C->getArgOperand(1);
       if (Bytes->getType() != B.getInt64Ty())
         Bytes = B.CreateZExtOrTrunc(Bytes, B.getInt64Ty());
@@ -436,6 +450,53 @@ struct Lowering {
       C->setArgOperand(0, N);
       ++S.ClaimNarrowed;
     }
+  }
+
+  // Place this pass's own narrows the way the generic passes placed M5.0's
+  // early narrows: hoist loop-invariant ones to the preheader (csetbounds
+  // does not trap, so this is safe) and reuse a dominating identical one.
+  void placeNarrows(Function &F) {
+    if (Created.empty())
+      return;
+    DominatorTree DT(F);
+    LoopInfo LI(DT);
+    for (Instruction *I : Created) {
+      while (Loop *L = LI.getLoopFor(I->getParent())) {
+        BasicBlock *PH = L->getLoopPreheader();
+        if (!PH || !L->hasLoopInvariantOperands(I))
+          break;
+        I->moveBefore(PH->getTerminator()->getIterator());
+        ++S.Hoisted;
+      }
+    }
+    SmallPtrSet<Instruction *, 32> Mine(llvm::from_range, Created);
+    DenseMap<std::pair<Value *, std::pair<Value *, Value *>>,
+             SmallVector<CallInst *, 2>> Seen;
+    SmallVector<Instruction *, 8> Dead;
+    DT.recalculate(F);
+    ReversePostOrderTraversal<Function *> RPOT(&F);
+    for (BasicBlock *BB : RPOT)
+      for (Instruction &I : *BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI || !Mine.count(CI) || CI->arg_size() != 2)
+          continue;
+        auto &Bucket = Seen[{CI->getCalledOperand(),
+                             {CI->getArgOperand(0), CI->getArgOperand(1)}}];
+        bool Replaced = false;
+        for (CallInst *P : Bucket)
+          if (DT.dominates(P, CI)) {
+            CI->replaceAllUsesWith(P);
+            Dead.push_back(CI);
+            ++S.CSEd;
+            Replaced = true;
+            break;
+          }
+        if (!Replaced)
+          Bucket.push_back(CI);
+      }
+    for (Instruction *I : Dead)
+      I->eraseFromParent();
+    Created.clear();
   }
 
   void collectFacts(Function &F) {
@@ -460,6 +521,7 @@ struct Lowering {
         runChecks(F);
       if (ClaimNarrow)
         runClaims(F);
+      placeNarrows(F);
     }
     if (!StatsOut.empty() && (S.Markers || S.Claims)) {
       std::error_code EC;
@@ -472,7 +534,8 @@ struct Lowering {
            << " guards=" << S.Guards << " narrowed=" << S.Narrowed
            << " skipped=" << S.Skipped << " removed=" << S.Removed
            << " twoversion=" << S.TwoVersion << " noedge=" << S.NoEdge
-           << " kept=" << S.Kept << " claims=" << S.Claims
+           << " kept=" << S.Kept << " hoisted=" << S.Hoisted
+           << " csed=" << S.CSEd << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof << "\n";
