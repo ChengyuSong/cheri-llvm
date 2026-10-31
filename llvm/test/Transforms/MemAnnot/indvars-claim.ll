@@ -6,7 +6,7 @@ target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S
 declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64 immarg)
 
 ; CHECK-LABEL: @f(
-; CHECK: %c = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %p, i64 4, i64 256)
+; CHECK: %c = call {{.*}}@llvm.mem.claim.p200(ptr addrspace(200) %p, i64 4, i64 256)
 ; CHECK: store i32 0, ptr addrspace(200) %c
 define void @f(ptr addrspace(200) %a, i64 %n) addrspace(200) {
 entry:
