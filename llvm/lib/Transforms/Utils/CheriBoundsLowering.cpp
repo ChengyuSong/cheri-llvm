@@ -75,6 +75,14 @@ static cl::opt<bool> SingleTagTest(
     "cheri-bounds-single-tag-test", cl::init(true), cl::Hidden,
     cl::desc("R4 (D22): two-version sites merge the exact and rounded "
              "capability with a PHI (one tag test) instead of a select"));
+static cl::opt<bool> SplitMerged(
+    "cheri-bounds-split-merged", cl::init(true), cl::Hidden,
+    cl::desc("R4 (D26): one marker per conditional predecessor of a shared "
+             "panic block"));
+static cl::opt<bool> AdoptOrphans(
+    "cheri-bounds-adopt", cl::init(true), cl::Hidden,
+    cl::desc("R4 (D26): a marker adopts guards of proved-away sites that "
+             "index its base with its checked index"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -87,7 +95,7 @@ struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
-  unsigned TwoVersionInLoop = 0;
+  unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
@@ -472,6 +480,46 @@ struct Lowering {
     }
   }
 
+  // R4 (D26): a guard GEP whose own check the optimizer proved redundant
+  // against another site's check (GVN: `i ^ 1 < 8` and `i < 8` are the same
+  // compare) has no marker left. It is adopted by the marker whose success
+  // edge dominates it and whose compare checks exactly its index against the
+  // same object: same base, one index equal to the checked index, element
+  // size equal to the marker's. Narrowing it to (base, len * esz) is then the
+  // hardware form of that very compare.
+  void adopt(SmallVectorImpl<Marker> &Ms, DominatorTree &DT,
+             DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards) {
+    if (!AdoptOrphans)
+      return;
+    DenseSet<uint64_t> Live;
+    for (Marker &Mk : Ms)
+      Live.insert(Mk.Site);
+    SmallVector<std::pair<uint64_t, GetElementPtrInst *>, 4> Add;
+    for (auto &[Site, Gs] : Guards) {
+      if (Live.count(Site))
+        continue;
+      for (GetElementPtrInst *G : Gs) {
+        if (G->getNumIndices() != 1)
+          continue;
+        for (Marker &Mk : Ms) {
+          if (!Mk.Pred || !Mk.Index || G->getPointerOperand() != Mk.Base ||
+              G->idx_begin()->get() != Mk.Index ||
+              DL.getTypeAllocSize(G->getSourceElementType()) != Mk.Esz ||
+              !DT.dominates(BasicBlockEdge(Mk.Pred, Mk.Ok), G->getParent()))
+            continue;
+          if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+            if (!DT.dominates(LI, G))
+              continue;
+          Add.push_back({Mk.Site, G});
+          ++S.Adopted;
+          break;
+        }
+      }
+    }
+    for (auto &[Site, G] : Add)
+      Guards[Site].push_back(G);
+  }
+
   void runChecks(Function &F) {
     SmallVector<Marker, 8> Markers;
     DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> Guards;
@@ -488,32 +536,61 @@ struct Lowering {
       if (!OB)
         continue;
       ++S.Markers;
-      auto *Esz = dyn_cast<ConstantInt>(OB->Inputs[2].get());
-      auto *Site = dyn_cast<ConstantInt>(OB->Inputs[3].get());
-      auto *Kind = dyn_cast<ConstantInt>(OB->Inputs[4].get());
-      if (!Esz || !Site || !Kind) {
-        ++S.Merged; // checks merged by the optimizer: keep
-        continue;
-      }
-      if (!DL.isFatPointer(OB->Inputs[0]->getType()))
-        continue; // not a capability: nothing to decide
-      Marker Mk{CB, OB->Inputs[0].get(), OB->Inputs[1].get(),
-                Esz->getZExtValue(), Site->getZExtValue(),
-                Kind->getZExtValue()};
-      if (OB->Inputs.size() >= 7 &&
-          DL.isFatPointer(OB->Inputs[5]->getType())) {
-        Mk.ParentBase = OB->Inputs[5].get();
-        Mk.ParentLen = OB->Inputs[6].get();
-      }
       BasicBlock *P = CB->getParent();
+      // R4 (D26): a panic block that several checks share (SimplifyCFG/GVN
+      // merged their panics; differing bundle inputs became PHIs in P) is
+      // split into one marker per conditional predecessor, with the inputs
+      // that predecessor contributes. R2/R3 kept every merged check.
+      SmallVector<BasicBlock *, 4> Preds;
       if (BasicBlock *Pr = P->getSinglePredecessor())
-        if (auto *Br = dyn_cast<CondBrInst>(Pr->getTerminator()))
-          if (Br->getSuccessor(0) != Br->getSuccessor(1)) {
-            Mk.Pred = Pr;
-            Mk.Ok = Br->getSuccessor(Br->getSuccessor(0) == P ? 1 : 0);
-          }
-      Mk.Index = checkedIndex(Mk);
-      Markers.push_back(Mk);
+        Preds.push_back(Pr);
+      else if (SplitMerged)
+        for (BasicBlock *Pr : predecessors(P))
+          if (!is_contained(Preds, Pr))
+            Preds.push_back(Pr);
+      if (Preds.empty())
+        Preds.push_back(nullptr);
+      bool Split = Preds.size() > 1;
+      bool Any = false;
+      for (BasicBlock *Pr : Preds) {
+        auto In = [&](unsigned K) -> Value * {
+          Value *V = OB->Inputs[K].get();
+          if (auto *PN = dyn_cast<PHINode>(V))
+            if (PN->getParent() == P && Pr)
+              return PN->getIncomingValueForBlock(Pr);
+          return V;
+        };
+        auto *Esz = dyn_cast<ConstantInt>(In(2));
+        auto *Site = dyn_cast<ConstantInt>(In(3));
+        auto *Kind = dyn_cast<ConstantInt>(In(4));
+        if (!Esz || !Site || !Kind)
+          continue;
+        Value *Base = In(0), *Len = In(1);
+        if (!DL.isFatPointer(Base->getType()) ||
+            (isa<PHINode>(Base) && cast<PHINode>(Base)->getParent() == P))
+          continue; // not a capability: nothing to decide
+        Marker Mk{CB, Base, Len, Esz->getZExtValue(), Site->getZExtValue(),
+                  Kind->getZExtValue()};
+        if (OB->Inputs.size() >= 7 && DL.isFatPointer(In(5)->getType())) {
+          Mk.ParentBase = In(5);
+          Mk.ParentLen = In(6);
+        }
+        if (Pr)
+          if (auto *Br = dyn_cast<CondBrInst>(Pr->getTerminator()))
+            if (Br->getSuccessor(0) != Br->getSuccessor(1)) {
+              Mk.Pred = Pr;
+              Mk.Ok = Br->getSuccessor(Br->getSuccessor(0) == P ? 1 : 0);
+            }
+        if (Split && !Mk.Pred)
+          continue;
+        Mk.Index = checkedIndex(Mk);
+        Markers.push_back(Mk);
+        Any = true;
+        if (Split)
+          ++S.SplitMarkers;
+      }
+      if (!Any)
+        ++S.Merged; // checks merged by the optimizer: keep
     }
     if (Markers.empty())
       return;
@@ -526,6 +603,7 @@ struct Lowering {
     for (Marker &Mk : Markers)
       for (GetElementPtrInst *G : Mk.Group)
         Narrowable.insert(G);
+    adopt(Markers, DT, Guards);
     SmallPtrSet<GetElementPtrInst *, 8> Done;
     SmallVector<BasicBlock *, 4> DeadPanics;
     for (Marker &Mk : Markers) {
@@ -735,8 +813,9 @@ struct Lowering {
         ++S.Kept;
       }
     }
+    SmallPtrSet<BasicBlock *, 4> Gone; // R4: split markers share a panic block
     for (BasicBlock *BB : DeadPanics)
-      if (pred_empty(BB))
+      if (Gone.insert(BB).second && pred_empty(BB))
         DeleteDeadBlock(BB);
   }
 
@@ -960,6 +1039,26 @@ struct Lowering {
     SmallVector<Instruction *, 8> Dead;
     DT.recalculate(F);
     ReversePostOrderTraversal<Function *> RPOT(&F);
+    // R4: identical integer arithmetic this pass made (len * esz) first, so
+    // the narrows that use it compare equal below.
+    DenseMap<std::tuple<unsigned, Value *, Value *>, SmallVector<Instruction *, 2>> SeenBO;
+    for (BasicBlock *BB : RPOT)
+      for (Instruction &I : *BB) {
+        auto *BO = dyn_cast<BinaryOperator>(&I);
+        if (!BO || !Mine.count(BO))
+          continue;
+        auto &Bucket = SeenBO[{BO->getOpcode(), BO->getOperand(0), BO->getOperand(1)}];
+        bool Replaced = false;
+        for (Instruction *P : Bucket)
+          if (DT.dominates(P, BO)) {
+            BO->replaceAllUsesWith(P);
+            Dead.push_back(BO);
+            Replaced = true;
+            break;
+          }
+        if (!Replaced)
+          Bucket.push_back(BO);
+      }
     for (BasicBlock *BB : RPOT)
       for (Instruction &I : *BB) {
         auto *CI = dyn_cast<CallInst>(&I);
@@ -1025,7 +1124,8 @@ struct Lowering {
            << " guards=" << S.Guards << " narrowed=" << S.Narrowed
            << " skipped=" << S.Skipped << " removed=" << S.Removed
            << " twoversion=" << S.TwoVersion
-           << " twoversion_loop=" << S.TwoVersionInLoop << " noedge=" << S.NoEdge
+           << " twoversion_loop=" << S.TwoVersionInLoop
+           << " split=" << S.SplitMarkers << " adopted=" << S.Adopted << " noedge=" << S.NoEdge
            << " kept=" << S.Kept << " hoisted=" << S.Hoisted
            << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
            << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked
