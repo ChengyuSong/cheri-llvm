@@ -250,8 +250,14 @@ struct Lowering {
         Exact ? Intrinsic::cheri_cap_bounds_set_exact
               : Intrinsic::cheri_cap_bounds_set,
         {Bytes->getType()});
-    return B.CreateCall(F, {Base, Bytes});
+    CallInst *N = B.CreateCall(F, {Base, Bytes});
+    // R3 (D23): name the origin of this pass's narrows the way M5.0 named its
+    // early ones, so tests on emitted IR can tell them apart. No pass reads it.
+    if (NarrowTag)
+      N->setMetadata(NarrowTag, MDNode::get(M.getContext(), {}));
+    return N;
   }
+  const char *NarrowTag = nullptr;
 
   Exactness exactness(Value *Base, Value *Len, uint64_t Esz,
                       std::optional<uint64_t> &ConstBytes) {
@@ -932,10 +938,13 @@ struct Lowering {
       collectFacts(F);
       // R3: claims first, so a check narrow of a claimed value to the same
       // bytes sees the claim's narrow and is not repeated (k5_sub_index).
+      NarrowTag = "cheri.contract_narrow";
       if (ClaimNarrow)
         runClaims(F);
+      NarrowTag = "cheri.access_narrow";
       if (Pol != P_Off)
         runChecks(F);
+      NarrowTag = nullptr;
       placeNarrows(F);
     }
     if (!StatsOut.empty() && (S.Markers || S.Claims)) {
