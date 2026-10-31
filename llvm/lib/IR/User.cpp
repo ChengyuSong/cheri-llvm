@@ -11,6 +11,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MemAnnot.h"
 
 using namespace llvm;
 
@@ -125,6 +126,15 @@ bool User::isDroppable() const {
     case Intrinsic::pseudoprobe:
     case Intrinsic::experimental_noalias_scope_decl:
       return true;
+    case Intrinsic::mem_fact: {
+      // [LLM-generated] M5r: only fail-safe facts are droppable; a claim or
+      // free must survive (it would otherwise lose a narrow / a free).
+      for (unsigned I = 0, E = II->getNumOperandBundles(); I != E; ++I)
+        if (!memannot::isDroppableFactTag(
+                II->getOperandBundleAt(I).getTagName()))
+          return false;
+      return true;
+    }
     }
   }
   return false;

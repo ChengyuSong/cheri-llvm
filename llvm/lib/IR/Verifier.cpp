@@ -94,6 +94,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAArch64.h"
@@ -4126,6 +4127,59 @@ void Verifier::visitCallBase(CallBase &Call) {
     }
   }
 
+  // [LLM-generated] M5r memory-safety annotations (llvm/IR/MemAnnot.h).
+  {
+    bool IsFact = Call.getIntrinsicID() == Intrinsic::mem_fact;
+    unsigned NumMem = 0;
+    auto IsPtr = [](Value *V) { return V->getType()->isPointerTy(); };
+    auto IsInt = [](Value *V) { return V->getType()->isIntegerTy(); };
+    auto IsCInt = [](Value *V) { return isa<ConstantInt>(V); };
+    for (unsigned i = 0, e = Call.getNumOperandBundles(); i < e; ++i) {
+      OperandBundleUse BU = Call.getOperandBundleAt(i);
+      StringRef T = BU.getTagName();
+      if (!memannot::isMemTag(T)) {
+        Check(!IsFact, "llvm.mem.fact may only carry \"mem.\" bundles", Call);
+        continue;
+      }
+      ++NumMem;
+      auto &In = BU.Inputs;
+      if (T == memannot::TagCheck) {
+        Check(!IsFact, "\"mem.check\" belongs on a check's failure call, "
+                       "not on llvm.mem.fact", Call);
+        // Site and kind may be PHIs after SimplifyCFG merged failure calls.
+        Check((In.size() == 5 || In.size() == 7) && IsPtr(In[0]) &&
+                  IsInt(In[1]) && IsInt(In[2]) && IsInt(In[3]) &&
+                  IsInt(In[4]) &&
+                  (In.size() == 5 || (IsPtr(In[5]) && IsInt(In[6]))),
+              "\"mem.check\" bundle must be (ptr base, iN len, iN elemsize, "
+              "i64 site, i64 kind [, ptr parent, iN parentlen])", Call);
+        continue;
+      }
+      Check(IsFact, "\"mem.\" fact bundles may only appear on llvm.mem.fact",
+            Call);
+      if (T == memannot::TagClaim)
+        Check(In.size() == 3 && IsPtr(In[0]) && IsInt(In[1]) && IsCInt(In[2]),
+              "\"mem.claim\" must be (ptr, iN bytes, i64 flags)", Call);
+      else if (T == memannot::TagAllocInbounds)
+        Check(In.size() == 1 && IsPtr(In[0]),
+              "\"mem.alloc_inbounds\" must be (ptr)", Call);
+      else if (T == memannot::TagInbounds)
+        Check(In.size() == 3 && IsPtr(In[0]) && IsPtr(In[1]) && IsInt(In[2]),
+              "\"mem.inbounds\" must be (ptr, ptr base, iN bytes)", Call);
+      else if (T == memannot::TagFree)
+        Check(In.size() == 2 && IsPtr(In[0]) && IsPtr(In[1]),
+              "\"mem.free\" must be (ptr, ptr ownerslot-or-null)", Call);
+      else if (T == memannot::TagInvalidate)
+        Check(In.size() == 2 && IsPtr(In[0]) && IsCInt(In[1]),
+              "\"mem.invalidate\" must be (ptr, i64 kind)", Call);
+      else
+        Check(T == memannot::TagDropped, "unknown \"mem.\" bundle tag", Call);
+    }
+    if (IsFact)
+      Check(NumMem == 1, "llvm.mem.fact must carry exactly one fact bundle",
+            Call);
+  }
+
   // Verify that callee and callsite agree on whether to use pointer auth.
   Check(!(Call.getCalledFunction() && FoundPtrauthBundle),
         "Direct call cannot have a ptrauth bundle", Call);
@@ -5688,6 +5742,16 @@ void Verifier::visitMemCacheHintMetadata(Instruction &I, MDNode *MD) {
 void Verifier::visitInstruction(Instruction &I) {
   BasicBlock *BB = I.getParent();
   Check(BB, "Instruction not embedded in basic block!", &I);
+
+  // [LLM-generated] M5r: !mem.guard !{i64 site} on the guarded access.
+  if (MDNode *G = I.getMetadata(memannot::GuardMD)) {
+    Check(isa<GetElementPtrInst>(I) || isa<LoadInst>(I) || isa<StoreInst>(I) ||
+              isa<AnyMemIntrinsic>(I),
+          "!mem.guard only on getelementptr, load, store or mem intrinsics", &I);
+    Check(G->getNumOperands() == 1 &&
+              mdconst::dyn_extract_or_null<ConstantInt>(G->getOperand(0)),
+          "!mem.guard must be !{i64 site}", &I);
+  }
 
   if (!isa<PHINode>(I)) {   // Check that non-phi nodes are not self referential
     for (User *U : I.users()) {

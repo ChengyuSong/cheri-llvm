@@ -126,6 +126,7 @@ public:
     case Intrinsic::objectsize:
     case Intrinsic::ptr_annotation:
     case Intrinsic::var_annotation:
+    case Intrinsic::mem_fact: // [LLM-generated] M5r
       return true;
     }
     return false;
