@@ -50,6 +50,9 @@ LLVM_ABI void runCensusLate(Module &M);
 LLVM_ABI bool stripAnnotations(Module &M);
 /// Late census + strip (the R0 CheriBoundsLowering body).
 LLVM_ABI bool runCheriBoundsLoweringStub(Module &M);
+/// R2: late census, per-check / per-claim CHERI decisions
+/// (CheriBoundsLowering.cpp), then strip.
+LLVM_ABI bool runCheriBoundsLowering(Module &M);
 /// Set by -mem-annot-census: add the start census at pipeline start.
 LLVM_ABI bool censusAtPipelineStart();
 /// True while a start census is pending for \p M (D14: InstCombine keeps

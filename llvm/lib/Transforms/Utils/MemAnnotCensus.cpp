@@ -209,12 +209,19 @@ bool memannot::runCensusStart(Module &M) {
     ++S.Start[K];
     Changed = true;
   };
+  // R2: last_use is counted as distinct loan ids (D16 moves ids between
+  // instructions on inlining).
+  DenseSet<Metadata *> StartLoans;
+  auto CountLoans = [](Instruction &I, DenseSet<Metadata *> &Set) {
+    if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
+      for (const MDOperand &Op : LU->operands())
+        Set.insert(Op.get());
+  };
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
       if (I.getMetadata(memannot::GuardMD))
         ++S.Start[K_Guard];
-      if (I.getMetadata(memannot::LastUseMD))
-        ++S.Start[K_LastUse];
+      CountLoans(I, StartLoans);
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -241,6 +248,7 @@ bool memannot::runCensusStart(Module &M) {
         ++S.PlainCallees[calleeName(*CB)];
       }
     }
+  S.Start[K_LastUse] = StartLoans.size();
   if (CensusTestErase)
     for (Function &F : M)
       for (Instruction &I : instructions(F))
@@ -277,12 +285,14 @@ static void runCensusLateImpl(Module &M) {
   DenseMap<uint64_t, bool> SeenDropped;   // id -> seen as mem.dropped
   DenseSet<uint64_t> SeenSites;           // "mem.check" sites still present
   unsigned Stripped = 0;                  // checked-callee calls w/o bundle
+  DenseSet<Metadata *> LateLoans;
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
       if (I.getMetadata(memannot::GuardMD))
         ++Late[K_Guard];
-      if (I.getMetadata(memannot::LastUseMD))
-        ++Late[K_LastUse];
+      if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
+        for (const MDOperand &Op : LU->operands())
+          LateLoans.insert(Op.get());
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -323,6 +333,7 @@ static void runCensusLateImpl(Module &M) {
       }
     }
 
+  Late[K_LastUse] = LateLoans.size();
   unsigned Total = 0;
   for (unsigned K = 0; K < K_NumKinds; ++K)
     Total += Late[K] + (SP ? SP->Start[K] : 0);
@@ -569,7 +580,7 @@ PreservedAnalyses MemAnnotCensusPass::run(Module &M, ModuleAnalysisManager &) {
 
 PreservedAnalyses CheriBoundsLoweringPass::run(Module &M,
                                                ModuleAnalysisManager &) {
-  return memannot::runCheriBoundsLoweringStub(M) ? PreservedAnalyses::none()
+  return memannot::runCheriBoundsLowering(M) ? PreservedAnalyses::none()
                                                  : PreservedAnalyses::all();
 }
 

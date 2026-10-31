@@ -45,6 +45,9 @@
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
+/// R2: -cheri-skip-narrow / -cheri-contract-discharge, read by the late pass.
+bool cheriSkipNarrowEnabled();
+bool cheriContractDischargeEnabled();
 struct CheriSkipNarrowPass : PassInfoMixin<CheriSkipNarrowPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   static bool isRequired() { return true; }

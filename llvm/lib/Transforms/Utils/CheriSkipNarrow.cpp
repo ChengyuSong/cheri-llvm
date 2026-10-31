@@ -646,3 +646,6 @@ PreservedAnalyses MemContractCPass::run(Module &M, ModuleAnalysisManager &) {
   }
   return PreservedAnalyses::none();
 }
+
+bool llvm::cheriSkipNarrowEnabled() { return EnableSkipNarrow; }
+bool llvm::cheriContractDischargeEnabled() { return EnableContractDischarge; }

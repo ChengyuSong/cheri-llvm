@@ -1956,6 +1956,67 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
   }
 }
 
+// [LLM-generated] M5r R2 (D16): a call's !mem.last_use means the loans end
+// after the call returns. When the call is inlined, put the ids on the last
+// memory access or call of each return path of the inlined body: walk back
+// from each return through single-predecessor blocks. A path without such an
+// instruction (within the walk limit) loses the ids, which is fail-safe.
+static bool isLastUseCarrier(const Instruction &I) {
+  if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
+      isa<AtomicCmpXchgInst>(I))
+    return true;
+  const auto *C = dyn_cast<CallBase>(&I);
+  if (!C)
+    return false;
+  if (const auto *II = dyn_cast<IntrinsicInst>(C)) {
+    if (isa<MemIntrinsic>(II))
+      return true;
+    return false; // lifetime, debug, assume, annotations, cheri/claim helpers
+  }
+  return true;
+}
+
+static void moveLastUseIntoInlinedBody(CallBase &CB,
+                                       ArrayRef<ReturnInst *> Returns) {
+  MDNode *LU = CB.getMetadata(memannot::LastUseMD);
+  if (!LU)
+    return;
+  LLVMContext &Ctx = CB.getContext();
+  for (ReturnInst *RI : Returns) {
+    Instruction *Found = nullptr;
+    BasicBlock *BB = RI->getParent();
+    Instruction *Start = RI;
+    for (unsigned Steps = 0; BB && Steps < 8 && !Found; ++Steps) {
+      for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
+        if (&*It != Start && isLastUseCarrier(*It)) {
+          Found = &*It;
+          break;
+        }
+      if (Found)
+        break;
+      BB = BB->getSinglePredecessor();
+      if (BB)
+        Start = BB->getTerminator();
+      if (BB && isLastUseCarrier(*Start)) { // invoke terminator
+        Found = Start;
+        break;
+      }
+    }
+    if (!Found)
+      continue; // fail-safe: this path loses the loan end
+    SmallVector<Metadata *, 4> Ids;
+    SmallPtrSet<Metadata *, 4> Seen;
+    if (MDNode *Old = Found->getMetadata(memannot::LastUseMD))
+      for (const MDOperand &Op : Old->operands())
+        if (Seen.insert(Op.get()).second)
+          Ids.push_back(Op.get());
+    for (const MDOperand &Op : LU->operands())
+      if (Seen.insert(Op.get()).second)
+        Ids.push_back(Op.get());
+    Found->setMetadata(memannot::LastUseMD, MDNode::get(Ctx, Ids));
+  }
+}
+
 static void HandleByValArgumentInit(Type *ByValType, Value *Dst, Value *Src,
                                     MaybeAlign SrcAlign, Module *M,
                                     BasicBlock *InsertBlock,
@@ -3066,6 +3127,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // the call.
     moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
     moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
+    moveLastUseIntoInlinedBody(CB, Returns);
 
     // For 'nodebug' functions, the associated DISubprogram is always null.
     // Conservatively avoid propagating the callsite debug location to
