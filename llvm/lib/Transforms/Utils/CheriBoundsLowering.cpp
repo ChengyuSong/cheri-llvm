@@ -220,7 +220,10 @@ struct Lowering {
   Value *narrow(Builder &B, Value *Base, Value *Bytes, bool Exact) {
     // Rule 1: the base is already narrowed to exactly these bytes (e.g. a
     // manual bounds_set_exact): no second narrow.
-    if (auto *II = dyn_cast<IntrinsicInst>(Base->stripPointerCasts()))
+    Value *Inner = Base->stripPointerCasts();
+    while (memannot::isMemClaim(Inner)) // a claim only narrows further
+      Inner = cast<CallBase>(Inner)->getArgOperand(0)->stripPointerCasts();
+    if (auto *II = dyn_cast<IntrinsicInst>(Inner))
       if ((II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact ||
            (!Exact && II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set)) &&
           sameBytes(II->getArgOperand(1), Bytes)) {

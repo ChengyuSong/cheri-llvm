@@ -822,7 +822,8 @@ define i64 @already(ptr addrspace(200) %p, i64 %n, i64 %i) {
 ; DROP-NEXT:    ret i64 [[V]]
 ;
   %b = shl nuw i64 %n, 3
-  %a = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %p, i64 %b)
+  %a0 = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %p, i64 %b)
+  %a = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %a0, i64 %b, i64 256)
   %c = icmp ult i64 %i, %n
   br i1 %c, label %ok, label %fail
 ok:
