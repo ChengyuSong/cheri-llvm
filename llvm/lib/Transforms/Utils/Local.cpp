@@ -58,6 +58,7 @@
 #include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/MemoryModelRelaxationAnnotations.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -1530,6 +1531,10 @@ bool llvm::EliminateDuplicatePHINodes(BasicBlock *BB) {
 Align llvm::tryEnforceAlignment(Value *V, Align PrefAlign,
                                 const DataLayout &DL) {
   V = V->stripPointerCasts();
+  // [LLM-generated] M5r R1: llvm.mem.claim returns its argument, so raising
+  // the alignment of the claimed object is as valid as without the claim.
+  while (memannot::isMemClaim(V))
+    V = cast<CallBase>(V)->getArgOperand(0)->stripPointerCasts();
 
   if (AllocaInst *AI = dyn_cast<AllocaInst>(V)) {
     // TODO: Ideally, this function would not be called if PrefAlign is smaller
