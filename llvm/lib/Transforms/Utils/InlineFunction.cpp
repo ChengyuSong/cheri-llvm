@@ -1942,6 +1942,20 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
                                       : memannot::isDeallocCall(*C))
           Targets.push_back(C);
       }
+  // [LLM-generated] M5r R4: the inlined allocator shim (__rust_dealloc) may
+  // call a user GlobalAlloc::dealloc that is not a known deallocation
+  // function: the free moves to the inlined calls that take the freed pointer.
+  if (Tag == memannot::TagFree && Targets.empty() && !MB->Inputs.empty()) {
+    const Value *P = MB->Inputs[0]->stripPointerCasts();
+    for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+      for (Instruction &I : *BI)
+        if (auto *C = dyn_cast<CallBase>(&I))
+          if (!C->getOperandBundle(Tag) && !isa<IntrinsicInst>(C) &&
+              any_of(C->args(), [&](Value *A) {
+                return A->stripPointerCasts() == P;
+              }))
+            Targets.push_back(C);
+  }
   for (CallBase *C : Targets) {
     SmallVector<OperandBundleDef, 2> OBs;
     C->getOperandBundlesAsDefs(OBs);

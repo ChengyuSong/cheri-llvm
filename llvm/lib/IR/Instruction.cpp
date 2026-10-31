@@ -170,6 +170,11 @@ static void transferLastUse(Instruction &I) {
       break;
   }
   BasicBlock *BB = I.getParent();
+  // A clone that replaces I (e.g. a call re-created with other operand
+  // bundles) copied the same uniqued node: the loans still end there.
+  for (Instruction &O : *BB)
+    if (&O != &I && O.getMetadata(memannot::LastUseMD) == LU)
+      return;
   Instruction *Start = &I;
   for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
     for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
