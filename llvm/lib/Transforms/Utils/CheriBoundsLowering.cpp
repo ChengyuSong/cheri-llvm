@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -58,6 +59,18 @@ static cl::opt<bool> LenRange(
     "cheri-bounds-len-range", cl::init(true), cl::Hidden,
     cl::desc("Classify a run-time length whose known-bits maximum is "
              "always exact as Always (R2; M5.0 used static types only)"));
+static cl::opt<bool> CoverageCheck(
+    "cheri-bounds-coverage", cl::init(true), cl::Hidden,
+    cl::desc("R3 (D19): remove a check only if every access in its success "
+             "region that depends on the checked index is covered"));
+static cl::opt<bool> Relink(
+    "cheri-bounds-relink", cl::init(true), cl::Hidden,
+    cl::desc("R3 (D19): re-link markers whose guard was merged (e.g. sunk "
+             "into a common successor) by site group and index PHI"));
+static cl::opt<bool> ClaimCoalesce(
+    "cheri-claim-coalesce", cl::init(true), cl::Hidden,
+    cl::desc("R3 (D20): one narrow for constant-size claims of one base in a "
+             "block whose ranges form one contiguous extent"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -70,7 +83,9 @@ struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
-  unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0;
+  unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
+  unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
+           ClaimCoalesced = 0, CoalesceGroups = 0;
 };
 
 uint64_t rv64LLVMMask(uint64_t Len) {
@@ -265,7 +280,161 @@ struct Lowering {
     uint64_t Esz, Site, Kind;
     BasicBlock *Pred = nullptr; // single conditional predecessor
     BasicBlock *Ok = nullptr;
+    Value *ParentBase = nullptr, *ParentLen = nullptr; // range markers (R3)
+    Value *Index = nullptr; // the checked index, from Pred's compare (R3)
+    SmallVector<GetElementPtrInst *, 2> Group; // re-linked shared guards
   };
+
+  // R3: the index X of `X <u Len` (or `Len >u X`) that holds on the Ok edge.
+  static Value *checkedIndex(const Marker &Mk) {
+    using namespace PatternMatch;
+    if (!Mk.Pred)
+      return nullptr;
+    auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
+    CmpPredicate P;
+    Value *A, *B;
+    if (!match(Br->getCondition(), m_ICmp(P, m_Value(A), m_Value(B))))
+      return nullptr;
+    ICmpInst::Predicate Pr = P;
+    if (Br->getSuccessor(0) != Mk.Ok)
+      Pr = ICmpInst::getInversePredicate(Pr);
+    if (Pr == ICmpInst::ICMP_ULT && B == Mk.Len)
+      return A;
+    if (Pr == ICmpInst::ICMP_UGT && A == Mk.Len)
+      return B;
+    return nullptr;
+  }
+
+  // R3: V is X or computed from X by a short chain of integer arithmetic.
+  static bool dependsOn(const Value *V, const Value *X, unsigned D = 0) {
+    if (V == X)
+      return true;
+    if (D > 4)
+      return false;
+    if (const auto *BO = dyn_cast<BinaryOperator>(V))
+      return dependsOn(BO->getOperand(0), X, D + 1) ||
+             dependsOn(BO->getOperand(1), X, D + 1);
+    if (const auto *C = dyn_cast<CastInst>(V))
+      return dependsOn(C->getOperand(0), X, D + 1);
+    if (const auto *PN = dyn_cast<PHINode>(V))
+      return D == 0 && is_contained(PN->incoming_values(), X);
+    return false;
+  }
+
+  // R3 (D19, design 3.3.1): every memory access in the region the success
+  // edge dominates whose address depends on the checked index must be
+  // covered: by a !mem.guard GEP (its own check decides it) or by a guard
+  // this pass narrows. Otherwise removing the check could leave an access
+  // that only the software check protected (e.g. a GVN-merged check).
+  bool covered(const Marker &Mk, DominatorTree &DT,
+               const SmallPtrSetImpl<GetElementPtrInst *> &Narrowed) {
+    if (!CoverageCheck)
+      return true;
+    if (!Mk.Index)
+      return false;
+    BasicBlockEdge E(Mk.Pred, Mk.Ok);
+    auto AddrOK = [&](Value *Ptr) {
+      for (unsigned D = 0; D < 4; ++D) {
+        auto *G = dyn_cast<GetElementPtrInst>(Ptr);
+        if (!G)
+          return true;
+        if (G->getMetadata(memannot::GuardMD) || Narrowed.count(G))
+          return true;
+        for (Value *Idx : G->indices())
+          if (dependsOn(Idx, Mk.Index))
+            return false;
+        Ptr = G->getPointerOperand();
+      }
+      return true;
+    };
+    for (BasicBlock &BB : *Mk.Pred->getParent()) {
+      if (!DT.dominates(E, &BB))
+        continue;
+      for (Instruction &I : BB) {
+        if (Value *Ptr = getLoadStorePointerOperand(&I)) {
+          if (!AddrOK(Ptr))
+            return false;
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          for (Value *A : CB->args())
+            if (A->getType()->isPointerTy() && !AddrOK(A))
+              return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // R3 (D19): a marker whose guard GEP was merged with another site's (e.g.
+  // SimplifyCFG sinking two `store out[i]` into a common block drops both
+  // !mem.guard ids) is re-linked to the merged GEP G when G indexes the same
+  // base with the same element size and every incoming value of G's index
+  // PHI is the checked index of a same-(base, len, esz) marker whose success
+  // edge dominates that incoming block.
+  void relink(SmallVectorImpl<Marker> &Ms, DominatorTree &DT,
+              const DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards,
+              Function &F) {
+    if (!Relink)
+      return;
+    auto HasGuard = [&](const Marker &Mk) {
+      for (GetElementPtrInst *G : Guards.lookup(Mk.Site))
+        if (G->getPointerOperand() == Mk.Base)
+          return true;
+      return false;
+    };
+    SmallVector<unsigned, 4> Unlinked;
+    for (unsigned I = 0; I < Ms.size(); ++I)
+      if (Ms[I].Pred && Ms[I].Index && !HasGuard(Ms[I]))
+        Unlinked.push_back(I);
+    if (Unlinked.empty())
+      return;
+    for (Instruction &I : instructions(F)) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G || G->getMetadata(memannot::GuardMD) || G->getNumIndices() != 1)
+        continue;
+      auto *PN = dyn_cast<PHINode>(G->idx_begin()->get());
+      if (!PN)
+        continue;
+      SmallVector<unsigned, 4> Members;
+      bool All = true;
+      for (unsigned K = 0; K < PN->getNumIncomingValues() && All; ++K) {
+        Value *V = PN->getIncomingValue(K);
+        BasicBlock *In = PN->getIncomingBlock(K);
+        bool Found = false;
+        for (unsigned U : Unlinked) {
+          Marker &Mk = Ms[U];
+          if (Mk.Base != G->getPointerOperand() || Mk.Index != V ||
+              DL.getTypeAllocSize(G->getSourceElementType()) != Mk.Esz)
+            continue;
+          // The success edge must dominate the PHI's incoming edge (for a
+          // PHI use, dominates(Edge, Use) tests the edge In -> PN's block).
+          (void)In;
+          if (!DT.dominates(BasicBlockEdge(Mk.Pred, Mk.Ok), PN->getOperandUse(K)))
+            continue;
+          if (!is_contained(Members, U))
+            Members.push_back(U);
+          Found = true;
+          break;
+        }
+        All = Found;
+      }
+      if (!All || Members.size() < 2)
+        continue;
+      // Same object and length for the whole group; base/len dominate G.
+      Marker &M0 = Ms[Members[0]];
+      bool Same = true;
+      for (unsigned U : Members)
+        Same &= Ms[U].Len == M0.Len;
+      for (Value *V : {M0.Base, M0.Len})
+        if (auto *VI = dyn_cast<Instruction>(V))
+          Same &= DT.dominates(VI, G);
+      if (!Same)
+        continue;
+      for (unsigned U : Members)
+        Ms[U].Group.push_back(G);
+      ++S.Relinked;
+      S.RelinkGuards += Members.size();
+    }
+  }
 
   void runChecks(Function &F) {
     SmallVector<Marker, 8> Markers;
@@ -295,6 +464,11 @@ struct Lowering {
       Marker Mk{CB, OB->Inputs[0].get(), OB->Inputs[1].get(),
                 Esz->getZExtValue(), Site->getZExtValue(),
                 Kind->getZExtValue()};
+      if (OB->Inputs.size() >= 7 &&
+          DL.isFatPointer(OB->Inputs[5]->getType())) {
+        Mk.ParentBase = OB->Inputs[5].get();
+        Mk.ParentLen = OB->Inputs[6].get();
+      }
       BasicBlock *P = CB->getParent();
       if (BasicBlock *Pr = P->getSinglePredecessor())
         if (auto *Br = dyn_cast<CondBrInst>(Pr->getTerminator()))
@@ -302,11 +476,19 @@ struct Lowering {
             Mk.Pred = Pr;
             Mk.Ok = Br->getSuccessor(Br->getSuccessor(0) == P ? 1 : 0);
           }
+      Mk.Index = checkedIndex(Mk);
       Markers.push_back(Mk);
     }
     if (Markers.empty())
       return;
     DominatorTree DT(F);
+    relink(Markers, DT, Guards, F);
+    // Guards this pass will narrow (for the coverage check): every marker's
+    // own guards and the re-linked group guards.
+    SmallPtrSet<GetElementPtrInst *, 16> Narrowable;
+    for (Marker &Mk : Markers)
+      for (GetElementPtrInst *G : Mk.Group)
+        Narrowable.insert(G);
     SmallPtrSet<GetElementPtrInst *, 8> Done;
     SmallVector<BasicBlock *, 4> DeadPanics;
     for (Marker &Mk : Markers) {
@@ -326,6 +508,12 @@ struct Lowering {
                                     G->getParent()))
           OnEdge.push_back(G);
       }
+      // Re-linked group guards count as on-edge: the group's checks jointly
+      // dominate every path into them (relink()).
+      SmallVector<GetElementPtrInst *, 2> GroupG;
+      for (GetElementPtrInst *G : Mk.Group)
+        if (!Done.count(G))
+          GroupG.push_back(G);
       S.Guards += Mine.size();
       if (Pol == P_Drop) {
         if (Mk.Pred) {
@@ -339,7 +527,7 @@ struct Lowering {
         ++S.Borrow;
       if (RawSite)
         ++S.Raw;
-      if (Mine.empty()) {
+      if (Mine.empty() && Mk.Group.empty()) {
         ++S.Unlinked; // no guard left: nothing to narrow, keep the check
         continue;
       }
@@ -355,6 +543,31 @@ struct Lowering {
                                                              Mk.Esz),
                                          "", /*NUW=*/true, /*NSW=*/true);
       };
+      // R3 (design 3.3.3): a range marker narrows its parent first, then
+      // the subrange from the narrowed parent (M5.0 s7b: a subrange narrow
+      // from a wider capability can silently succeed past the parent).
+      auto BaseAt = [&](Builder &B) -> Value * {
+        Value *Base = Mk.Base;
+        if (Mk.ParentBase && Mk.ParentLen) {
+          Value *PL = Mk.ParentLen;
+          if (Mk.Esz != 1)
+            PL = B.CreateMul(PL, ConstantInt::get(PL->getType(), Mk.Esz), "",
+                             true, true);
+          Value *NP = narrow(B, Mk.ParentBase, PL, false);
+          Function *AG = Intrinsic::getOrInsertDeclaration(
+              &M, Intrinsic::cheri_cap_address_get, {B.getInt64Ty()});
+          Value *Off = B.CreateSub(B.CreateCall(AG, {Mk.Base}),
+                                   B.CreateCall(AG, {Mk.ParentBase}));
+          Base = B.CreateGEP(B.getInt8Ty(), NP, Off);
+          ++S.ParentFirst;
+        }
+        return Base;
+      };
+      auto NarrowAt = [&](Builder &B, bool Exact, Value *Bytes = nullptr,
+                          Value *Base = nullptr) -> Value * {
+        return narrow(B, Base ? Base : BaseAt(B), Bytes ? Bytes : BytesAt(B),
+                      Exact);
+      };
       // Narrow at each guard and keep the check (narrow mode, Never sites,
       // borrows in narrow mode); skippable with a proof (rule 1).
       auto NarrowKeep = [&](bool Exact) {
@@ -364,13 +577,32 @@ struct Lowering {
         }
         for (GetElementPtrInst *G : Mine) {
           Builder &B = mk(G);
-          G->setOperand(0, narrow(B, Mk.Base, BytesAt(B), Exact));
+          G->setOperand(0, NarrowAt(B, Exact));
+          Done.insert(G);
+        }
+        for (GetElementPtrInst *G : GroupG) {
+          Builder &B = mk(G);
+          G->setOperand(0, NarrowAt(B, Exact));
           Done.insert(G);
         }
         ++S.Narrowed;
       };
-      bool CanRemove = Mk.Pred && !OnEdge.empty() && OnEdge.size() == Mine.size() &&
+      bool CanRemove = Mk.Pred && OnEdge.size() == Mine.size() &&
+                       (!OnEdge.empty() || !Mk.Group.empty()) &&
                        !Borrow && dominatesTerm(DT, Mk);
+      if (CanRemove && Pol != P_Narrow) {
+        SmallPtrSet<GetElementPtrInst *, 16> Cov(Narrowable);
+        for (GetElementPtrInst *G : Mine)
+          Cov.insert(G);
+        if (!covered(Mk, DT, Cov)) {
+          CanRemove = false;
+          ++S.Uncovered;
+        }
+      }
+      // Group guards cannot be two-versioned per predecessor: elide removes
+      // a grouped check only when the narrow is exact by construction.
+      if (CanRemove && !Mk.Group.empty() && Pol == P_Elide && Ex != E_Always)
+        CanRemove = false;
       if (Pol == P_Narrow) {
         if (RawSite) {
           ++S.Kept;
@@ -388,21 +620,32 @@ struct Lowering {
         continue;
       }
       Builder &B = mk(Mk.Pred->getTerminator());
-      Value *Bytes = BytesAt(B);
+      auto RewriteGroup = [&](bool Exact) {
+        for (GetElementPtrInst *G : GroupG) {
+          Builder &GB = mk(G);
+          rewriteGuards({G}, NarrowAt(GB, Exact), Done);
+        }
+      };
       if (Ex == E_Always || (Pol == P_UB && Ex == E_Dynamic)) {
-        rewriteGuards(OnEdge, narrow(B, Mk.Base, Bytes, true), Done);
+        if (!OnEdge.empty())
+          rewriteGuards(OnEdge, NarrowAt(B, true), Done);
+        RewriteGroup(true);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Pol == P_UB) { // Never
-        rewriteGuards(OnEdge, narrow(B, Mk.Base, Bytes, false), Done);
+        if (!OnEdge.empty())
+          rewriteGuards(OnEdge, NarrowAt(B, false), Done);
+        RewriteGroup(false);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Ex == E_Dynamic) {
-        Value *Exact = narrow(B, Mk.Base, Bytes, true);
+        Value *Bytes = BytesAt(B);
+        Value *Base = BaseAt(B);
+        Value *Exact = NarrowAt(B, true, Bytes, Base);
         Function *TagF = Intrinsic::getOrInsertDeclaration(
             &M, Intrinsic::cheri_cap_tag_get);
         Value *Tag = B.CreateCall(TagF, {Exact});
-        Value *Rounded = narrow(B, Mk.Base, Bytes, false);
+        Value *Rounded = NarrowAt(B, false, Bytes, Base);
         Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
         rewriteGuards(OnEdge, Cap, Done);
         // M5.0 shape: branch on the tag first; only the untagged (inexact)
@@ -468,6 +711,7 @@ struct Lowering {
       if (memannot::isMemClaim(&I))
         Claims.push_back(cast<CallBase>(&I));
     bool Discharge = cheriSkipNarrowEnabled() && cheriContractDischargeEnabled();
+    SmallVector<CallBase *, 8> ToNarrow;
     for (CallBase *C : Claims) {
       ++S.Claims;
       Value *P = C->getArgOperand(0);
@@ -488,6 +732,15 @@ struct Lowering {
           continue;
         }
       }
+      ToNarrow.push_back(C);
+    }
+    SmallPtrSet<CallBase *, 8> DoneC;
+    if (ClaimCoalesce)
+      coalesceClaims(ToNarrow, DoneC);
+    for (CallBase *C : ToNarrow) {
+      if (DoneC.count(C))
+        continue;
+      Value *P = C->getArgOperand(0);
       Builder &B = mk(C);
       Value *Bytes = C->getArgOperand(1);
       if (Bytes->getType() != B.getInt64Ty())
@@ -497,6 +750,70 @@ struct Lowering {
       // stripAnnotations treat it as before; strip replaces it with N.
       C->setArgOperand(0, N);
       ++S.ClaimNarrowed;
+    }
+  }
+
+  // R3 (D20): claims of constant size on one base (constant offsets) in the
+  // same block, with the same flags, whose byte ranges form one contiguous
+  // extent (e.g. a fully unrolled store loop) share one narrow of that
+  // extent. Each claim becomes an offset into it, so every claimed range is
+  // still inside a capability no wider than the union of ranges the code
+  // itself claims (no gap memory is ever included).
+  void coalesceClaims(ArrayRef<CallBase *> Cs, SmallPtrSetImpl<CallBase *> &DoneC) {
+    struct Item { CallBase *C; int64_t Off; uint64_t Bytes; };
+    MapVector<std::tuple<BasicBlock *, Value *, uint64_t>, SmallVector<Item, 4>> G;
+    for (CallBase *C : Cs) {
+      auto *BC = dyn_cast<ConstantInt>(C->getArgOperand(1));
+      auto *FC = dyn_cast<ConstantInt>(C->getArgOperand(2));
+      if (!BC || !FC || BC->isZero() || BC->getValue().getActiveBits() > 32)
+        continue;
+      int64_t Off = 0;
+      Value *Base = GetPointerBaseWithConstantOffset(C->getArgOperand(0), Off, DL);
+      if (!Base || !DL.isFatPointer(Base->getType()))
+        continue;
+      G[{C->getParent(), Base, FC->getZExtValue()}].push_back(
+          {C, Off, BC->getZExtValue()});
+    }
+    for (auto &[Key, Items] : G) {
+      if (Items.size() < 2)
+        continue;
+      Value *Base = std::get<1>(Key);
+      SmallVector<Item, 4> Sorted(Items);
+      llvm::sort(Sorted, [](const Item &A, const Item &B) { return A.Off < B.Off; });
+      int64_t Lo = Sorted.front().Off, Hi = Lo;
+      bool Contig = true;
+      for (const Item &It : Sorted) {
+        if (It.Off > Hi) {
+          Contig = false;
+          break;
+        }
+        Hi = std::max<int64_t>(Hi, It.Off + (int64_t)It.Bytes);
+      }
+      if (!Contig || Hi - Lo > (1 << 20))
+        continue;
+      // Insert before the first claim of the group in program order; Base
+      // dominates it (it is the claims' common underlying pointer).
+      CallBase *First = Items.front().C;
+      for (const Item &It : Items)
+        if (It.C->comesBefore(First))
+          First = It.C;
+      if (auto *BI = dyn_cast<Instruction>(Base))
+        if (BI->getParent() == First->getParent() && !BI->comesBefore(First))
+          continue;
+      Builder &B = mk(First);
+      Value *Start = Lo ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Lo)) : Base;
+      Value *N = narrow(B, Start, B.getInt64(Hi - Lo), false);
+      for (const Item &It : Items) {
+        Builder &CB = mk(It.C);
+        Value *P = It.Off == Lo ? N
+                                : CB.CreateGEP(CB.getInt8Ty(), N,
+                                               CB.getInt64(It.Off - Lo));
+        It.C->setArgOperand(0, P);
+        DoneC.insert(It.C);
+        ++S.ClaimNarrowed;
+        ++S.ClaimCoalesced;
+      }
+      ++S.CoalesceGroups;
     }
   }
 
@@ -565,10 +882,12 @@ struct Lowering {
         continue;
       Facts.clear();
       collectFacts(F);
-      if (Pol != P_Off)
-        runChecks(F);
+      // R3: claims first, so a check narrow of a claimed value to the same
+      // bytes sees the claim's narrow and is not repeated (k5_sub_index).
       if (ClaimNarrow)
         runClaims(F);
+      if (Pol != P_Off)
+        runChecks(F);
       placeNarrows(F);
     }
     if (!StatsOut.empty() && (S.Markers || S.Claims)) {
@@ -583,10 +902,15 @@ struct Lowering {
            << " skipped=" << S.Skipped << " removed=" << S.Removed
            << " twoversion=" << S.TwoVersion << " noedge=" << S.NoEdge
            << " kept=" << S.Kept << " hoisted=" << S.Hoisted
-           << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow << " claims=" << S.Claims
+           << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
+           << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked
+           << " relink_markers=" << S.RelinkGuards
+           << " parent_first=" << S.ParentFirst << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
-           << " claim_proof=" << S.ClaimProof << "\n";
+           << " claim_proof=" << S.ClaimProof
+           << " claim_coalesced=" << S.ClaimCoalesced
+           << " coalesce_groups=" << S.CoalesceGroups << "\n";
     }
   }
 };

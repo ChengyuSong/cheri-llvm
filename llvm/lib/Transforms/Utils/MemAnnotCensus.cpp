@@ -6,6 +6,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
@@ -134,8 +135,46 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
   return std::nullopt;
 }
 
+// [LLM-generated] M5r R3 (D18): watches one !mem.last_use carrier so the
+// late census can say why a loan id vanished: its carrier accessed a stack
+// slot that was promoted to SSA (nothing left in memory to invalidate), the
+// carrier was deleted for another reason, or the metadata was dropped.
+struct LUWatch final : CallbackVH {
+  SmallVector<Metadata *, 2> Loans;
+  WeakVH Alloca; // underlying alloca of a load/store carrier
+  bool AllocaAccess = false;
+  bool Deleted = false;
+  explicit LUWatch(Instruction *I, MDNode *LU) : CallbackVH(I) {
+    for (const MDOperand &Op : LU->operands())
+      Loans.push_back(Op.get());
+    if (Value *P = getLoadStorePointerOperand(I))
+      if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(P))) {
+        Alloca = A;
+        AllocaAccess = true;
+      }
+  }
+  void deleted() override {
+    Deleted = true;
+    setValPtr(nullptr);
+  }
+  void allUsesReplacedWith(Value *) override {}
+};
+
 struct State {
   std::map<uint64_t, Entry> Entries; // id -> entry
+  DenseMap<const Instruction *, std::unique_ptr<LUWatch>> LUWatches;
+  std::vector<std::unique_ptr<LUWatch>> LURetired;
+  void watch(Instruction &I) {
+    MDNode *LU = I.getMetadata(memannot::LastUseMD);
+    if (!LU)
+      return;
+    auto &W = LUWatches[&I];
+    if (W && static_cast<Value *>(*W) == &I)
+      return;
+    if (W)
+      LURetired.push_back(std::move(W));
+    W = std::make_unique<LUWatch>(&I, LU);
+  }
   std::map<uint64_t, std::unique_ptr<ClaimVH>> Claims; // id -> watcher
   uint64_t NextId = 1;
   unsigned Start[K_NumKinds] = {};
@@ -222,6 +261,7 @@ bool memannot::runCensusStart(Module &M) {
       if (I.getMetadata(memannot::GuardMD))
         ++S.Start[K_Guard];
       CountLoans(I, StartLoans);
+      S.watch(I);
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -422,9 +462,45 @@ static void runCensusLateImpl(Module &M) {
     }
     ++Lost[E.K][R];
   }
+  // R3 (D18): why each lost loan id vanished.
+  unsigned LUPromoted = 0, LUCarrierDeleted = 0, LUDropped = 0;
+  {
+    DenseMap<Metadata *, SmallVector<LUWatch *, 2>> ByLoan;
+    auto Add = [&](LUWatch *W) {
+      for (Metadata *L : W->Loans)
+        ByLoan[L].push_back(W);
+    };
+    for (auto &[I, W] : SP->LUWatches)
+      Add(W.get());
+    for (auto &W : SP->LURetired)
+      Add(W.get());
+    for (auto &[L, Ws] : ByLoan) {
+      if (LateLoans.count(L))
+        continue;
+      bool Promoted = false, AllDeleted = true;
+      for (LUWatch *W : Ws) {
+        Promoted |= W->Deleted && W->AllocaAccess && !W->Alloca;
+        AllDeleted &= W->Deleted;
+      }
+      if (Promoted)
+        ++LUPromoted;
+      else if (AllDeleted)
+        ++LUCarrierDeleted;
+      else
+        ++LUDropped;
+    }
+  }
   std::string LostStr;
   raw_string_ostream LOS(LostStr);
   for (unsigned K = 0; K < K_NumKinds; ++K) {
+    if (K == K_LastUse) {
+      unsigned S = SP->Start[K], L = Late[K];
+      if (S > L || LUPromoted || LUCarrierDeleted || LUDropped)
+        LOS << " last_use=" << (S > L ? S - L : 0) << "(fail-safe:promoted="
+            << LUPromoted << ",carrier-deleted=" << LUCarrierDeleted
+            << ",md-dropped=" << LUDropped << ")";
+      continue;
+    }
     if (isHintKind(K)) {
       // Hints are not tracked individually (cloning may add some); a net
       // decrease is reported as fail-safe.
@@ -586,11 +662,25 @@ PreservedAnalyses CheriBoundsLoweringPass::run(Module &M,
 
 
 void memannot::countAnnotations(const Function &F, unsigned *Out) {
+  // R3 (D18): watch carriers created after the start census (D16 moves,
+  // clones), so late loss reasons cover them too.
+  State *St = nullptr;
+  {
+    std::lock_guard<std::mutex> G(stateLock());
+    auto It = states().find(F.getParent());
+    if (It != states().end())
+      St = It->second.get();
+  }
   for (const Instruction &I : instructions(F)) {
     if (I.getMetadata(memannot::GuardMD))
       ++Out[K_Guard];
-    if (I.getMetadata(memannot::LastUseMD))
+    if (I.getMetadata(memannot::LastUseMD)) {
       ++Out[K_LastUse];
+      if (St) {
+        std::lock_guard<std::mutex> G(stateLock());
+        St->watch(const_cast<Instruction &>(I));
+      }
+    }
     auto *CB = dyn_cast<CallBase>(&I);
     if (!CB)
       continue;
