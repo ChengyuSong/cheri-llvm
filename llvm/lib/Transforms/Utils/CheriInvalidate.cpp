@@ -14,6 +14,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
@@ -33,6 +34,10 @@ using namespace llvm;
 static cl::opt<std::string> InvalidateOpt(
     "cheri-invalidate", cl::init("none"), cl::Hidden,
     cl::desc("M5r R4 Track B prototype: none, scope, free, all"));
+static cl::opt<bool> InvFilter(
+    "cheri-invalidate-filter", cl::init(true), cl::Hidden,
+    cl::desc("Only range-check a slot whose stored capabilities may point "
+             "into the dead object (underlying-object provenance)"));
 static cl::opt<std::string> InvStatsOut(
     "cheri-invalidate-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module invalidation counts"));
@@ -48,7 +53,14 @@ struct Inv {
   const DataLayout &DL;
   bool Scope, Free;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
-           Slots = 0, LUFrameCopies = 0, LUCarriers = 0;
+           Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
+  // Provenance of the capabilities stored into each slot (R4 filter):
+  // the identified underlying objects, and whether any origin is unknown.
+  struct Prov {
+    SmallPtrSet<const Value *, 4> Objs;
+    bool Unknown = false;
+  };
+  DenseMap<std::pair<AllocaInst *, int64_t>, Prov> SlotProv;
   Inv(Module &M, bool Scope, bool Free)
       : M(M), DL(M.getDataLayout()), Scope(Scope), Free(Free) {}
 
@@ -71,6 +83,15 @@ struct Inv {
       auto &V = Out[A];
       if (!is_contained(V, Off))
         V.push_back(Off);
+      Prov &Pv = SlotProv[{A, Off}];
+      SmallVector<const Value *, 4> Objs;
+      getUnderlyingObjects(SI->getValueOperand(), Objs);
+      for (const Value *O : Objs) {
+        if (isa<AllocaInst>(O) || isa<Argument>(O) || isa<GlobalValue>(O))
+          Pv.Objs.insert(O);
+        else if (!isa<ConstantPointerNull>(O) && !isa<UndefValue>(O))
+          Pv.Unknown = true;
+      }
     }
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
@@ -111,6 +132,80 @@ struct Inv {
         return false;
     return true;
   }
+
+  // R4 filter: can slot S hold a capability into the frame object A?
+  // An argument or global cannot (A is created in this frame); an unknown
+  // origin (a load, a call result) can only if A's address escapes.
+  bool mayHoldFrame(Slot S, AllocaInst *A) {
+    if (!InvFilter)
+      return true;
+    auto It = SlotProv.find({S.A, S.Off});
+    if (It == SlotProv.end())
+      return true;
+    if (It->second.Objs.count(A))
+      return true;
+    if (It->second.Unknown && PointerMayBeCaptured(A, /*ReturnCaptures=*/true))
+      return true;
+    ++Filtered;
+    return false;
+  }
+  // Can slot S hold a capability into a heap block? Only an argument or an
+  // unknown origin can; frame objects and globals cannot.
+  bool mayHoldHeap(Slot S) {
+    if (!InvFilter)
+      return true;
+    auto It = SlotProv.find({S.A, S.Off});
+    if (It == SlotProv.end() || It->second.Unknown)
+      return true;
+    for (const Value *O : It->second.Objs)
+      if (isa<Argument>(O))
+        return true;
+    ++Filtered;
+    return false;
+  }
+
+  // R4 filter: a non-escaping slot object that is never read again after
+  // the event cannot hand out the stale capability; skip it.
+  bool readLater(AllocaInst *S, Instruction *At, DominatorTree &DT) {
+    if (!InvFilter)
+      return true;
+    auto It = ReadLater.find({S, At});
+    if (It != ReadLater.end())
+      return It->second;
+    bool R = PointerMayBeCaptured(S, /*ReturnCaptures=*/true);
+    if (!R) {
+      SmallVector<const Value *, 8> WL{S};
+      SmallPtrSet<const Value *, 16> Seen;
+      while (!WL.empty() && !R) {
+        const Value *V = WL.pop_back_val();
+        if (!Seen.insert(V).second)
+          continue;
+        for (const User *U : V->users()) {
+          auto *I = dyn_cast<Instruction>(U);
+          if (!I)
+            continue;
+          if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||
+              isa<SelectInst>(I)) {
+            WL.push_back(I);
+            continue;
+          }
+          if (isa<StoreInst>(I) || I->isLifetimeStartOrEnd() ||
+              isa<DbgInfoIntrinsic>(I))
+            continue;
+          // A load or any other reader (memcpy source, call): reachable?
+          if (I != At && isPotentiallyReachable(At, I, nullptr, &DT)) {
+            R = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!R)
+      ++Filtered;
+    ReadLater[{S, At}] = R;
+    return R;
+  }
+  DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadLater;
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
   void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len) {
@@ -176,12 +271,13 @@ struct Inv {
           }
         Value *Lo = nullptr;
         for (auto &[S, Offs] : CapSlots) {
-          if (S == A || !liveAt(S, E, DT))
+          if (S == A || !liveAt(S, E, DT) || !readLater(S, E, DT))
             continue;
           if (!Lo)
             Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
           for (int64_t Off : Offs)
-            checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()));
+            if (mayHoldFrame({S, Off}, A))
+              checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()));
         }
       }
     if (Free)
@@ -197,10 +293,11 @@ struct Inv {
         Value *Len = B.CreateCall(decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}), {P});
         B.SetInsertPoint(C->getNextNode());
         for (auto &[S, Offs] : CapSlots) {
-          if (!liveAt(S, C, DT))
+          if (!liveAt(S, C, DT) || !readLater(S, C, DT))
             continue;
           for (int64_t Off : Offs)
-            checkAndClear(B, {S, Off}, Lo, Len);
+            if (mayHoldHeap({S, Off}))
+              checkAndClear(B, {S, Off}, Lo, Len);
         }
       }
   }
@@ -218,7 +315,7 @@ struct Inv {
            << " scope_events=" << ScopeEvents << " free_events=" << FreeEvents
            << " own_nulled=" << OwnNulled << " range_checks=" << RangeChecks
            << " lu_carriers=" << LUCarriers
-           << " lu_frame_copies=" << LUFrameCopies << "\n";
+           << " lu_frame_copies=" << LUFrameCopies << " filtered=" << Filtered << "\n";
     }
   }
 };
