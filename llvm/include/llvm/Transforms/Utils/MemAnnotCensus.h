@@ -53,6 +53,8 @@ LLVM_ABI bool runCheriBoundsLoweringStub(Module &M);
 /// R2: late census, per-check / per-claim CHERI decisions
 /// (CheriBoundsLowering.cpp), then strip.
 LLVM_ABI bool runCheriBoundsLowering(Module &M);
+/// [LLM-generated] M5r R4 Track B prototype (-cheri-invalidate).
+LLVM_ABI bool runCheriInvalidate(Module &M);
 /// Set by -mem-annot-census: add the start census at pipeline start.
 LLVM_ABI bool censusAtPipelineStart();
 /// True while a start census is pending for \p M (D14: InstCombine keeps

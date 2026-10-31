@@ -1161,6 +1161,7 @@ bool memannot::runCheriBoundsLowering(Module &M) {
   runCensusLate(M);
   Lowering L(M, readPolicy(M), cheriSkipNarrowEnabled());
   L.run();
+  runCheriInvalidate(M); // R4 Track B (off by default), before the strip
   stripAnnotations(M);
   return true;
 }

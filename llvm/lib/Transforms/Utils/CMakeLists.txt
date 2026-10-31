@@ -15,6 +15,7 @@ add_llvm_component_library(LLVMTransformUtils
   CheriSetBounds.cpp
   CheriLogSetBoundsPass.cpp
   CheriBoundsLowering.cpp
+  CheriInvalidate.cpp
   CheriSkipNarrow.cpp
   MemAnnotCensus.cpp
   CloneFunction.cpp
