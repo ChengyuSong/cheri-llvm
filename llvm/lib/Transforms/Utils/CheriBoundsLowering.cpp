@@ -36,6 +36,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/KnownBits.h"
@@ -68,7 +69,7 @@ enum Exactness { E_Always, E_Never, E_Dynamic };
 struct Stats {
   unsigned Markers = 0, Merged = 0, Raw = 0, Borrow = 0, Unlinked = 0,
            Narrowed = 0, Skipped = 0, Removed = 0, TwoVersion = 0,
-           Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0;
+           Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0;
 };
 
@@ -187,7 +188,45 @@ struct Lowering {
   }
 
   // ---- IR helpers ---------------------------------------------------------
+  // X*c, X<<k and the same constant compare equal.
+  static bool sameBytes(Value *A, Value *B) {
+    using namespace PatternMatch;
+    if (A == B)
+      return true;
+    auto Split = [](Value *V, Value *&X, uint64_t &C) {
+      const APInt *K;
+      if (match(V, m_Mul(m_Value(X), m_APInt(K))) && K->getActiveBits() <= 64) {
+        C = K->getZExtValue();
+        return true;
+      }
+      if (match(V, m_Shl(m_Value(X), m_APInt(K))) && K->ult(63)) {
+        C = 1ULL << K->getZExtValue();
+        return true;
+      }
+      X = V;
+      C = 1;
+      return true;
+    };
+    if (auto *CA = dyn_cast<ConstantInt>(A))
+      if (auto *CB = dyn_cast<ConstantInt>(B))
+        return CA->getValue() == CB->getValue();
+    Value *XA, *XB;
+    uint64_t CA, CB;
+    Split(A, XA, CA);
+    Split(B, XB, CB);
+    return XA == XB && CA == CB;
+  }
+
   Value *narrow(Builder &B, Value *Base, Value *Bytes, bool Exact) {
+    // Rule 1: the base is already narrowed to exactly these bytes (e.g. a
+    // manual bounds_set_exact): no second narrow.
+    if (auto *II = dyn_cast<IntrinsicInst>(Base->stripPointerCasts()))
+      if ((II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact ||
+           (!Exact && II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set)) &&
+          sameBytes(II->getArgOperand(1), Bytes)) {
+        ++S.AlreadyNarrow;
+        return Base;
+      }
     Function *F = Intrinsic::getOrInsertDeclaration(
         &M,
         Exact ? Intrinsic::cheri_cap_bounds_set_exact
@@ -363,14 +402,20 @@ struct Lowering {
         Value *Rounded = narrow(B, Mk.Base, Bytes, false);
         Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
         rewriteGuards(OnEdge, Cap, Done);
+        // M5.0 shape: branch on the tag first; only the untagged (inexact)
+        // path keeps the software check:
+        //   Pred: br tag, Ok, Slow      Slow: br cond, Ok, Panic (original)
         auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
-        Value *C = Br->getCondition();
-        // Fail only when the software check fails and the exact narrow
-        // did not keep the tag.
-        Value *NewC = Br->getSuccessor(0) == Mk.Panic->getParent()
-                          ? B.CreateAnd(C, B.CreateNot(Tag))
-                          : B.CreateOr(C, Tag);
-        Br->setCondition(NewC);
+        BasicBlock *P = Mk.Panic->getParent();
+        BasicBlock *Slow = BasicBlock::Create(F.getContext(), "cheri.slowcheck",
+                                              &F, P);
+        Br->removeFromParent();
+        Br->insertInto(Slow, Slow->end());
+        CondBrInst::Create(Tag, Mk.Ok, Slow, Mk.Pred);
+        for (PHINode &PN : Mk.Ok->phis())
+          PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
+        for (PHINode &PN : P->phis())
+          PN.replaceIncomingBlockWith(Mk.Pred, Slow);
         ++S.TwoVersion;
       } else { // elide, Never: rounded narrow, keep the check
         NarrowKeep(false);
@@ -535,7 +580,7 @@ struct Lowering {
            << " skipped=" << S.Skipped << " removed=" << S.Removed
            << " twoversion=" << S.TwoVersion << " noedge=" << S.NoEdge
            << " kept=" << S.Kept << " hoisted=" << S.Hoisted
-           << " csed=" << S.CSEd << " claims=" << S.Claims
+           << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof << "\n";
