@@ -36,6 +36,7 @@
 namespace llvm {
 class CallBase;
 class Instruction;
+class MDNode;
 class Value;
 class DataLayout;
 
@@ -111,6 +112,11 @@ LLVM_ABI bool isTriviallyAllocInbounds(const Value *V, const DataLayout &DL);
 LLVM_ABI bool hasMemCheck(const CallBase &CB);
 /// True if every operand bundle on \p CB is a "mem." bundle.
 LLVM_ABI bool onlyMemBundles(const CallBase &CB);
+/// R4 (D28): instructions that may carry !mem.last_use (memory accesses and
+/// calls other than annotation intrinsics).
+LLVM_ABI bool isLastUseCarrier(const Instruction &I);
+/// R4 (D28): add the loan ids of LU to To's !mem.last_use.
+LLVM_ABI void mergeLastUse(Instruction &To, MDNode *LU);
 } // namespace memannot
 } // namespace llvm
 #endif

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/AttributeMask.h"
@@ -109,7 +110,88 @@ void Instruction::handleMarkerRemoval() {
   DebugMarker->removeMarker();
 }
 
+// [LLM-generated] M5r R4 (D28): an erased !mem.last_use carrier hands its
+// loan ids to the previous carrier on the same path (same block, then up a
+// chain of single predecessors). Nothing between that carrier and the erased
+// one accesses memory or calls (they would be carriers), so the loans end at
+// the same point. A carrier that accesses an alloca is not transferred (the
+// alloca is being promoted, nothing remains to invalidate; census "promoted").
+// No carrier found within the walk limit: the ids are lost (fail-safe).
+// Passes that move the surviving copy later (SimplifyCFG sinking) merge the
+// ids onto it and clear them on the erased copies first.
+static cl::opt<bool> MemLastUseTransfer(
+    "mem-last-use-transfer", cl::init(true), cl::Hidden,
+    cl::desc("M5r R4 (D28): move !mem.last_use from an erased carrier to the "
+             "previous carrier on its path"));
+
+bool llvm::memannot::isLastUseCarrier(const Instruction &I) {
+  if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
+      isa<AtomicCmpXchgInst>(I))
+    return true;
+  const auto *C = dyn_cast<CallBase>(&I);
+  if (!C)
+    return false;
+  if (const auto *II = dyn_cast<IntrinsicInst>(C))
+    return isa<MemIntrinsic>(II);
+  return true;
+}
+
+void llvm::memannot::mergeLastUse(Instruction &To, MDNode *LU) {
+  SmallVector<Metadata *, 4> Ids;
+  SmallPtrSet<Metadata *, 4> Seen;
+  if (MDNode *Old = To.getMetadata(LastUseMD))
+    for (const MDOperand &Op : Old->operands())
+      if (Seen.insert(Op.get()).second)
+        Ids.push_back(Op.get());
+  for (const MDOperand &Op : LU->operands())
+    if (Seen.insert(Op.get()).second)
+      Ids.push_back(Op.get());
+  To.setMetadata(LastUseMD, MDNode::get(To.getContext(), Ids));
+}
+
+static void transferLastUse(Instruction &I) {
+  if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
+    return;
+  MDNode *LU = I.getMetadata(memannot::LastUseMD);
+  if (!LU)
+    return;
+  const Value *P = nullptr;
+  if (auto *LI = dyn_cast<LoadInst>(&I))
+    P = LI->getPointerOperand();
+  else if (auto *SI = dyn_cast<StoreInst>(&I))
+    P = SI->getPointerOperand();
+  for (unsigned D = 0; P && D < 8; ++D) {
+    P = P->stripPointerCasts();
+    if (isa<AllocaInst>(P))
+      return;
+    if (auto *G = dyn_cast<GEPOperator>(P))
+      P = G->getPointerOperand();
+    else
+      break;
+  }
+  BasicBlock *BB = I.getParent();
+  Instruction *Start = &I;
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
+      if (&*It != Start && &*It != &I && memannot::isLastUseCarrier(*It)) {
+        memannot::mergeLastUse(*It, LU);
+        return;
+      }
+    BB = BB->getSinglePredecessor();
+    if (!BB)
+      return;
+    Start = BB->getTerminator();
+    if (!Start)
+      return;
+    if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
+      memannot::mergeLastUse(*Start, LU);
+      return;
+    }
+  }
+}
+
 BasicBlock::iterator Instruction::eraseFromParent() {
+  transferLastUse(*this);
   handleMarkerRemoval();
   return getParent()->getInstList().erase(getIterator());
 }
