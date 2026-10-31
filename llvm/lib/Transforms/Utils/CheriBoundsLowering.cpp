@@ -258,6 +258,14 @@ struct Lowering {
     return N;
   }
   const char *NarrowTag = nullptr;
+  // Entry claims (Param) are M3.0's entry narrows; every other claim kind is
+  // a conversion (M3.3 contract) narrow.
+  static const char *claimTag(CallBase *C) {
+    auto *FC = dyn_cast<ConstantInt>(C->getArgOperand(2));
+    if (FC && (FC->getZExtValue() & memannot::CF_KindMask) == memannot::CK_Param)
+      return "cheri.entry_narrow";
+    return "cheri.contract_narrow";
+  }
 
   Exactness exactness(Value *Base, Value *Len, uint64_t Esz,
                       std::optional<uint64_t> &ConstBytes) {
@@ -751,6 +759,7 @@ struct Lowering {
       Value *Bytes = C->getArgOperand(1);
       if (Bytes->getType() != B.getInt64Ty())
         Bytes = B.CreateZExtOrTrunc(Bytes, B.getInt64Ty());
+      NarrowTag = claimTag(C);
       Value *N = narrow(B, P, Bytes, false);
       // The claim stays (its operand becomes the narrow) so the census and
       // stripAnnotations treat it as before; strip replaces it with N.
@@ -802,6 +811,7 @@ struct Lowering {
       if (BI->getParent() == First->getParent() && !BI->comesBefore(First))
         return;
     Builder &B = mk(First);
+    NarrowTag = claimTag(First);
     Value *Start = Lo ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Lo)) : Base;
     Value *N = narrow(B, Start, B.getInt64(Hi - Lo), false);
     for (const CItem &It : Items) {
