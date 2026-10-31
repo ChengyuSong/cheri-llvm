@@ -63,6 +63,7 @@
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
@@ -1615,7 +1616,7 @@ private:
   // FIXME: What about debug intrinsics? This matches old behavior, but
   // doesn't make sense.
   void visitIntrinsicInst(IntrinsicInst &II) {
-    if (II.isDroppable()) {
+    if (II.isDroppable() || memannot::isMemFact(&II)) { // [LLM-generated] M5r
       AS.DeadUseIfPromotable.push_back(U);
       return;
     }
@@ -1751,6 +1752,16 @@ private:
   void visitInstruction(Instruction &I) { PI.setAborted(&I); }
 
   void visitCallBase(CallBase &CB) {
+    // [LLM-generated] M5r: "mem." annotation operands (llvm.mem.fact and the
+    // "mem.check" bundle) are pure information about the alloca; if it is
+    // promoted they are poisoned/renamed (see Value::dropDroppableUse).
+    if (memannot::isMemFact(&CB) ||
+        (CB.isBundleOperand(U) &&
+         memannot::isMemTag(CB.getBundleOpInfoForOperand(U->getOperandNo())
+             .Tag->getKey()))) {
+      AS.DeadUseIfPromotable.push_back(U);
+      return;
+    }
     // If the call operand is read-only and only does a read-only or address
     // capture, then we mark it as EscapedReadOnly.
     if (CB.isDataOperand(U) &&

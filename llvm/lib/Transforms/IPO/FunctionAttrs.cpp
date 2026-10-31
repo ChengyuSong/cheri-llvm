@@ -235,6 +235,13 @@ checkFunctionMemoryAccess(Function &F, bool ThisBody, AAResults &AAR,
       if (isa<PseudoProbeInst>(I))
         continue;
 
+      // [LLM-generated] M5r: the same holds for llvm.mem.fact annotations
+      // (stripped before ISel); they must not make a readonly function
+      // look like it writes memory.
+      if (auto *II = dyn_cast<IntrinsicInst>(&I);
+          II && II->getIntrinsicID() == Intrinsic::mem_fact)
+        continue;
+
       AddNonArgMemoryEffects(CallME);
 
       // Check whether all pointer arguments point to local memory, and

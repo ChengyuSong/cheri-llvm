@@ -1,6 +1,7 @@
 #include "llvm/Analysis/CheriBounds.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
@@ -76,6 +77,19 @@ bool CheriNeedBoundsChecker::useNeedsBounds(const Use &U,
   switch (I->getOpcode()) {
   case Instruction::Call:
   case Instruction::Invoke: {
+    // [LLM-generated] M5r: annotations (llvm.mem.fact, "mem." bundle
+    // operands) are stripped before ISel and never need stack bounds.
+    {
+      const auto *CB = cast<CallBase>(I);
+      if (CB->getIntrinsicID() == Intrinsic::mem_fact ||
+          (CB->isBundleOperand(U.getOperandNo()) &&
+           memannot::isMemTag(CB->getBundleOpInfoForOperand(U.getOperandNo())
+               .Tag->getKey()))) {
+        DBG_INDENTED("No need for stack bounds for mem. annotation: ";
+                     I->dump());
+        return false;
+      }
+    }
     switch (cast<CallBase>(I)->getIntrinsicID()) {
     case Intrinsic::not_intrinsic:
       // not an intrinsic call -> always need bounds:

@@ -928,6 +928,7 @@ public:
     case Intrinsic::assume:
     case Intrinsic::sideeffect:
     case Intrinsic::pseudoprobe:
+    case Intrinsic::mem_fact: // [LLM-generated] M5r: free, stripped pre-ISel
     case Intrinsic::arithmetic_fence:
     case Intrinsic::dbg_assign:
     case Intrinsic::dbg_declare:

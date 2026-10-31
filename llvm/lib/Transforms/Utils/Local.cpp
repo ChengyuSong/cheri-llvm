@@ -3941,8 +3941,11 @@ bool llvm::canReplaceOperandWithVariable(const Instruction *I, unsigned OpIdx) {
 
     // Constant bundle operands may need to retain their constant-ness for
     // correctness.
+    // [LLM-generated] M5r: "mem.check" operands may become PHIs when
+    // SimplifyCFG sinks/merges failure calls; the late pass reads the site of
+    // each incoming edge. This keeps code generation identical with markers.
     if (CB.isBundleOperand(OpIdx))
-      return false;
+      return CB.getBundleOpInfoForOperand(OpIdx).Tag->getKey() == "mem.check";
 
     if (OpIdx < CB.arg_size()) {
       // Some variadic intrinsics require constants in the variadic arguments,

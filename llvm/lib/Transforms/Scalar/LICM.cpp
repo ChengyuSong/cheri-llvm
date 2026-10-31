@@ -1240,6 +1240,11 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
     if (match(CI, m_Intrinsic<Intrinsic::assume>()))
       // Assumes don't actually alias anything or throw
       return true;
+    // [LLM-generated] M5r: llvm.mem.fact is assume-like and has no
+    // MemoryAccess; it is hoisted only under the same guaranteed-to-execute
+    // rules as llvm.assume.
+    if (match(CI, m_Intrinsic<Intrinsic::mem_fact>()))
+      return true;
 
     // Handle simple cases by querying alias analysis.
     MemoryEffects Behavior = AA->getMemoryEffects(CI);

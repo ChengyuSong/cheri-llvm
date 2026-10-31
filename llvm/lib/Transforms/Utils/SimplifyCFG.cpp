@@ -2523,6 +2523,14 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
     auto ProfitableToSinkInstruction = [&](LockstepReverseIterator<true> &LRI) {
       unsigned NumPHIInsts = 0;
       for (Use &U : (*LRI)[0]->operands()) {
+        // [LLM-generated] M5r: PHIs of "mem.check" operands are free (the
+        // bundle is stripped before ISel); sinking with markers must cost the
+        // same as without them.
+        if (auto *CB = dyn_cast<CallBase>(U.getUser());
+            CB && CB->isBundleOperand(U.getOperandNo()) &&
+            CB->getBundleOpInfoForOperand(U.getOperandNo()).Tag->getKey() ==
+                "mem.check")
+          continue;
         auto It = PHIOperands.find(&U);
         if (It != PHIOperands.end() && !all_of(It->second, [&](Value *V) {
               return InstructionsToSink.contains(V);

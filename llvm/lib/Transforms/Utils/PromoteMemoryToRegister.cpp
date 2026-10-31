@@ -38,6 +38,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -62,6 +63,23 @@ STATISTIC(NumLocalPromoted, "Number of alloca's promoted within one block");
 STATISTIC(NumSingleStore,   "Number of alloca's promoted with a single store");
 STATISTIC(NumDeadAlloca,    "Number of dead alloca's removed");
 STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
+
+// [LLM-generated] M5r: a use as a "mem." operand-bundle operand.
+static bool isMemBundleUse(const Use &U) {
+  auto *CB = dyn_cast<CallBase>(U.getUser());
+  return CB && CB->isBundleOperand(U.getOperandNo()) &&
+         memannot::isMemTag(CB->getBundleOpInfoForOperand(U.getOperandNo())
+             .Tag->getKey());
+}
+
+static bool isOnlyMemBundleUser(const User *Usr, const Value *V) {
+  if (!isa<CallBase>(Usr))
+    return false;
+  for (const Use &U : Usr->operands())
+    if (U.get() == V && !isMemBundleUse(U))
+      return false;
+  return true;
+}
 
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
   // Only allow direct and non-volatile loads and stores...
@@ -92,8 +110,11 @@ bool llvm::isAllocaPromotable(const AllocaInst *AI) {
         return false;
     } else if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(U)) {
       if (!II->isLifetimeStartOrEnd() && !II->isDroppable() &&
-          II->getIntrinsicID() != Intrinsic::fake_use)
+          II->getIntrinsicID() != Intrinsic::fake_use &&
+          !memannot::isMemFact(II)) // [LLM-generated] M5r
         return false;
+    } else if (isOnlyMemBundleUser(U, AI)) { // [LLM-generated] M5r
+      continue;
     } else if (const BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
       if (!onlyUsedByLifetimeMarkersOrDroppableInsts(BCI))
         return false;
@@ -531,6 +552,11 @@ static void removeIntrinsicUsers(AllocaInst *AI) {
     // Drop the use of AI in droppable instructions.
     if (I->isDroppable()) {
       I->dropDroppableUse(U);
+      continue;
+    }
+    // [LLM-generated] M5r: annotation uses are poisoned/renamed, not erased.
+    if (memannot::isMemFact(I) || isMemBundleUse(U)) {
+      Value::dropDroppableUse(U);
       continue;
     }
 

@@ -1954,7 +1954,7 @@ bool VPCostContext::useEmulatedMaskMemRefHack(const VPReplicateRecipe *R,
 bool VPCostContext::isFreeScalarIntrinsic(Intrinsic::ID ID) {
   return is_contained({Intrinsic::assume, Intrinsic::lifetime_end,
                        Intrinsic::lifetime_start, Intrinsic::sideeffect,
-                       Intrinsic::pseudoprobe,
+                       Intrinsic::pseudoprobe, Intrinsic::mem_fact,
                        Intrinsic::experimental_noalias_scope_decl},
                       ID);
 }

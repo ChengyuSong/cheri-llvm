@@ -54,6 +54,8 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1819,6 +1821,87 @@ static void AddAlignmentAssumptions(CallBase &CB, InlineFunctionInfo &IFI) {
   }
 }
 
+// [LLM-generated] M5r: parameter/return facts carried as attributes are lost
+// when the callee is inlined; re-express them as llvm.mem.fact at the call
+// site. Return facts are attached to the call value itself and follow the
+// inliner's RAUW to the returned value.
+//   "mem.alloc_inbounds"                 -> "mem.alloc_inbounds"(v)
+//   "mem.untrusted" + dereferenceable(N) -> "mem.claim"(v, N, Param|Untrusted)
+//   "mem.claim"="N"                      -> "mem.claim"(v, N, Param|Untrusted)
+static void addMemFact(IRBuilderBase &B, StringRef Tag,
+                       ArrayRef<Value *> Ops) {
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
+  OperandBundleDef OB(Tag.str(), std::vector<Value *>(Ops.begin(), Ops.end()));
+  B.CreateCall(Fact, {}, {OB});
+}
+
+static void addMemFactsFor(IRBuilderBase &B, Value *V, const AttributeSet &A1,
+                           const AttributeSet &A2, uint64_t Kind) {
+  auto Has = [&](StringRef K) {
+    return A1.hasAttribute(K) || A2.hasAttribute(K);
+  };
+  if (Has("mem.alloc_inbounds"))
+    addMemFact(B, memannot::TagAllocInbounds, {V});
+  uint64_t Bytes = 0;
+  for (const AttributeSet &A : {A1, A2}) {
+    if (A.hasAttribute("mem.claim")) {
+      uint64_t N = 0;
+      if (!A.getAttribute("mem.claim").getValueAsString().getAsInteger(10, N))
+        Bytes = std::max(Bytes, N);
+    }
+  }
+  if (!Bytes && Has("mem.untrusted"))
+    Bytes = std::max(A1.getDereferenceableBytes(), A2.getDereferenceableBytes());
+  if (Bytes) {
+    Type *I64 = B.getInt64Ty();
+    addMemFact(B, memannot::TagClaim,
+               {V, ConstantInt::get(I64, Bytes),
+                ConstantInt::get(I64, Kind | memannot::CF_Untrusted)});
+  }
+}
+
+// [LLM-generated] M5r: convert mem.* parameter/return attributes of the
+// inlined callee into llvm.mem.fact calls (they would be lost otherwise).
+static cl::opt<bool> MemAnnotInlineAttrFacts(
+    "mem-annot-inline-attr-facts", cl::init(true), cl::Hidden,
+    cl::desc("M5r: turn mem.* argument/return attributes into llvm.mem.fact "
+             "calls when inlining"));
+
+static void AddMemFactsFromAttributes(CallBase &CB) {
+  if (!MemAnnotInlineAttrFacts)
+    return;
+  Function *Callee = CB.getCalledFunction();
+  AttributeList CalleeAL = Callee->getAttributes(), CallAL = CB.getAttributes();
+  IRBuilder<> B(&CB);
+  for (Argument &Arg : Callee->args()) {
+    if (!Arg.getType()->isPointerTy())
+      continue;
+    unsigned N = Arg.getArgNo();
+    addMemFactsFor(B, CB.getArgOperand(N), CalleeAL.getParamAttrs(N),
+                   CallAL.getParamAttrs(N), memannot::CK_Param);
+  }
+  if (!CB.getType()->isPointerTy())
+    return;
+  AttributeSet R1 = CalleeAL.getRetAttrs(), R2 = CallAL.getRetAttrs();
+  if (!R1.hasAttribute("mem.alloc_inbounds") &&
+      !R2.hasAttribute("mem.alloc_inbounds") && !R1.hasAttribute("mem.claim") &&
+      !R2.hasAttribute("mem.claim") && !R1.hasAttribute("mem.untrusted") &&
+      !R2.hasAttribute("mem.untrusted"))
+    return;
+  BasicBlock::iterator IP;
+  if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+    BasicBlock *Normal = II->getNormalDest();
+    if (!Normal->getSinglePredecessor())
+      Normal = SplitEdge(II->getParent(), Normal);
+    IP = Normal->getFirstInsertionPt();
+  } else {
+    IP = std::next(CB.getIterator());
+  }
+  IRBuilder<> RB(IP->getParent(), IP);
+  addMemFactsFor(RB, &CB, R1, R2, memannot::CK_Ret);
+}
+
 static void HandleByValArgumentInit(Type *ByValType, Value *Dst, Value *Src,
                                     MaybeAlign SrcAlign, Module *M,
                                     BasicBlock *InsertBlock,
@@ -2614,6 +2697,10 @@ llvm::InlineResult llvm::CanInlineCallSite(const CallBase &CB,
         IFI.ConvergenceControlToken = OBUse.Inputs[0].get();
         continue;
       }
+      // [LLM-generated] M5r: a "mem.check" marker is moved onto the inlined
+      // body's noreturn calls (see InlineFunctionImpl).
+      if (OBUse.getTagName() == memannot::TagCheck)
+        continue;
 
       return InlineResult::failure("unsupported operand bundle");
     }
@@ -2828,6 +2915,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // instructions are actually cloned into the caller so that we can easily
     // check what will be known at the start of the inlined code.
     AddAlignmentAssumptions(CB, IFI);
+    AddMemFactsFromAttributes(CB); // [LLM-generated] M5r
 
     AssumptionCache *AC =
         IFI.GetAssumptionCache ? &IFI.GetAssumptionCache(*Caller) : nullptr;
@@ -2916,6 +3004,28 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
 
         VH = nullptr;
         ICS->eraseFromParent();
+      }
+    }
+
+    // [LLM-generated] M5r: keep a "mem.check" marker that sat on the call.
+    if (std::optional<OperandBundleUse> MC =
+            CB.getOperandBundle(memannot::TagCheck)) {
+      OperandBundleDef Def(*MC);
+      SmallVector<CallBase *, 4> Targets;
+      for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+        for (Instruction &I : *BI)
+          if (auto *C = dyn_cast<CallBase>(&I))
+            if (C->doesNotReturn() && !memannot::hasMemCheck(*C))
+              Targets.push_back(C);
+      for (CallBase *C : Targets) {
+        SmallVector<OperandBundleDef, 2> OBs;
+        C->getOperandBundlesAsDefs(OBs);
+        OBs.push_back(Def);
+        CallBase *NewC = CallBase::Create(C, OBs, C->getIterator());
+        NewC->takeName(C);
+        NewC->copyMetadata(*C);
+        C->replaceAllUsesWith(NewC);
+        C->eraseFromParent();
       }
     }
 

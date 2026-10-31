@@ -356,6 +356,7 @@ void AliasSetTracker::addUnknown(Instruction *Inst) {
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::sideeffect:
     case Intrinsic::pseudoprobe:
+    case Intrinsic::mem_fact: // [LLM-generated] M5r
       return;
     }
   }
