@@ -37,6 +37,7 @@ namespace llvm {
 class CallBase;
 class Instruction;
 class Value;
+class DataLayout;
 
 namespace memannot {
 /// "mem.claim"="N": parameter/return attribute (not a bundle) read by the
@@ -52,6 +53,9 @@ inline constexpr StringRef GuardMD = "mem.guard";
 /// !mem.last_use !{i64 loan, ...}: last use of each loan on this path (R1).
 inline constexpr StringRef LastUseMD = "mem.last_use";
 inline constexpr StringRef IdMD = "mem.annot.id";
+/// Set on a claim just before InstCombine folds it as object-exact (R1), so
+/// the census can classify the RAUW as explained.
+inline constexpr StringRef ObjectExactMD = "mem.claim.object_exact";
 
 // mem.claim flags (bit layout, informational for R0).
 enum ClaimKind : uint64_t {
@@ -94,6 +98,15 @@ LLVM_ABI bool isMemClaim(const Value *V);
 /// Deallocation call that may carry a "mem.free" bundle: allockind("free"),
 /// or free / c_free / __rust_dealloc / __rdl_dealloc / __rg_dealloc.
 LLVM_ABI bool isDeallocCall(const CallBase &CB);
+/// R1: \p Claim (an llvm.mem.claim call) claims exactly a whole stack or
+/// global object: its operand is the object's start (constant offset 0) and
+/// the claimed size equals the object's known size. Such a claim carries no
+/// information beyond the allocation itself, so it can be folded into its
+/// operand without losing anything a late pass could use.
+LLVM_ABI bool isClaimObjectExact(const CallBase &Claim, const DataLayout &DL);
+/// R1: \p V is (a constant in-range offset into) a stack or global object, so
+/// "mem.alloc_inbounds"(V) is implied by the allocation itself.
+LLVM_ABI bool isTriviallyAllocInbounds(const Value *V, const DataLayout &DL);
 /// True if this call carries a "mem.check" bundle.
 LLVM_ABI bool hasMemCheck(const CallBase &CB);
 /// True if every operand bundle on \p CB is a "mem." bundle.

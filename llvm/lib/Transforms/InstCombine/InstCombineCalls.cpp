@@ -4042,6 +4042,29 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
         }))
       return nullptr;
     break;
+  case Intrinsic::mem_claim: {
+    // [LLM-generated] M5r R1: a claim of exactly a whole stack/global object
+    // says nothing beyond the allocation; fold it so it cannot block SROA,
+    // memcpy-from-constant folding or memset-to-store (census: object-exact).
+    if (memannot::isClaimObjectExact(*II, DL)) {
+      II->setMetadata(memannot::ObjectExactMD, MDNode::get(II->getContext(), {}));
+      // The object may now be foldable (e.g. an alloca only copied from
+      // constant memory): revisit it.
+      auto PushObj = [&](Value *V) {
+        if (auto *Obj = dyn_cast<Instruction>(getUnderlyingObject(V)))
+          Worklist.push(Obj);
+      };
+      PushObj(II->getArgOperand(0));
+      for (User *U : II->users())
+        if (auto *MI = dyn_cast<MemTransferInst>(U)) {
+          PushObj(MI->getRawDest());
+          PushObj(MI->getRawSource());
+        }
+      replaceInstUsesWith(*II, II->getArgOperand(0));
+      return eraseInstFromFunction(*II);
+    }
+    break;
+  }
   case Intrinsic::mem_fact: {
     // [LLM-generated] M5r D14: a "mem.dropped" placeholder only exists for the
     // census; erase it when no census is running on this module.
@@ -4049,6 +4072,32 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
         II->getOperandBundleAt(0).getTagName() == memannot::TagDropped &&
         !memannot::censusActive(*II->getModule()))
       return eraseInstFromFunction(*II);
+    // [LLM-generated] M5r R1: a "mem.alloc_inbounds" fact on a stack/global
+    // object (or a constant in-range offset into one) is implied by the
+    // allocation; an identical earlier fact in the block makes it redundant.
+    // Erasing them keeps facts from blocking block merging/speculation.
+    if (II->getNumOperandBundles() == 1) {
+      OperandBundleUse OB = II->getOperandBundleAt(0);
+      bool Redundant = OB.getTagName() == memannot::TagAllocInbounds &&
+                       OB.Inputs.size() == 1 &&
+                       memannot::isTriviallyAllocInbounds(OB.Inputs[0], DL);
+      unsigned Budget = 16;
+      for (Instruction *P = II->getPrevNode(); P && !Redundant && Budget--;
+           P = P->getPrevNode()) {
+        auto *PI = dyn_cast<IntrinsicInst>(P);
+        if (PI && PI->getIntrinsicID() == Intrinsic::mem_fact &&
+            PI->getNumOperandBundles() == 1) {
+          OperandBundleUse PB = PI->getOperandBundleAt(0);
+          Redundant = PB.getTagName() == OB.getTagName() &&
+                      std::equal(PB.Inputs.begin(), PB.Inputs.end(),
+                                 OB.Inputs.begin(), OB.Inputs.end());
+        }
+      }
+      if (Redundant) {
+        memannot::noteRedundantFact(*II);
+        return eraseInstFromFunction(*II);
+      }
+    }
     break;
   }
   case Intrinsic::assume: {

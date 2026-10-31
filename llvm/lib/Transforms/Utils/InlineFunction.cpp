@@ -1884,7 +1884,9 @@ static void AddMemFactsFromAttributes(CallBase &CB, ValueToValueMapTy &VMap) {
     unsigned N = Arg.getArgNo();
     AttributeSet A1 = CalleeAL.getParamAttrs(N), A2 = CallAL.getParamAttrs(N);
     Value *V = CB.getArgOperand(N);
-    if (HasAI(A1, A2))
+    // R1: a fact on a stack/global object is implied by the allocation.
+    if (HasAI(A1, A2) &&
+        !memannot::isTriviallyAllocInbounds(V, CB.getDataLayout()))
       addMemFact(B, memannot::TagAllocInbounds, {V});
     if (uint64_t Bytes = claimBytes(A1, A2)) {
       // The inlined body reads the argument through VMap.

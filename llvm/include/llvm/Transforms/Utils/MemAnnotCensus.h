@@ -26,6 +26,8 @@
 
 namespace llvm {
 class Module;
+class Function;
+class Instruction;
 
 struct MemAnnotCensusPass : PassInfoMixin<MemAnnotCensusPass> {
   bool Late;
@@ -53,6 +55,19 @@ LLVM_ABI bool censusAtPipelineStart();
 /// True while a start census is pending for \p M (D14: InstCombine keeps
 /// "mem.dropped" placeholders only then).
 LLVM_ABI bool censusActive(const Module &M);
+/// A pass erased fact \p I as redundant (implied by the allocation or by an
+/// identical earlier fact); the census classifies it as "redundant".
+LLVM_ABI void noteRedundantFact(const Instruction &I);
+/// -mem-annot-census-per-pass: attribute annotation count changes to passes.
+LLVM_ABI bool censusPerPass();
+/// Number of annotation kinds counted by countAnnotations.
+inline constexpr unsigned NumCensusKinds = 8;
+/// Count annotations in \p F (check, guard, claim, alloc_inbounds, inbounds,
+/// free, last_use, dropped), adding to \p Out.
+LLVM_ABI void countAnnotations(const Function &F, unsigned *Out);
+/// Record that pass \p Pass changed the counts of \p M by Before -> After.
+LLVM_ABI void notePassDelta(const Module *M, StringRef Pass,
+                            const unsigned *Before, const unsigned *After);
 } // namespace memannot
 } // namespace llvm
 #endif

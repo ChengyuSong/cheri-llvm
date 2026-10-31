@@ -42,6 +42,11 @@ static cl::opt<bool> CensusVerbose(
     cl::desc("M5r: also print a census line for modules without "
              "annotations"));
 
+static cl::opt<bool> CensusPerPass(
+    "mem-annot-census-per-pass", cl::init(false), cl::Hidden,
+    cl::desc("M5r: attribute annotation count changes to the passes that "
+             "made them (reported with the late census)"));
+
 static cl::opt<bool> CensusTestErase(
     "mem-annot-census-test-erase", cl::init(false), cl::Hidden,
     cl::desc("M5r (testing only): after the start census, fold the first "
@@ -49,8 +54,10 @@ static cl::opt<bool> CensusTestErase(
              "it"));
 
 bool memannot::censusAtPipelineStart() { return CensusAtStart; }
+bool memannot::censusPerPass() { return CensusPerPass; }
 
 namespace {
+constexpr unsigned NumCensusKindsLocal = 8;
 enum Kind : unsigned {
   K_Check, K_Guard, K_Claim, K_AllocInbounds, K_Inbounds, K_Free,
   K_LastUse, K_Dropped, K_NumKinds
@@ -73,10 +80,14 @@ bool kindFromTag(StringRef T, Kind &K) {
 // into its operand (a real loss); deletion without RAUW means it was unused.
 struct ClaimVH final : CallbackVH {
   bool FoldedAway = false;
+  bool ObjectExact = false;
   explicit ClaimVH(Value *V) : CallbackVH(V) {}
   void allUsesReplacedWith(Value *New) override {
-    if (!memannot::isMemClaim(New) && !isa<PoisonValue>(New) &&
-        !isa<UndefValue>(New))
+    auto *Old = dyn_cast_or_null<Instruction>(getValPtr());
+    if (Old && Old->getMetadata(memannot::ObjectExactMD))
+      ObjectExact = true;
+    else if (!memannot::isMemClaim(New) && !isa<PoisonValue>(New) &&
+             !isa<UndefValue>(New))
       FoldedAway = true;
     setValPtr(New);
   }
@@ -119,6 +130,7 @@ struct State {
   std::map<uint64_t, std::unique_ptr<ClaimVH>> Claims; // id -> watcher
   uint64_t NextId = 1;
   unsigned Start[K_NumKinds] = {};
+  DenseSet<uint64_t> Redundant;      // fact ids erased as redundant
   StringMap<unsigned> CheckCallees; // callee -> calls with mem.check at start
   StringMap<unsigned> PlainCallees; // callee -> calls without at start
 };
@@ -231,6 +243,18 @@ bool memannot::runCensusStart(Module &M) {
   return Changed;
 }
 
+// [LLM-generated] M5r R1: per-pass attribution of annotation count changes.
+namespace {
+struct PassDelta {
+  unsigned Lost[NumCensusKindsLocal] = {};
+  unsigned Gained[NumCensusKindsLocal] = {};
+};
+std::map<const Module *, std::map<std::string, PassDelta>> &passDeltas() {
+  static std::map<const Module *, std::map<std::string, PassDelta>> D;
+  return D;
+}
+} // namespace
+static void reportPassDeltas(Module &M, raw_ostream &OS);
 static void runCensusLateImpl(Module &M) {
   std::lock_guard<std::mutex> G(stateLock());
   std::unique_ptr<State> SP;
@@ -293,8 +317,10 @@ static void runCensusLateImpl(Module &M) {
   unsigned Total = 0;
   for (unsigned K = 0; K < K_NumKinds; ++K)
     Total += Late[K] + (SP ? SP->Start[K] : 0);
-  if (!CensusVerbose && Total == 0)
+  if (!CensusVerbose && Total == 0) {
+    passDeltas().erase(&M);
     return;
+  }
 
   std::unique_ptr<raw_fd_ostream> Holder;
   raw_ostream &OS = out(Holder);
@@ -314,12 +340,14 @@ static void runCensusLateImpl(Module &M) {
   }
   Line("start", SP->Start);
   Line("late", Late);
+  reportPassDeltas(M, OS);
 
   // Classify the losses.
   enum { R_BlockDeleted, R_Unreachable, R_Dropped, R_Dead, R_IdStripped,
-         R_Unexplained, R_Num };
+         R_ObjectExact, R_Redundant, R_Unexplained, R_Num };
   const char *RName[R_Num] = {"block-deleted", "unreachable-block", "dropped",
-                              "dead",          "id-stripped",       "unexplained"};
+                              "dead",          "id-stripped",       "object-exact",
+                              "redundant",     "unexplained"};
   unsigned Lost[K_NumKinds][R_Num] = {};
   DenseMap<const Function *, SmallPtrSet<const BasicBlock *, 32>> Reach;
   auto Reachable = [&](BasicBlock *BB) {
@@ -350,7 +378,11 @@ static void runCensusLateImpl(Module &M) {
       if (CI != SP->Claims.end())
         CV = CI->second.get();
     }
-    if (CV && CV->FoldedAway) {
+    if (SP->Redundant.count(Id)) {
+      R = R_Redundant;
+    } else if (CV && CV->ObjectExact) {
+      R = R_ObjectExact;
+    } else if (CV && CV->FoldedAway) {
       R = R_Unexplained;
       Unexplained.push_back("claim #" + std::to_string(Id) + " in " + E.Fn +
                             " (folded into a non-claim value)");
@@ -418,6 +450,16 @@ void memannot::runCensusLate(Module &M) {
   for (Function &F : M)
     for (Instruction &I : instructions(F))
       I.setMetadata(memannot::IdMD, nullptr);
+}
+
+void memannot::noteRedundantFact(const Instruction &I) {
+  auto Id = getId(I);
+  if (!Id)
+    return;
+  std::lock_guard<std::mutex> G(stateLock());
+  auto It = states().find(I.getModule());
+  if (It != states().end())
+    It->second->Redundant.insert(*Id);
 }
 
 bool memannot::censusActive(const Module &M) {
@@ -520,4 +562,62 @@ PreservedAnalyses CheriBoundsLoweringPass::run(Module &M,
                                                ModuleAnalysisManager &) {
   return memannot::runCheriBoundsLoweringStub(M) ? PreservedAnalyses::none()
                                                  : PreservedAnalyses::all();
+}
+
+
+void memannot::countAnnotations(const Function &F, unsigned *Out) {
+  for (const Instruction &I : instructions(F)) {
+    if (I.getMetadata(memannot::GuardMD))
+      ++Out[K_Guard];
+    if (I.getMetadata(memannot::LastUseMD))
+      ++Out[K_LastUse];
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB)
+      continue;
+    if (auto *II = dyn_cast<IntrinsicInst>(CB);
+        II && II->getIntrinsicID() == Intrinsic::mem_fact) {
+      Kind K;
+      if (factKind(II, K))
+        ++Out[K];
+      continue;
+    }
+    if (memannot::isMemClaim(CB))
+      ++Out[K_Claim];
+    if (memannot::hasMemCheck(*CB))
+      ++Out[K_Check];
+    if (CB->getOperandBundle(memannot::TagFree))
+      ++Out[K_Free];
+  }
+}
+
+void memannot::notePassDelta(const Module *M, StringRef Pass,
+                             const unsigned *Before, const unsigned *After) {
+  bool Any = false;
+  for (unsigned K = 0; K < K_NumKinds; ++K)
+    Any |= Before[K] != After[K];
+  if (!Any)
+    return;
+  std::lock_guard<std::mutex> G(stateLock());
+  PassDelta &D = passDeltas()[M][Pass.str()];
+  for (unsigned K = 0; K < K_NumKinds; ++K) {
+    if (After[K] < Before[K])
+      D.Lost[K] += Before[K] - After[K];
+    else
+      D.Gained[K] += After[K] - Before[K];
+  }
+}
+
+static void reportPassDeltas(Module &M, raw_ostream &OS) {
+  auto It = passDeltas().find(&M);
+  if (It == passDeltas().end())
+    return;
+  for (auto &[Pass, D] : It->second) {
+    OS << "mem-annot-census-pass: " << M.getModuleIdentifier() << " " << Pass
+       << ":";
+    for (unsigned K = 0; K < K_NumKinds; ++K)
+      if (D.Lost[K] || D.Gained[K])
+        OS << " " << KindName[K] << "=-" << D.Lost[K] << "/+" << D.Gained[K];
+    OS << "\n";
+  }
+  passDeltas().erase(It);
 }
