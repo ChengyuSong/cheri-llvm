@@ -719,7 +719,9 @@ static const Value *stripPointerCastsAndOffsets(
         // special case.
         if (StripKind == PSK_ForAliasAnalysis &&
             (Call->getIntrinsicID() == Intrinsic::launder_invariant_group ||
-             Call->getIntrinsicID() == Intrinsic::strip_invariant_group)) {
+             Call->getIntrinsicID() == Intrinsic::strip_invariant_group ||
+             // [LLM-generated] M5r: llvm.mem.claim returns its argument.
+             Call->getIntrinsicID() == Intrinsic::mem_claim)) {
           V = Call->getArgOperand(0);
           continue;
         }

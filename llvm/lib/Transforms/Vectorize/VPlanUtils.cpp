@@ -165,6 +165,9 @@ const SCEV *vputils::getSCEVExprForVPValue(const VPValue *V,
   };
 
   VPValue *LHSVal, *RHSVal;
+  // [LLM-generated] M5r: llvm.mem.claim returns its pointer operand.
+  if (match(V, m_Intrinsic<Intrinsic::mem_claim>(m_VPValue(LHSVal))))
+    return getSCEVExprForVPValue(LHSVal, PSE, L);
   if (match(V, m_Add(m_VPValue(LHSVal), m_VPValue(RHSVal))))
     return CreateSCEV({LHSVal, RHSVal}, [&](ArrayRef<SCEVUse> Ops) {
       return SE.getAddExpr(Ops[0], Ops[1], SCEV::FlagAnyWrap, 0);

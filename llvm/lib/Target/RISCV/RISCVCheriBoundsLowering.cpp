@@ -18,7 +18,7 @@ struct RISCVCheriBoundsLowering : public ModulePass {
   static char ID;
   RISCVCheriBoundsLowering() : ModulePass(ID) {}
   StringRef getPassName() const override {
-    return "RISC-V CHERI bounds lowering (M5r R0 stub)";
+    return "RISC-V CHERI bounds lowering (M5r stub)";
   }
   bool runOnModule(Module &M) override {
     return memannot::runCheriBoundsLoweringStub(M);
@@ -28,7 +28,7 @@ struct RISCVCheriBoundsLowering : public ModulePass {
 
 char RISCVCheriBoundsLowering::ID = 0;
 INITIALIZE_PASS(RISCVCheriBoundsLowering, DEBUG_TYPE,
-                "RISC-V CHERI bounds lowering (M5r R0 stub)", false, false)
+                "RISC-V CHERI bounds lowering (M5r stub)", false, false)
 
 ModulePass *llvm::createRISCVCheriBoundsLoweringPass() {
   return new RISCVCheriBoundsLowering();

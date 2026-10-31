@@ -116,16 +116,19 @@ bool VPlanTransforms::tryToConvertVPInstructionsToVPRecipes(
               VectorID == Intrinsic::lifetime_start ||
               VectorID == Intrinsic::sideeffect ||
               VectorID == Intrinsic::pseudoprobe ||
-              VectorID == Intrinsic::mem_fact) { // [LLM-generated] M5r
+              VectorID == Intrinsic::mem_fact ||
+              VectorID == Intrinsic::mem_claim) { // [LLM-generated] M5r
             // If the operand of llvm.assume holds before vectorization, it will
             // also hold per lane.
             // llvm.pseudoprobe requires to be duplicated per lane for accurate
             // sample count.
-            // [LLM-generated] M5r: a mem.fact is per lane (one claim per
-            // element pointer), like pseudoprobe.
+            // [LLM-generated] M5r: a mem.fact / mem.claim is per lane (one
+            // per element pointer), like pseudoprobe. A widened consecutive
+            // access through a claim uses the lane-0 claim (D15).
             const bool IsSingleScalar = VectorID != Intrinsic::assume &&
                                         VectorID != Intrinsic::pseudoprobe &&
-                                        VectorID != Intrinsic::mem_fact;
+                                        VectorID != Intrinsic::mem_fact &&
+                                        VectorID != Intrinsic::mem_claim;
             NewRecipe = new VPReplicateRecipe(CI, Ingredient.operands(),
                                               /*IsSingleScalar=*/IsSingleScalar,
                                               /*Mask=*/nullptr, *VPI, *VPI,

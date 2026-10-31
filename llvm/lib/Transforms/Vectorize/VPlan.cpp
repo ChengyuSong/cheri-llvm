@@ -1955,6 +1955,7 @@ bool VPCostContext::isFreeScalarIntrinsic(Intrinsic::ID ID) {
   return is_contained({Intrinsic::assume, Intrinsic::lifetime_end,
                        Intrinsic::lifetime_start, Intrinsic::sideeffect,
                        Intrinsic::pseudoprobe, Intrinsic::mem_fact,
+                       Intrinsic::mem_claim,
                        Intrinsic::experimental_noalias_scope_decl},
                       ID);
 }

@@ -1,4 +1,4 @@
-; [LLM-generated] M5r R0: annotations survive the default O2/O3 pipelines
+; [LLM-generated] M5r R0/R1: annotations survive the default O2/O3 pipelines
 ; (census strict mode fails on any unexplained loss of a check/claim/free).
 ; RUN: opt -S -mem-annot-census -mem-annot-census-strict \
 ; RUN:   -passes='default<O2>,mem-annot-census-late' < %s 2>%t.o2 | FileCheck %s
@@ -41,8 +41,7 @@ loop:
   br i1 %c, label %loop, label %exit
 exit:
   %r = phi i32 [ 0, %entry ], [ %acc1, %loop ]
-  call void @llvm.mem.fact() [ "mem.free"(ptr %s, ptr %s) ]
-  call void @dealloc(ptr %s)
+  call void @dealloc(ptr %s) [ "mem.free"(ptr %s) ]
   ret i32 %r
 }
 
@@ -56,14 +55,15 @@ define i32 @const(ptr %s) {
 !0 = !{i64 1}
 
 ; CHECK-LABEL: define {{.*}}i32 @sum(
-; CHECK: call void @llvm.mem.fact() [ "mem.claim"(ptr %s, i64 64, i64 265) ]
-; CHECK: call void @panic_bounds_check({{.*}}) {{.*}}[ "mem.check"(ptr %s, i64 16, i64 4, i64 1, i64 0) ]
-; CHECK: call void @llvm.mem.fact() [ "mem.free"(ptr %s, ptr %s) ]
+; CHECK: [[C:%.*]] = {{.*}}call ptr @llvm.mem.claim.p0(ptr %s, i64 64, i64 265)
+; CHECK: load i32, ptr {{%.*}}
+; CHECK: call void @panic_bounds_check({{.*}}) {{.*}}[ "mem.check"(ptr [[C]], i64 16, i64 4, i64 1, i64 0) ]
+; CHECK: call void @dealloc(ptr %s) [ "mem.free"(ptr %s) ]
 ; CHECK-LABEL: define {{.*}}i32 @const(
 ; CHECK-NOT: mem.check
 ; CHECK: ret i32
 
-; CENSUS: mem-annot-census: {{.*}} start: check=1 guard=2 claim=0 alloc_inbounds=0 inbounds=0 free=1 invalidate=0
+; CENSUS: mem-annot-census: {{.*}} start: check=1 guard=2 claim=0 alloc_inbounds=0 inbounds=0 free=1 last_use=0 dropped=0
 ; CENSUS: mem-annot-census: {{.*}} late: check=1
 ; CENSUS: lost:
 ; CENSUS-NOT: unexplained loss

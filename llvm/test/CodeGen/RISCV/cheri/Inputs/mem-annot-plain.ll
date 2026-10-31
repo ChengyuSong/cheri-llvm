@@ -2,6 +2,7 @@ source_filename = "mem-annot"
 target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
 declare void @use(ptr addrspace(200))
+declare void @free(ptr addrspace(200))
 declare void @panic(i64) noreturn cold
 
 define i32 @f(ptr addrspace(200) %s, i64 %n) addrspace(200) {
@@ -24,6 +25,7 @@ ok:
 exit:
   %b = load i32, ptr addrspace(200) %buf, align 4
   %r = add i32 %acc1, %b
+  call void @free(ptr addrspace(200) %s)
   ret i32 %r
 fail:
   call void @panic(i64 %i)

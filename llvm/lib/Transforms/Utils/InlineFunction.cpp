@@ -1826,7 +1826,8 @@ static void AddAlignmentAssumptions(CallBase &CB, InlineFunctionInfo &IFI) {
 //   "mem.alloc_inbounds"                 -> llvm.mem.fact "mem.alloc_inbounds"(v)
 //   "mem.untrusted" + dereferenceable(N) -> v' = llvm.mem.claim(v, N, Param|Untrusted)
 //   "mem.claim"="N"                      -> v' = llvm.mem.claim(v, N, Param|Untrusted)
-// A parameter claim replaces the call argument (so the inlined body uses v');
+// A parameter claim replaces the argument in the inliner's value map (so the
+// inlined body uses v');
 // a return claim replaces the uses of the call value. Return facts are
 // attached to the call value and follow the inliner's RAUW.
 static void addMemFact(IRBuilderBase &B, StringRef Tag,
@@ -1867,7 +1868,7 @@ static Value *createMemClaim(IRBuilderBase &B, Value *V, uint64_t Bytes,
                             ConstantInt::get(I64, Kind | memannot::CF_Untrusted)});
 }
 
-static void AddMemFactsFromAttributes(CallBase &CB) {
+static void AddMemFactsFromAttributes(CallBase &CB, ValueToValueMapTy &VMap) {
   Function *Callee = CB.getCalledFunction();
   AttributeList CalleeAL = Callee->getAttributes(), CallAL = CB.getAttributes();
   IRBuilder<> B(&CB);
@@ -1885,8 +1886,12 @@ static void AddMemFactsFromAttributes(CallBase &CB) {
     Value *V = CB.getArgOperand(N);
     if (HasAI(A1, A2))
       addMemFact(B, memannot::TagAllocInbounds, {V});
-    if (uint64_t Bytes = claimBytes(A1, A2))
-      CB.setArgOperand(N, createMemClaim(B, V, Bytes, memannot::CK_Param));
+    if (uint64_t Bytes = claimBytes(A1, A2)) {
+      // The inlined body reads the argument through VMap.
+      auto It = VMap.find(&Arg);
+      if (It != VMap.end() && It->second == V)
+        It->second = createMemClaim(B, V, Bytes, memannot::CK_Param);
+    }
   }
   if (!CB.getType()->isPointerTy())
     return;
@@ -2963,7 +2968,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // instructions are actually cloned into the caller so that we can easily
     // check what will be known at the start of the inlined code.
     AddAlignmentAssumptions(CB, IFI);
-    AddMemFactsFromAttributes(CB); // [LLM-generated] M5r
+    AddMemFactsFromAttributes(CB, VMap); // [LLM-generated] M5r
 
     AssumptionCache *AC =
         IFI.GetAssumptionCache ? &IFI.GetAssumptionCache(*Caller) : nullptr;

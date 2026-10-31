@@ -2497,6 +2497,7 @@ public:
     case Intrinsic::sideeffect:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r
+    case Intrinsic::mem_claim:
     case Intrinsic::arithmetic_fence:
       return 0;
     case Intrinsic::masked_store: {
