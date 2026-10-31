@@ -754,14 +754,65 @@ struct Lowering {
   }
 
   // R3 (D20): claims of constant size on one base (constant offsets) in the
-  // same block, with the same flags, whose byte ranges form one contiguous
-  // extent (e.g. a fully unrolled store loop) share one narrow of that
-  // extent. Each claim becomes an offset into it, so every claimed range is
-  // still inside a capability no wider than the union of ranges the code
-  // itself claims (no gap memory is ever included).
+  // same block with the same flags share narrows:
+  //  * claims whose result is only used as the address of loads/stores that
+  //    fit in the claimed bytes ("access-only", e.g. a fully unrolled store
+  //    loop) and whose ranges form one contiguous extent share one narrow of
+  //    the union: such an access is in bounds of either capability, so the
+  //    wider bounds are not observable (no capability escapes);
+  //  * any other claims share a narrow only with identical (offset, bytes)
+  //    claims, so a capability that escapes keeps exactly its claimed bounds
+  //    (tests/ui/cheri/qemu/export-entry-bounds.rs: a 32 B and a 64 B claim on
+  //    one base must not both become 64 B).
+  bool accessOnly(CallBase *C, uint64_t Bytes) {
+    for (User *U : C->users()) {
+      Type *Ty = nullptr;
+      if (auto *LI = dyn_cast<LoadInst>(U))
+        Ty = LI->getType();
+      else if (auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand() == C)
+          return false;
+        Ty = SI->getValueOperand()->getType();
+      } else
+        return false;
+      if (!Ty->isSized() || DL.getTypeStoreSize(Ty).isScalable() ||
+          DL.getTypeStoreSize(Ty).getFixedValue() > Bytes)
+        return false;
+    }
+    return true;
+  }
+
+  struct CItem { CallBase *C; int64_t Off; uint64_t Bytes; };
+
+  // One narrow of [Lo, Hi) of Base before the first of Items; each claim
+  // becomes an offset into it.
+  void shareNarrow(Value *Base, ArrayRef<CItem> Items, int64_t Lo, int64_t Hi,
+                   SmallPtrSetImpl<CallBase *> &DoneC) {
+    CallBase *First = Items.front().C;
+    for (const CItem &It : Items)
+      if (It.C->comesBefore(First))
+        First = It.C;
+    if (auto *BI = dyn_cast<Instruction>(Base))
+      if (BI->getParent() == First->getParent() && !BI->comesBefore(First))
+        return;
+    Builder &B = mk(First);
+    Value *Start = Lo ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Lo)) : Base;
+    Value *N = narrow(B, Start, B.getInt64(Hi - Lo), false);
+    for (const CItem &It : Items) {
+      Builder &CB = mk(It.C);
+      Value *P = It.Off == Lo ? N
+                              : CB.CreateGEP(CB.getInt8Ty(), N,
+                                             CB.getInt64(It.Off - Lo));
+      It.C->setArgOperand(0, P);
+      DoneC.insert(It.C);
+      ++S.ClaimNarrowed;
+      ++S.ClaimCoalesced;
+    }
+    ++S.CoalesceGroups;
+  }
+
   void coalesceClaims(ArrayRef<CallBase *> Cs, SmallPtrSetImpl<CallBase *> &DoneC) {
-    struct Item { CallBase *C; int64_t Off; uint64_t Bytes; };
-    MapVector<std::tuple<BasicBlock *, Value *, uint64_t>, SmallVector<Item, 4>> G;
+    MapVector<std::tuple<BasicBlock *, Value *, uint64_t>, SmallVector<CItem, 4>> G;
     for (CallBase *C : Cs) {
       auto *BC = dyn_cast<ConstantInt>(C->getArgOperand(1));
       auto *FC = dyn_cast<ConstantInt>(C->getArgOperand(2));
@@ -778,42 +829,39 @@ struct Lowering {
       if (Items.size() < 2)
         continue;
       Value *Base = std::get<1>(Key);
-      SmallVector<Item, 4> Sorted(Items);
-      llvm::sort(Sorted, [](const Item &A, const Item &B) { return A.Off < B.Off; });
-      int64_t Lo = Sorted.front().Off, Hi = Lo;
-      bool Contig = true;
-      for (const Item &It : Sorted) {
-        if (It.Off > Hi) {
-          Contig = false;
-          break;
+      SmallVector<CItem, 4> Acc;
+      MapVector<std::pair<int64_t, uint64_t>, SmallVector<CItem, 2>> Same;
+      for (const CItem &It : Items) {
+        if (accessOnly(It.C, It.Bytes))
+          Acc.push_back(It);
+        else
+          Same[{It.Off, It.Bytes}].push_back(It);
+      }
+      if (Acc.size() >= 2) {
+        SmallVector<CItem, 4> Sorted(Acc);
+        llvm::sort(Sorted,
+                   [](const CItem &A, const CItem &B) { return A.Off < B.Off; });
+        int64_t Lo = Sorted.front().Off, Hi = Lo;
+        bool Contig = true;
+        for (const CItem &It : Sorted) {
+          if (It.Off > Hi) {
+            Contig = false;
+            break;
+          }
+          Hi = std::max<int64_t>(Hi, It.Off + (int64_t)It.Bytes);
         }
-        Hi = std::max<int64_t>(Hi, It.Off + (int64_t)It.Bytes);
+        if (Contig && Hi - Lo <= (1 << 20))
+          shareNarrow(Base, Acc, Lo, Hi, DoneC);
+        else
+          for (const CItem &It : Acc)
+            Same[{It.Off, It.Bytes}].push_back(It);
+      } else {
+        for (const CItem &It : Acc)
+          Same[{It.Off, It.Bytes}].push_back(It);
       }
-      if (!Contig || Hi - Lo > (1 << 20))
-        continue;
-      // Insert before the first claim of the group in program order; Base
-      // dominates it (it is the claims' common underlying pointer).
-      CallBase *First = Items.front().C;
-      for (const Item &It : Items)
-        if (It.C->comesBefore(First))
-          First = It.C;
-      if (auto *BI = dyn_cast<Instruction>(Base))
-        if (BI->getParent() == First->getParent() && !BI->comesBefore(First))
-          continue;
-      Builder &B = mk(First);
-      Value *Start = Lo ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Lo)) : Base;
-      Value *N = narrow(B, Start, B.getInt64(Hi - Lo), false);
-      for (const Item &It : Items) {
-        Builder &CB = mk(It.C);
-        Value *P = It.Off == Lo ? N
-                                : CB.CreateGEP(CB.getInt8Ty(), N,
-                                               CB.getInt64(It.Off - Lo));
-        It.C->setArgOperand(0, P);
-        DoneC.insert(It.C);
-        ++S.ClaimNarrowed;
-        ++S.ClaimCoalesced;
-      }
-      ++S.CoalesceGroups;
+      for (auto &[R, Its] : Same)
+        if (Its.size() >= 2)
+          shareNarrow(Base, Its, R.first, R.first + (int64_t)R.second, DoneC);
     }
   }
 

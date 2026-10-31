@@ -186,6 +186,38 @@ define void @coalesce(ptr addrspace(200) %p) {
   ret void
 }
 
+; Escaping claims keep their own bounds: the 32 B and 64 B claims stay
+; separate; the two identical 32 B claims share one narrow.
+declare void @use(ptr addrspace(200), ptr addrspace(200), ptr addrspace(200))
+define void @coalesce_escape(ptr addrspace(200) %p) {
+; ELIDE-LABEL: define void @coalesce_escape(
+; ELIDE-SAME: ptr addrspace(200) [[P:%.*]]) addrspace(200) {
+; ELIDE-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 32)
+; ELIDE-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 64)
+; ELIDE-NEXT:    call addrspace(200) void @use(ptr addrspace(200) [[TMP1]], ptr addrspace(200) [[TMP2]], ptr addrspace(200) [[TMP1]])
+; ELIDE-NEXT:    ret void
+;
+; NARROW-LABEL: define void @coalesce_escape(
+; NARROW-SAME: ptr addrspace(200) [[P:%.*]]) addrspace(200) {
+; NARROW-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 32)
+; NARROW-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 64)
+; NARROW-NEXT:    call addrspace(200) void @use(ptr addrspace(200) [[TMP1]], ptr addrspace(200) [[TMP2]], ptr addrspace(200) [[TMP1]])
+; NARROW-NEXT:    ret void
+;
+; LEGACY-LABEL: define void @coalesce_escape(
+; LEGACY-SAME: ptr addrspace(200) [[P:%.*]]) addrspace(200) {
+; LEGACY-NEXT:    [[TMP1:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 32)
+; LEGACY-NEXT:    [[TMP2:%.*]] = call addrspace(200) ptr addrspace(200) @llvm.cheri.cap.bounds.set.i64(ptr addrspace(200) [[P]], i64 64)
+; LEGACY-NEXT:    call addrspace(200) void @use(ptr addrspace(200) [[TMP1]], ptr addrspace(200) [[TMP2]], ptr addrspace(200) [[TMP1]])
+; LEGACY-NEXT:    ret void
+;
+  %c1 = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %p, i64 32, i64 256)
+  %c2 = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %p, i64 64, i64 256)
+  %c3 = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %p, i64 32, i64 256)
+  call void @use(ptr addrspace(200) %c1, ptr addrspace(200) %c2, ptr addrspace(200) %c3)
+  ret void
+}
+
 ; Parent-first: a subrange marker (7 operands) narrows the parent first.
 define i32 @subrange(ptr addrspace(200) %pa, i64 %pn, i64 %lo, i64 %n, i64 %i) {
 ; ELIDE-LABEL: define i32 @subrange(
@@ -276,4 +308,4 @@ fail:
 !0 = !{i64 1}
 !4 = !{i64 4}
 
-; STATS: uncovered=1 relinked=1 relink_markers=2 parent_first=1 claims=2 claim_narrowed=2 claim_verified=0 claim_proof=0 claim_coalesced=2 coalesce_groups=1
+; STATS: uncovered=1 relinked=1 relink_markers=2 parent_first=1 claims=5 claim_narrowed=5 claim_verified=0 claim_proof=0 claim_coalesced=4 coalesce_groups=2
