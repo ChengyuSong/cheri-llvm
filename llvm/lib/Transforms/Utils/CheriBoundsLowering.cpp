@@ -235,16 +235,32 @@ struct Lowering {
   Value *narrow(Builder &B, Value *Base, Value *Bytes, bool Exact) {
     // Rule 1: the base is already narrowed to exactly these bytes (e.g. a
     // manual bounds_set_exact): no second narrow.
+    // A claim only narrows further. R3: a claim this pass narrowed is also
+    // looked through to its original operand, so a check narrow after a claim
+    // narrow (claims run first) still sees a manual narrow under the claim
+    // (R2 parity for k5_sub_index ub; claim lengths are not structurally
+    // equal to check lengths, D24).
+    auto Already = [&](Value *Inner) {
+      auto *II = dyn_cast<IntrinsicInst>(Inner);
+      return II &&
+             (II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact ||
+              (!Exact && II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set)) &&
+             sameBytes(II->getArgOperand(1), Bytes);
+    };
     Value *Inner = Base->stripPointerCasts();
-    while (memannot::isMemClaim(Inner)) // a claim only narrows further
-      Inner = cast<CallBase>(Inner)->getArgOperand(0)->stripPointerCasts();
-    if (auto *II = dyn_cast<IntrinsicInst>(Inner))
-      if ((II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact ||
-           (!Exact && II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set)) &&
-          sameBytes(II->getArgOperand(1), Bytes)) {
+    while (memannot::isMemClaim(Inner)) {
+      auto *CB = cast<CallBase>(Inner);
+      auto It = ClaimOrig.find(CB);
+      if (It != ClaimOrig.end() && Already(It->second->stripPointerCasts())) {
         ++S.AlreadyNarrow;
         return Base;
       }
+      Inner = CB->getArgOperand(0)->stripPointerCasts();
+    }
+    if (Already(Inner)) {
+      ++S.AlreadyNarrow;
+      return Base;
+    }
     Function *F = Intrinsic::getOrInsertDeclaration(
         &M,
         Exact ? Intrinsic::cheri_cap_bounds_set_exact
@@ -258,6 +274,7 @@ struct Lowering {
     return N;
   }
   const char *NarrowTag = nullptr;
+  DenseMap<CallBase *, Value *> ClaimOrig; // claim -> operand before narrowing
   // Entry claims (Param) are M3.0's entry narrows; every other claim kind is
   // a conversion (M3.3 contract) narrow.
   static const char *claimTag(CallBase *C) {
@@ -761,6 +778,8 @@ struct Lowering {
         Bytes = B.CreateZExtOrTrunc(Bytes, B.getInt64Ty());
       NarrowTag = claimTag(C);
       Value *N = narrow(B, P, Bytes, false);
+      if (N != P)
+        ClaimOrig[C] = P;
       // The claim stays (its operand becomes the narrow) so the census and
       // stripAnnotations treat it as before; strip replaces it with N.
       C->setArgOperand(0, N);
@@ -819,6 +838,7 @@ struct Lowering {
       Value *P = It.Off == Lo ? N
                               : CB.CreateGEP(CB.getInt8Ty(), N,
                                              CB.getInt64(It.Off - Lo));
+      ClaimOrig[It.C] = It.C->getArgOperand(0);
       It.C->setArgOperand(0, P);
       DoneC.insert(It.C);
       ++S.ClaimNarrowed;
@@ -945,6 +965,7 @@ struct Lowering {
       if (F.isDeclaration())
         continue;
       Facts.clear();
+      ClaimOrig.clear();
       collectFacts(F);
       // R3: claims first, so a check narrow of a claimed value to the same
       // bytes sees the claim's narrow and is not repeated (k5_sub_index).
