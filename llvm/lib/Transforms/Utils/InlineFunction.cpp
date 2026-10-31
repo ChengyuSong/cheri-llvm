@@ -1836,12 +1836,22 @@ static void addMemFact(IRBuilderBase &B, StringRef Tag,
   B.CreateCall(Fact, {}, {OB});
 }
 
+// [LLM-generated] M5r: the legacy M2 "mem.alloc_inbounds" argument/return
+// attribute (emitted by local/m5 rustc on most Rust-ABI pointer params and
+// consumed by CheriSkipNarrow before inlining) is only turned into a fact on
+// request, so R0 codegen for existing rustc output is unchanged. The M5r
+// attributes ("mem.claim"="N", "mem.untrusted") always are.
+static cl::opt<bool> MemAnnotInlineLegacyAllocInbounds(
+    "mem-annot-inline-legacy-alloc-inbounds", cl::init(false), cl::Hidden,
+    cl::desc("M5r: when inlining, turn the legacy mem.alloc_inbounds "
+             "argument/return attribute into a mem.alloc_inbounds fact"));
+
 static void addMemFactsFor(IRBuilderBase &B, Value *V, const AttributeSet &A1,
                            const AttributeSet &A2, uint64_t Kind) {
   auto Has = [&](StringRef K) {
     return A1.hasAttribute(K) || A2.hasAttribute(K);
   };
-  if (Has("mem.alloc_inbounds"))
+  if (MemAnnotInlineLegacyAllocInbounds && Has("mem.alloc_inbounds"))
     addMemFact(B, memannot::TagAllocInbounds, {V});
   uint64_t Bytes = 0;
   for (const AttributeSet &A : {A1, A2}) {
@@ -1861,16 +1871,7 @@ static void addMemFactsFor(IRBuilderBase &B, Value *V, const AttributeSet &A1,
   }
 }
 
-// [LLM-generated] M5r: convert mem.* parameter/return attributes of the
-// inlined callee into llvm.mem.fact calls (they would be lost otherwise).
-static cl::opt<bool> MemAnnotInlineAttrFacts(
-    "mem-annot-inline-attr-facts", cl::init(true), cl::Hidden,
-    cl::desc("M5r: turn mem.* argument/return attributes into llvm.mem.fact "
-             "calls when inlining"));
-
 static void AddMemFactsFromAttributes(CallBase &CB) {
-  if (!MemAnnotInlineAttrFacts)
-    return;
   Function *Callee = CB.getCalledFunction();
   AttributeList CalleeAL = Callee->getAttributes(), CallAL = CB.getAttributes();
   IRBuilder<> B(&CB);
@@ -1884,8 +1885,10 @@ static void AddMemFactsFromAttributes(CallBase &CB) {
   if (!CB.getType()->isPointerTy())
     return;
   AttributeSet R1 = CalleeAL.getRetAttrs(), R2 = CallAL.getRetAttrs();
-  if (!R1.hasAttribute("mem.alloc_inbounds") &&
-      !R2.hasAttribute("mem.alloc_inbounds") && !R1.hasAttribute("mem.claim") &&
+  bool AI = MemAnnotInlineLegacyAllocInbounds;
+  if (!(AI && R1.hasAttribute("mem.alloc_inbounds")) &&
+      !(AI && R2.hasAttribute("mem.alloc_inbounds")) &&
+      !R1.hasAttribute("mem.claim") &&
       !R2.hasAttribute("mem.claim") && !R1.hasAttribute("mem.untrusted") &&
       !R2.hasAttribute("mem.untrusted"))
     return;
