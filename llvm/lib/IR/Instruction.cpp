@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/MemAnnot.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -123,6 +124,10 @@ static cl::opt<bool> MemLastUseTransfer(
     "mem-last-use-transfer", cl::init(true), cl::Hidden,
     cl::desc("M5r R4 (D28): move !mem.last_use from an erased carrier to the "
              "previous carrier on its path"));
+static cl::opt<bool> MemLastUseTransferStrict(
+    "mem-last-use-transfer-strict", cl::init(true), cl::Hidden,
+    cl::desc("M5r R5 (D39): straight-line last_use transfers only (no move "
+             "into a branching predecessor), join predecessors, then forward"));
 
 bool llvm::memannot::isLastUseCarrier(const Instruction &I) {
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
@@ -175,23 +180,98 @@ static void transferLastUse(Instruction &I) {
   for (Instruction &O : *BB)
     if (&O != &I && O.getMetadata(memannot::LastUseMD) == LU)
       return;
+  // R5 (D39): only straight-line moves. Backward, a predecessor must branch
+  // only to this block: the other successors of a branching predecessor may
+  // still use the loan, so clearing there would be too early. All the
+  // predecessors of a join (each ending in a carrier and branching only here)
+  // take the ids. Otherwise forward: the next carrier on the unique path (a
+  // later end is never too early; the window grows by no memory access).
+  if (!MemLastUseTransferStrict) {
+    Instruction *Start = &I;
+    for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+      for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
+        if (&*It != Start && &*It != &I && memannot::isLastUseCarrier(*It)) {
+          memannot::mergeLastUse(*It, LU);
+          return;
+        }
+      BB = BB->getSinglePredecessor();
+      if (!BB)
+        return;
+      Start = BB->getTerminator();
+      if (!Start)
+        return;
+      if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
+        memannot::mergeLastUse(*Start, LU);
+        return;
+      }
+    }
+    return;
+  }
+  auto LastCarrierIn = [&](BasicBlock *B, Instruction *From) -> Instruction * {
+    auto It = From ? From->getReverseIterator() : B->rbegin();
+    for (auto E = B->rend(); It != E; ++It)
+      if (&*It != &I && &*It != From && memannot::isLastUseCarrier(*It))
+        return &*It;
+    return nullptr;
+  };
   Instruction *Start = &I;
   for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
-    for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
-      if (&*It != Start && &*It != &I && memannot::isLastUseCarrier(*It)) {
+    if (Instruction *C = LastCarrierIn(BB, Start)) {
+      memannot::mergeLastUse(*C, LU);
+      return;
+    }
+    SmallVector<BasicBlock *, 4> Preds(predecessors(BB));
+    if (Preds.empty())
+      break;
+    bool Straight = true;
+    for (BasicBlock *P : Preds)
+      Straight &= P != BB && P->getTerminator() &&
+                  P->getTerminator()->getNumSuccessors() == 1;
+    if (!Straight)
+      break;
+    if (Preds.size() == 1) {
+      BB = Preds[0];
+      Start = nullptr;
+      if (Instruction *T = BB->getTerminator();
+          T && T != &I && memannot::isLastUseCarrier(*T)) { // invoke
+        memannot::mergeLastUse(*T, LU);
+        return;
+      }
+      continue;
+    }
+    // A join: every predecessor must end in a carrier of its own.
+    SmallVector<Instruction *, 4> Cs;
+    for (BasicBlock *P : Preds) {
+      Instruction *C = LastCarrierIn(P, nullptr);
+      if (!C)
+        break;
+      Cs.push_back(C);
+    }
+    if (Cs.size() != Preds.size())
+      break;
+    for (Instruction *C : Cs)
+      memannot::mergeLastUse(*C, LU);
+    return;
+  }
+  // Forward: the next carrier on the unique path from I.
+  BB = I.getParent();
+  Instruction *From = &I;
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    for (auto It = From ? std::next(From->getIterator()) : BB->begin(),
+              E = BB->end();
+         It != E; ++It)
+      if (&*It != &I && memannot::isLastUseCarrier(*It)) {
         memannot::mergeLastUse(*It, LU);
         return;
       }
-    BB = BB->getSinglePredecessor();
-    if (!BB)
+    Instruction *T = BB->getTerminator();
+    if (!T || T->getNumSuccessors() != 1)
       return;
-    Start = BB->getTerminator();
-    if (!Start)
+    BasicBlock *S = T->getSuccessor(0);
+    if (S == BB || S->getUniquePredecessor() != BB)
       return;
-    if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
-      memannot::mergeLastUse(*Start, LU);
-      return;
-    }
+    BB = S;
+    From = nullptr;
   }
 }
 
