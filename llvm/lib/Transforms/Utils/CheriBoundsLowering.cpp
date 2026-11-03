@@ -137,7 +137,8 @@ static void runNarrowTagCheck(Module &M) {
           for (const DILocation *D = DL; D; D = D->getInlinedAt()) {
             StringRef FN = D->getFilename();
             if (!FN.contains("library/core/") && !FN.contains("library/alloc/") &&
-                !FN.contains("library/std/")) {
+                !FN.contains("library/std/") && !FN.contains("library/stdarch/") &&
+                !FN.contains("library/portable-simd/")) {
               DL = D;
               break;
             }
