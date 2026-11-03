@@ -88,6 +88,11 @@ static cl::opt<bool> BorrowDeref(
     cl::desc("R4: a borrow check whose borrow is only dereferenced in the Ok "
              "block, with no side effect before the access, is treated as an "
              "access check (Vec/SmallVec Index borrows after inlining)"));
+static cl::opt<bool> RecoverConst(
+    "cheri-bounds-recover-const", cl::init(true), cl::Hidden,
+    cl::desc("R5 (D30): a split marker whose index is a constant on its edge "
+             "recovers the constant-offset accesses of its base in its Ok "
+             "block as guards (fully unrolled loops)"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -102,6 +107,7 @@ struct Stats {
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
   unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0, BorrowDeref = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
+  unsigned Recovered = 0, RecoveredMarkers = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
 };
@@ -331,6 +337,8 @@ struct Lowering {
     BasicBlock *Ok = nullptr;
     Value *ParentBase = nullptr, *ParentLen = nullptr; // range markers (R3)
     Value *Index = nullptr; // the checked index, from Pred's compare (R3)
+    ConstantInt *ConstIdx = nullptr; // R5 (D30): constant index on this edge
+    SmallVector<GetElementPtrInst *, 2> Recov; // R5 (D30): its recovered guards
     SmallVector<GetElementPtrInst *, 2> Group; // re-linked shared guards
   };
 
@@ -434,6 +442,8 @@ struct Lowering {
                const SmallPtrSetImpl<GetElementPtrInst *> &Narrowed) {
     if (!CoverageCheck)
       return true;
+    if (!Mk.Index && Mk.ConstIdx)
+      return coveredConst(Mk, DT, Narrowed);
     if (!Mk.Index)
       return false;
     BasicBlockEdge E(Mk.Pred, Mk.Ok);
@@ -467,6 +477,162 @@ struct Lowering {
     }
     return true;
   }
+
+  // R5 (D30): coverage for a constant-index marker. Every access in the
+  // region its success edge dominates whose address is the marker's base
+  // plus anything must go through a guard (its own, a recovered one of a
+  // sibling marker, or a !mem.guard GEP); a call taking a pointer derived
+  // from the base is not covered.
+  bool coveredConst(const Marker &Mk, DominatorTree &DT,
+                    const SmallPtrSetImpl<GetElementPtrInst *> &Narrowed) {
+    BasicBlockEdge E(Mk.Pred, Mk.Ok);
+    auto FromBase = [&](Value *P) {
+      return getUnderlyingObject(P, 8) == getUnderlyingObject(Mk.Base, 8);
+    };
+    // A guard GEP, or an address computed from a capability this pass (or
+    // an earlier one) already narrowed: the hardware checks it.
+    auto IsGuard = [&](Value *P) {
+      for (unsigned D = 0; D < 6; ++D) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(P)) {
+          if (G->getMetadata(memannot::GuardMD) || Narrowed.count(G) ||
+              RecoveredG.count(G))
+            return true;
+          P = G->getPointerOperand();
+        } else if (auto *CI = dyn_cast<CallBase>(P)) {
+          return CI->doesNotAccessMemory() && P != Mk.Base;
+        } else if (auto *PN = dyn_cast<PHINode>(P)) {
+          return PN->getName().starts_with("cheri.cap");
+        } else
+          return false;
+      }
+      return false;
+    };
+    for (BasicBlock &BB : *Mk.Pred->getParent()) {
+      if (!DT.dominates(E, &BB))
+        continue;
+      for (Instruction &I : BB) {
+        if (Value *Ptr = getLoadStorePointerOperand(&I)) {
+          if (FromBase(Ptr) && !IsGuard(Ptr))
+            return false;
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB == Mk.Panic || memannot::isMemFact(CB) || isa<DbgInfoIntrinsic>(CB) ||
+              CB->doesNotAccessMemory())
+            continue;
+          for (Value *A : CB->args())
+            if (A->getType()->isPointerTy() && FromBase(A))
+              return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // R5 (D30): the Ok edge of Mk's compare excludes the constant K as an
+  // out-of-range index: `Len != K` (an unrolled `icmp eq` loop exit; the
+  // earlier unrolled checks give Len >= K) or `K <u Len`.
+  static bool edgeExcludes(const Marker &Mk, ConstantInt *K) {
+    using namespace PatternMatch;
+    auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
+    CmpPredicate P;
+    Value *A, *B;
+    if (!match(Br->getCondition(), m_ICmp(P, m_Value(A), m_Value(B))))
+      return false;
+    ICmpInst::Predicate Pr = P;
+    if (Br->getSuccessor(0) != Mk.Ok)
+      Pr = ICmpInst::getInversePredicate(Pr);
+    auto IsK = [&](Value *V) {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && C->getValue() == K->getValue();
+    };
+    if (Pr == ICmpInst::ICMP_NE)
+      return (A == Mk.Len && IsK(B)) || (B == Mk.Len && IsK(A));
+    if (Pr == ICmpInst::ICMP_ULT)
+      return IsK(A) && B == Mk.Len;
+    if (Pr == ICmpInst::ICMP_UGT)
+      return A == Mk.Len && IsK(B);
+    return false;
+  }
+
+  // R5 (D30): base-wide guard recovery for fully unrolled loops. After full
+  // unrolling the per-iteration accesses are constant-offset GEPs of the
+  // base (or the base itself) and carry no !mem.guard, and the exit tests
+  // are `icmp eq Len, K`. A split marker whose panic index is the constant K
+  // on its edge, and whose edge excludes K, adopts the accesses of its Ok
+  // block at exactly base + K * esz (access size <= esz) as its guards. A
+  // narrow of (base, Len * esz) then traps exactly where the compare would
+  // have panicked.
+  void recoverConst(SmallVectorImpl<Marker> &Ms,
+                    DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards) {
+    if (!RecoverConst)
+      return;
+    for (Marker &Mk : Ms) {
+      if (!Mk.Pred || Mk.Index || !Mk.Group.empty() ||
+          (Mk.Kind & memannot::CHKF_KindMask) != memannot::CHK_Index ||
+          Mk.Esz == 0 || Mk.Panic->arg_size() < 2)
+        continue;
+      bool Has = false;
+      for (GetElementPtrInst *G : Guards.lookup(Mk.Site))
+        Has |= G->getPointerOperand() == Mk.Base && !RecoveredG.count(G);
+      if (Has)
+        continue;
+      Value *IdxV = Mk.Panic->getArgOperand(0);
+      if (auto *PN = dyn_cast<PHINode>(IdxV))
+        if (PN->getParent() == Mk.Panic->getParent())
+          IdxV = PN->getIncomingValueForBlock(Mk.Pred);
+      auto *K = dyn_cast<ConstantInt>(IdxV);
+      if (!K || K->getValue().getActiveBits() > 32 || !edgeExcludes(Mk, K))
+        continue;
+      if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+        if (LI->getParent() == Mk.Ok)
+          continue;
+      int64_t Want = (int64_t)(K->getZExtValue() * Mk.Esz);
+      SmallVector<Instruction *, 2> Acc;
+      for (Instruction &I : *Mk.Ok) {
+        Value *P = getLoadStorePointerOperand(&I);
+        if (!P)
+          continue;
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+          if (SI->getValueOperand() == Mk.Base)
+            continue;
+        int64_t C = 0;
+        if (P != Mk.Base) {
+          auto *G = dyn_cast<GetElementPtrInst>(P);
+          if (!G || G->getPointerOperand() != Mk.Base)
+            continue;
+          APInt Off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+          if (!G->accumulateConstantOffset(DL, Off))
+            continue;
+          C = Off.getSExtValue();
+        }
+        Type *T = isa<LoadInst>(&I) ? I.getType()
+                                    : cast<StoreInst>(&I)->getValueOperand()->getType();
+        if (C != Want || DL.getTypeStoreSize(T).getKnownMinValue() > Mk.Esz)
+          continue;
+        Acc.push_back(&I);
+      }
+      if (Acc.empty())
+        continue;
+      for (Instruction *I : Acc) {
+        unsigned PI = isa<LoadInst>(I) ? 0 : 1;
+        Value *P = I->getOperand(PI);
+        auto *G = dyn_cast<GetElementPtrInst>(P);
+        if (!G || G->getParent() != Mk.Ok || !G->hasOneUse()) {
+          // A private guard GEP for this access (the original may be
+          // shared, or the access may use the base directly).
+          IRBuilder<> IB(I);
+          G = cast<GetElementPtrInst>(IB.CreateGEP(
+              IB.getInt8Ty(), Mk.Base, IB.getInt64(Want), "cheri.recovered"));
+          I->setOperand(PI, G);
+        }
+        Mk.Recov.push_back(G);
+        RecoveredG.insert(G);
+        ++S.Recovered;
+      }
+      Mk.ConstIdx = K;
+      ++S.RecoveredMarkers;
+    }
+  }
+  SmallPtrSet<GetElementPtrInst *, 16> RecoveredG;
 
   // R3 (D19): a marker whose guard GEP was merged with another site's (e.g.
   // SimplifyCFG sinking two `store out[i]` into a common block drops both
@@ -664,6 +830,8 @@ struct Lowering {
       for (GetElementPtrInst *G : Mk.Group)
         Narrowable.insert(G);
     adopt(Markers, DT, Guards);
+    RecoveredG.clear();
+    recoverConst(Markers, Guards);
     SmallPtrSet<GetElementPtrInst *, 8> Done;
     SmallVector<BasicBlock *, 4> DeadPanics;
     for (Marker &Mk : Markers) {
@@ -672,7 +840,15 @@ struct Lowering {
       bool RawSite = CK == memannot::CHK_RawChecked;
       // Guards of this marker: same site, same base.
       SmallVector<GetElementPtrInst *, 2> Mine, OnEdge;
+      // R5 (D30): a constant-index marker owns exactly its recovered guards.
+      for (GetElementPtrInst *G : Mk.Recov)
+        if (!Done.count(G)) {
+          Mine.push_back(G);
+          OnEdge.push_back(G);
+        }
       for (GetElementPtrInst *G : Guards.lookup(Mk.Site)) {
+        if (Mk.ConstIdx)
+          break;
         if (Done.count(G) || G->getPointerOperand() != Mk.Base)
           continue;
         if (auto *LI = dyn_cast<Instruction>(Mk.Len))
@@ -1200,7 +1376,9 @@ struct Lowering {
            << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
            << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked
            << " relink_markers=" << S.RelinkGuards
-           << " parent_first=" << S.ParentFirst << " claims=" << S.Claims
+           << " parent_first=" << S.ParentFirst
+           << " recovered=" << S.Recovered
+           << " recovered_markers=" << S.RecoveredMarkers << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof

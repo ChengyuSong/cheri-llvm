@@ -430,7 +430,7 @@ fail:
 !4 = !{i64 4}
 !5 = !{i64 5}
 
-; STATS: already=1 uncovered=1 relinked=1 relink_markers=2 parent_first=1 claims=6 claim_narrowed=5 claim_verified=0 claim_proof=1 claim_coalesced=4 coalesce_groups=2
+; STATS: already=1 uncovered=1 relinked=1 relink_markers=2 parent_first=1 {{.*}}claims=6 claim_narrowed=5 claim_verified=0 claim_proof=1 claim_coalesced=4 coalesce_groups=2
 ;.
 ; ELIDE: [[META0]] = !{}
 ;.
