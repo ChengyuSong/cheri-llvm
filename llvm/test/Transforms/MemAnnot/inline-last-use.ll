@@ -3,6 +3,7 @@
 ; ids onto the last memory access or call of each return path of the inlined
 ; body; a path without one loses them (fail-safe).
 ; RUN: opt -S -passes=always-inline < %s | FileCheck %s
+; R5 (D35): the callee's own loan 3 is re-keyed per inlined copy (low 42 bits kept).
 
 declare void @g()
 
@@ -52,7 +53,7 @@ define i32 @caller(ptr %p, i1 %b) {
 !1 = !{i64 3}
 !2 = !{i64 8}
 ;.
-; CHECK: [[META0]] = !{i64 3, i64 7}
+; CHECK: [[META0]] = !{i64 {{[0-9]+}}, i64 7}
 ; CHECK: [[META1]] = !{i64 7}
 ; CHECK: [[META2]] = !{i64 8}
 ;.

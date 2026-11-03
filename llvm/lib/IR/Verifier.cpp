@@ -5764,6 +5764,15 @@ void Verifier::visitInstruction(Instruction &I) {
       OK &= mdconst::dyn_extract_or_null<ConstantInt>(Op) != nullptr;
     Check(OK, "!mem.last_use must be a non-empty list of i64 loan ids", &I);
   }
+  // [LLM-generated] M5r R5 (D35): !mem.loan !{i64 loan, ...} on the store of
+  // a reference into memory.
+  if (MDNode *LN = I.getMetadata(memannot::LoanMD)) {
+    Check(isa<StoreInst>(I), "!mem.loan only on store instructions", &I);
+    bool OK = LN->getNumOperands() > 0;
+    for (const MDOperand &Op : LN->operands())
+      OK &= mdconst::dyn_extract_or_null<ConstantInt>(Op) != nullptr;
+    Check(OK, "!mem.loan must be a non-empty list of i64 loan ids", &I);
+  }
 
   if (!isa<PHINode>(I)) {   // Check that non-phi nodes are not self referential
     for (User *U : I.users()) {

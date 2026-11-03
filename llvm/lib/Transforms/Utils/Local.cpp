@@ -2967,7 +2967,8 @@ static void combineMetadata(Instruction *K, const Instruction *J,
         // when both instructions carry the identical node (fail-safe drop).
         LLVMContext &Ctx = K->getContext();
         if ((Kind == Ctx.getMDKindID("mem.last_use") ||
-             Kind == Ctx.getMDKindID("mem.guard")) &&
+             Kind == Ctx.getMDKindID("mem.guard") ||
+             Kind == Ctx.getMDKindID("mem.loan")) &&
             KMD == JMD)
           break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata

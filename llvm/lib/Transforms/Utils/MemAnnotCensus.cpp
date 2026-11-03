@@ -139,6 +139,16 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
 // late census can say why a loan id vanished: its carrier accessed a stack
 // slot that was promoted to SSA (nothing left in memory to invalidate), the
 // carrier was deleted for another reason, or the metadata was dropped.
+// R5: loan ids are counted by their original id (the LLVM inliner re-keys a
+// cloned body's ids in the high bits, D35).
+static Metadata *loanKey(Metadata *M) {
+  if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(M))
+    if (C->getBitWidth() == 64)
+      return ConstantAsMetadata::get(
+          ConstantInt::get(C->getType(), C->getZExtValue() & memannot::LoanKeyMask));
+  return M;
+}
+
 struct LUWatch final : CallbackVH {
   SmallVector<Metadata *, 2> Loans;
   WeakVH Alloca; // underlying alloca of a load/store carrier
@@ -146,7 +156,7 @@ struct LUWatch final : CallbackVH {
   bool Deleted = false;
   explicit LUWatch(Instruction *I, MDNode *LU) : CallbackVH(I) {
     for (const MDOperand &Op : LU->operands())
-      Loans.push_back(Op.get());
+      Loans.push_back(loanKey(Op.get()));
     if (Value *P = getLoadStorePointerOperand(I))
       if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(P))) {
         Alloca = A;
@@ -254,7 +264,7 @@ bool memannot::runCensusStart(Module &M) {
   auto CountLoans = [](Instruction &I, DenseSet<Metadata *> &Set) {
     if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
       for (const MDOperand &Op : LU->operands())
-        Set.insert(Op.get());
+        Set.insert(loanKey(Op.get()));
   };
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
@@ -332,7 +342,7 @@ static void runCensusLateImpl(Module &M) {
         ++Late[K_Guard];
       if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
         for (const MDOperand &Op : LU->operands())
-          LateLoans.insert(Op.get());
+          LateLoans.insert(loanKey(Op.get()));
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -571,9 +581,10 @@ bool memannot::stripAnnotations(Module &M) {
   unsigned GuardKind = M.getContext().getMDKindID(memannot::GuardMD);
   unsigned LastUseKind = M.getContext().getMDKindID(memannot::LastUseMD);
   unsigned IdKind = M.getContext().getMDKindID(memannot::IdMD);
+  unsigned LoanKind = M.getContext().getMDKindID(memannot::LoanMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
-      for (unsigned MK : {GuardKind, LastUseKind, IdKind})
+      for (unsigned MK : {GuardKind, LastUseKind, IdKind, LoanKind})
         if (I.getMetadata(MK)) {
           I.setMetadata(MK, nullptr);
           Changed = true;

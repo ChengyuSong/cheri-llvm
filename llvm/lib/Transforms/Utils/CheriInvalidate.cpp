@@ -7,8 +7,12 @@
 //     any other live frame capability slot whose base lies inside A;
 //   * "mem.free"(p) on a deallocation call: after the call, clear the tag of
 //     any live frame capability slot whose base lies inside p's bounds.
-// Only capabilities into dead storage are touched (fail-safe; no defined
-// behaviour changes). Off by default: -cheri-invalidate=none|scope|free|all.
+//   * R5: !mem.last_use of loan L: after the carrier, null every frame slot
+//     that only ever holds L's reference (all its capability stores carry
+//     the rustc slot fact !mem.loan !{L}).
+// Only capabilities into dead storage (or of an ended loan) are touched
+// (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
+// or a '+'-list (e.g. scope+free, the R4 "all").
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/MapVector.h"
@@ -20,6 +24,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -33,7 +38,16 @@ using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
     "cheri-invalidate", cl::init("none"), cl::Hidden,
-    cl::desc("M5r R4 Track B prototype: none, scope, free, all"));
+    cl::desc("M5r Track B prototype: none, scope, free, loan, all, or a "
+             "'+'-list (scope+free = R4 all)"));
+static cl::opt<bool> InvAsmNoEscape(
+    "cheri-invalidate-asm-noescape", cl::init(true), cl::Hidden,
+    cl::desc("R5 (D37): an inline asm with an empty template (black_box) does "
+             "not capture, read or write the pointers it is given"));
+static cl::opt<bool> InvLoanSkip(
+    "cheri-invalidate-loan-skip", cl::init(true), cl::Hidden,
+    cl::desc("R5 (D37): no range check at a scope/free event for a loan slot "
+             "whose loan-end clear lies on every path from its stores"));
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -51,9 +65,11 @@ struct Slot {
 struct Inv {
   Module &M;
   const DataLayout &DL;
-  bool Scope, Free;
+  bool Scope, Free, Loan;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
+  unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0,
+           AsmNoEscape = 0;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -61,8 +77,69 @@ struct Inv {
     bool Unknown = false;
   };
   DenseMap<std::pair<AllocaInst *, int64_t>, Prov> SlotProv;
-  Inv(Module &M, bool Scope, bool Free)
-      : M(M), DL(M.getDataLayout()), Scope(Scope), Free(Free) {}
+  Inv(Module &M, bool Scope, bool Free, bool Loan)
+      : M(M), DL(M.getDataLayout()), Scope(Scope), Free(Free), Loan(Loan) {}
+
+  // R5 (D37): `asm sideeffect ""` (core::hint::black_box) executes nothing,
+  // so it cannot capture, read or write anything at run time. Only this late
+  // pass treats it so; the generic passes keep their conservative view.
+  static bool isEmptyAsm(const CallBase *CB) {
+    auto *IA = dyn_cast<InlineAsm>(CB->getCalledOperand());
+    if (!IA)
+      return false;
+    StringRef T = StringRef(IA->getAsmString()).trim();
+    while (T.consume_front("/*")) {
+      size_t E = T.find("*/");
+      if (E == StringRef::npos)
+        return false;
+      T = T.drop_front(E + 2).trim();
+    }
+    return T.empty();
+  }
+  struct NoAsmTracker : CaptureTracker {
+    bool Captured = false, SawAsm = false;
+    void tooManyUses() override { Captured = true; }
+    Action captured(const Use *U, UseCaptureInfo) override {
+      // A volatile access only uses the address (LLVM counts it as a
+      // capture); it hands the pointer to nobody.
+      if (auto *LI = dyn_cast<LoadInst>(U->getUser()))
+        if (U->getOperandNo() == LI->getPointerOperandIndex())
+          return ContinueIgnoringReturn;
+      if (auto *SI = dyn_cast<StoreInst>(U->getUser()))
+        if (U->getOperandNo() == SI->getPointerOperandIndex())
+          return ContinueIgnoringReturn;
+      if (auto *CB = dyn_cast<CallBase>(U->getUser()))
+        if (InvAsmNoEscape && isEmptyAsm(CB)) {
+          SawAsm = true;
+          return ContinueIgnoringReturn;
+        }
+      // Reading a capability's address/bounds/tag (e.g. this pass's own
+      // range-check operands) hands out no provenance.
+      if (auto *II = dyn_cast<IntrinsicInst>(U->getUser()))
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::cheri_cap_address_get:
+        case Intrinsic::cheri_cap_base_get:
+        case Intrinsic::cheri_cap_length_get:
+        case Intrinsic::cheri_cap_tag_get:
+          return ContinueIgnoringReturn;
+        default:
+          break;
+        }
+      Captured = true;
+      return Stop;
+    }
+  };
+  DenseMap<const Value *, bool> EscCache;
+  bool escapes(const Value *V) {
+    auto It = EscCache.find(V);
+    if (It != EscCache.end())
+      return It->second;
+    NoAsmTracker T;
+    PointerMayBeCaptured(V, &T);
+    if (!T.Captured && T.SawAsm)
+      ++AsmNoEscape;
+    return EscCache[V] = T.Captured;
+  }
 
   Function *decl(Intrinsic::ID ID, ArrayRef<Type *> Tys = {}) {
     return Intrinsic::getOrInsertDeclaration(&M, ID, Tys);
@@ -144,7 +221,7 @@ struct Inv {
       return true;
     if (It->second.Objs.count(A))
       return true;
-    if (It->second.Unknown && PointerMayBeCaptured(A, /*ReturnCaptures=*/true))
+    if (It->second.Unknown && escapes(A))
       return true;
     ++Filtered;
     return false;
@@ -172,7 +249,7 @@ struct Inv {
     auto It = ReadLater.find({S, At});
     if (It != ReadLater.end())
       return It->second;
-    bool R = PointerMayBeCaptured(S, /*ReturnCaptures=*/true);
+    bool R = escapes(S);
     if (!R) {
       SmallVector<const Value *, 8> WL{S};
       SmallPtrSet<const Value *, 16> Seen;
@@ -192,6 +269,9 @@ struct Inv {
           if (isa<StoreInst>(I) || I->isLifetimeStartOrEnd() ||
               isa<DbgInfoIntrinsic>(I))
             continue;
+          if (auto *CB = dyn_cast<CallBase>(I))
+            if (InvAsmNoEscape && isEmptyAsm(CB))
+              continue;
           // A load or any other reader (memcpy source, call): reachable?
           if (I != At && isPotentiallyReachable(At, I, nullptr, &DT)) {
             R = true;
@@ -221,6 +301,165 @@ struct Inv {
     ++RangeChecks;
   }
 
+  // ---- R5 (D36): loan-end invalidation ------------------------------------
+  // A loan slot is a frame cap slot whose every capability store carries the
+  // rustc slot fact !mem.loan with a common loan id L, and which nothing else
+  // can write (no overlapping non-capability store, memory intrinsic or call,
+  // and the alloca does not escape). At L's last use nothing can read the
+  // reference any more (borrowck), so the slot is nulled right after it.
+  struct LoanSlot {
+    SmallVector<StoreInst *, 2> Stores;
+    SmallVector<uint64_t, 2> Ids; // common to every store
+    SmallVector<Instruction *, 2> Clears;
+    bool OK = true;
+  };
+  MapVector<std::pair<AllocaInst *, int64_t>, LoanSlot> LS;
+
+  static SmallVector<uint64_t, 2> mdIds(const MDNode *N) {
+    SmallVector<uint64_t, 2> R;
+    if (N)
+      for (const MDOperand &Op : N->operands())
+        if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op))
+          R.push_back(C->getZExtValue());
+    return R;
+  }
+
+  void collectLoanSlots(Function &F) {
+    LS.clear();
+    unsigned LoanKind = M.getContext().getMDKindID(memannot::LoanMD);
+    SmallPtrSet<AllocaInst *, 8> Bad;
+    for (Instruction &I : instructions(F)) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        int64_t Off = 0;
+        Value *Base = GetPointerBaseWithConstantOffset(SI->getPointerOperand(), Off, DL);
+        auto *A = dyn_cast_or_null<AllocaInst>(Base);
+        if (!A) {
+          if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand())))
+            Bad.insert(U); // variable offset: may hit any slot
+          continue;
+        }
+        MDNode *N = SI->getMetadata(LoanKind);
+        if (N)
+          ++LoanFacts;
+        if (DL.isFatPointer(SI->getValueOperand()->getType()) && Off >= 0 && Off % 16 == 0) {
+          LoanSlot &L = LS[{A, Off}];
+          SmallVector<uint64_t, 2> Ids = mdIds(N);
+          if (Ids.empty())
+            L.OK = false;
+          else if (L.Stores.empty())
+            L.Ids = Ids;
+          else
+            erase_if(L.Ids, [&](uint64_t X) { return !is_contained(Ids, X); });
+          L.Stores.push_back(SI);
+          continue;
+        }
+        // A non-capability store overlapping a slot of A.
+        uint64_t Sz = DL.getTypeStoreSize(SI->getValueOperand()->getType()).getKnownMinValue();
+        for (int64_t O = (Off / 16) * 16; O < Off + (int64_t)Sz; O += 16)
+          LS[{A, O}].OK = false;
+        continue;
+      }
+      if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
+        Value *P = isa<AtomicRMWInst>(I) ? cast<AtomicRMWInst>(I).getPointerOperand()
+                                         : cast<AtomicCmpXchgInst>(I).getPointerOperand();
+        if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(P)))
+          Bad.insert(U);
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        if (CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB) ||
+            (InvAsmNoEscape && isEmptyAsm(CB)) || memannot::isMemFact(CB))
+          continue;
+        for (Value *Arg : CB->args())
+          if (Arg->getType()->isPointerTy())
+            if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(Arg)))
+              Bad.insert(U); // memcpy/memset destination or a callee
+      }
+    }
+    for (auto &[K, L] : LS) {
+      if (Bad.count(K.first) || L.Ids.empty() || L.Stores.empty() || escapes(K.first))
+        L.OK = false;
+      if (L.OK)
+        ++LoanSlots;
+    }
+  }
+
+  void loanClears(Function &F, DominatorTree &DT) {
+    unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
+    Type *CapTy = PointerType::get(M.getContext(), 200);
+    SmallVector<Instruction *, 16> Carriers;
+    for (Instruction &I : instructions(F))
+      if (I.getMetadata(LUKind))
+        Carriers.push_back(&I);
+    IRBuilder<> B(M.getContext());
+    for (Instruction *C : Carriers) {
+      if (C->isTerminator())
+        continue; // invoke: the normal edge may be shared
+      SmallVector<uint64_t, 4> Ids = mdIds(C->getMetadata(LUKind));
+      for (auto &[K, L] : LS) {
+        if (!L.OK || none_of(L.Ids, [&](uint64_t X) { return is_contained(Ids, X); }))
+          continue;
+        Instruction *At = C->getNextNode();
+        if (!liveAt(K.first, At, DT))
+          continue; // never store to a dead (possibly recoloured) slot
+        B.SetInsertPoint(At);
+        Value *P = K.second ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), K.first, K.second)
+                            : K.first;
+        L.Clears.push_back(B.CreateAlignedStore(ConstantPointerNull::get(
+                                                    cast<PointerType>(CapTy)),
+                                                P, Align(16)));
+        ++LoanClears;
+      }
+    }
+  }
+
+  // Can From reach To without passing one of Block?
+  static bool reachAvoid(Instruction *From, Instruction *To,
+                         const SmallPtrSetImpl<Instruction *> &Block) {
+    auto Scan = [&](BasicBlock::iterator It, BasicBlock *BB) -> int {
+      for (; It != BB->end(); ++It) {
+        if (&*It == To)
+          return 1;
+        if (Block.count(&*It))
+          return 0;
+      }
+      return -1;
+    };
+    int R = Scan(std::next(From->getIterator()), From->getParent());
+    if (R >= 0)
+      return R == 1;
+    SmallVector<BasicBlock *, 8> WL(successors(From->getParent()));
+    SmallPtrSet<BasicBlock *, 32> Seen;
+    while (!WL.empty()) {
+      BasicBlock *BB = WL.pop_back_val();
+      if (!Seen.insert(BB).second)
+        continue;
+      R = Scan(BB->begin(), BB);
+      if (R == 1)
+        return true;
+      if (R == 0)
+        continue;
+      append_range(WL, successors(BB));
+    }
+    return false;
+  }
+
+  // R5 (D37): a loan slot whose clear lies on every path from each of its
+  // stores to the event cannot hold a stale capability there.
+  bool loanCovered(AllocaInst *A, int64_t Off, Instruction *E) {
+    if (!InvLoanSkip || !Loan)
+      return false;
+    auto It = LS.find({A, Off});
+    if (It == LS.end() || !It->second.OK || It->second.Clears.empty())
+      return false;
+    SmallPtrSet<Instruction *, 4> Blk(It->second.Clears.begin(), It->second.Clears.end());
+    for (StoreInst *St : It->second.Stores)
+      if (reachAvoid(St, E, Blk))
+        return false;
+    ++LoanSkipped;
+    return true;
+  }
+
   void runOn(Function &F) {
     MapVector<AllocaInst *, SmallVector<int64_t, 2>> CapSlots;
     collectSlots(F, CapSlots);
@@ -239,6 +478,9 @@ struct Inv {
     if (CapSlots.empty())
       return;
     DominatorTree DT(F);
+    collectLoanSlots(F);
+    if (Loan)
+      loanClears(F, DT);
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -276,7 +518,7 @@ struct Inv {
           if (!Lo)
             Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
           for (int64_t Off : Offs)
-            if (mayHoldFrame({S, Off}, A))
+            if (mayHoldFrame({S, Off}, A) && !loanCovered(S, Off, E))
               checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()));
         }
       }
@@ -296,7 +538,7 @@ struct Inv {
           if (!liveAt(S, C, DT) || !readLater(S, C, DT))
             continue;
           for (int64_t Off : Offs)
-            if (mayHoldHeap({S, Off}))
+            if (mayHoldHeap({S, Off}) && !loanCovered(S, Off, C))
               checkAndClear(B, {S, Off}, Lo, Len);
         }
       }
@@ -315,7 +557,10 @@ struct Inv {
            << " scope_events=" << ScopeEvents << " free_events=" << FreeEvents
            << " own_nulled=" << OwnNulled << " range_checks=" << RangeChecks
            << " lu_carriers=" << LUCarriers
-           << " lu_frame_copies=" << LUFrameCopies << " filtered=" << Filtered << "\n";
+           << " lu_frame_copies=" << LUFrameCopies << " filtered=" << Filtered
+           << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
+           << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped
+           << " asm_noescape=" << AsmNoEscape << "\n";
     }
   }
 };
@@ -323,11 +568,13 @@ struct Inv {
 
 bool memannot::runCheriInvalidate(Module &M) {
   StringRef Mode = InvalidateOpt;
-  bool Scope = Mode == "scope" || Mode == "all";
-  bool Free = Mode == "free" || Mode == "all";
-  if (!Scope && !Free && InvStatsOut.empty())
+  bool All = Mode == "all";
+  bool Scope = All || Mode.contains("scope");
+  bool Free = All || Mode.contains("free");
+  bool Loan = All || Mode.contains("loan");
+  if (!Scope && !Free && !Loan && InvStatsOut.empty())
     return false;
-  Inv I(M, Scope, Free);
+  Inv I(M, Scope, Free, Loan);
   I.run();
-  return Scope || Free;
+  return Scope || Free || Loan;
 }

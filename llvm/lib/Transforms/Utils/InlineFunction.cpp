@@ -75,6 +75,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <deque>
@@ -1990,6 +1991,48 @@ static bool isLastUseCarrier(const Instruction &I) {
   return true;
 }
 
+// [LLM-generated] M5r R5 (D35): the callee's loans are new loans in every
+// inlined copy (as the MIR inliner re-keys them). Re-key the !mem.last_use
+// and !mem.loan ids of the cloned body with a per-inline salt, so that a
+// loan-end of one copy never names the slots of another copy. Runs before
+// the call site's own ids (caller loans) are moved into the body.
+static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
+  static std::atomic<uint64_t> Salt{0};
+  LLVMContext &Ctx = Caller->getContext();
+  unsigned Kinds[2] = {Ctx.getMDKindID(memannot::LastUseMD),
+                       Ctx.getMDKindID(memannot::LoanMD)};
+  uint64_t S = 0;
+  DenseMap<MDNode *, MDNode *> Done;
+  for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+    for (Instruction &I : *BI)
+      for (unsigned K : Kinds) {
+        MDNode *N = I.getMetadata(K);
+        if (!N)
+          continue;
+        if (!S)
+          while (!(S = ++Salt & 0x1fffff))
+            ;
+        MDNode *&New = Done[N];
+        if (!New) {
+          SmallVector<Metadata *, 4> Ids;
+          for (const MDOperand &Op : N->operands()) {
+            auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
+            if (!C) {
+              Ids.push_back(Op.get());
+              continue;
+            }
+            // Low 42 bits: the original id (the census keys on them);
+            // bits 42..62: the inline salt.
+            uint64_t V = (C->getZExtValue() & memannot::LoanKeyMask) |
+                         ((S & 0x1fffff) << 42);
+            Ids.push_back(ConstantAsMetadata::get(ConstantInt::get(C->getType(), V)));
+          }
+          New = MDNode::get(Ctx, Ids);
+        }
+        I.setMetadata(K, New);
+      }
+}
+
 static void moveLastUseIntoInlinedBody(CallBase &CB,
                                        ArrayRef<ReturnInst *> Returns) {
   MDNode *LU = CB.getMetadata(memannot::LastUseMD);
@@ -3141,6 +3184,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // the call.
     moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
     moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
+    rekeyInlinedLoans(FirstNewBlock, Caller);
     moveLastUseIntoInlinedBody(CB, Returns);
 
     // For 'nodebug' functions, the associated DISubprogram is always null.
