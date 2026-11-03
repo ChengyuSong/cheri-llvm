@@ -207,6 +207,11 @@ static void transferLastUse(Instruction &I) {
     }
     return;
   }
+  // Passes erase while blocks are being rewritten: never assert on a block
+  // without a terminator (it just ends the walk).
+  auto Term = [](BasicBlock *B) -> Instruction * {
+    return (B && !B->empty() && B->back().isTerminator()) ? &B->back() : nullptr;
+  };
   auto LastCarrierIn = [&](BasicBlock *B, Instruction *From) -> Instruction * {
     auto It = From ? From->getReverseIterator() : B->rbegin();
     for (auto E = B->rend(); It != E; ++It)
@@ -225,14 +230,14 @@ static void transferLastUse(Instruction &I) {
       break;
     bool Straight = true;
     for (BasicBlock *P : Preds)
-      Straight &= P != BB && P->getTerminator() &&
-                  P->getTerminator()->getNumSuccessors() == 1;
+      Straight &= P != BB && Term(P) &&
+                  Term(P)->getNumSuccessors() == 1;
     if (!Straight)
       break;
     if (Preds.size() == 1) {
       BB = Preds[0];
       Start = nullptr;
-      if (Instruction *T = BB->getTerminator();
+      if (Instruction *T = Term(BB);
           T && T != &I && memannot::isLastUseCarrier(*T)) { // invoke
         memannot::mergeLastUse(*T, LU);
         return;
@@ -264,11 +269,11 @@ static void transferLastUse(Instruction &I) {
         memannot::mergeLastUse(*It, LU);
         return;
       }
-    Instruction *T = BB->getTerminator();
+    Instruction *T = Term(BB);
     if (!T || T->getNumSuccessors() != 1)
       return;
     BasicBlock *S = T->getSuccessor(0);
-    if (S == BB || S->getUniquePredecessor() != BB)
+    if (S == BB || !S->hasNPredecessors(1))
       return;
     BB = S;
     From = nullptr;
