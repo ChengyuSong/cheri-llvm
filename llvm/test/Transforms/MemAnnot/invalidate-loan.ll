@@ -6,7 +6,8 @@
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=scope+free < %s | FileCheck %s --check-prefix=SF
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all < %s | FileCheck %s --check-prefix=ALL
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-loan-skip=false < %s | FileCheck %s --check-prefix=NOSKIP
-; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-asm-noescape=false < %s | FileCheck %s --check-prefix=ASMESC
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-escape=false < %s | FileCheck %s --check-prefix=NOESC
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-escape=false -cheri-invalidate-asm-noescape=false < %s | FileCheck %s --check-prefix=ASMESC
 ; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
@@ -44,8 +45,10 @@ define void @mixed(ptr addrspace(200) %p, ptr addrspace(200) %q) {
 ; LOAN-NOT: store {{(volatile )?}}ptr addrspace(200) null
 ; LOAN: ret void
 
-; The slot escapes into a call (which may write it): no clear. An empty-asm
-; (black_box) use does not count as an escape.
+; The slot escapes into a call. R5: no clear. R6 (D41): the slot's type
+; region is inside the loan region, and any borrow of the slot is inside the
+; slot's region, so a callee cannot use the slot after the loan end: cleared
+; (prefix NOESC checks the R5 rule). An empty-asm (black_box) use never counts as an escape.
 define void @escaped(ptr addrspace(200) %p) {
   %r = alloca ptr addrspace(200), align 16, addrspace(200)
   store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
@@ -54,8 +57,11 @@ define void @escaped(ptr addrspace(200) %p) {
   ret void
 }
 ; LOAN-LABEL: define void @escaped(
-; LOAN-NOT: store {{(volatile )?}}ptr addrspace(200) null
-; LOAN: ret void
+; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
+; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r, align 16, !pcsections [[PCL:![0-9]+]]
+; NOESC-LABEL: define void @escaped(
+; NOESC-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; NOESC: ret void
 define void @blackbox(ptr addrspace(200) %p) {
   %r = alloca ptr addrspace(200), align 16, addrspace(200)
   store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
@@ -93,7 +99,9 @@ define void @skip() {
 ; NOSKIP-LABEL: define void @skip(
 ; NOSKIP: %cheri.inv.cap = load ptr addrspace(200), ptr addrspace(200) %r
 ; NOSKIP: call addrspace(200) void @llvm.lifetime.end
-; STATS: loan_facts=5 loan_slots=3 loan_clears=3 loan_skipped=1
+; STATS: loan_facts=5 loan_slots=4 loan_clears=4 loan_skipped=1 loan_escaped=1
+; R6 (D48): each clear is recorded in a cheri_inv_* pcsections section.
+; LOAN: [[PCL]] = !{!"cheri_inv_loan"}
 
 !0 = !{i64 5}
 !1 = !{i64 9}

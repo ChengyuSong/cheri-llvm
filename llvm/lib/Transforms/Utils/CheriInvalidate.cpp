@@ -44,9 +44,37 @@ static cl::opt<std::string> InvalidateOpt(
 // before lifetime.end, or a loan clear) is a dead store to codegen:
 // SelectionDAG drops stores to a frame object before its LIFETIME_END, so the
 // R4 own-slot nulling never reached the binary. Volatile keeps it.
+// [LLM-generated] M5r R6 (D48): tag every inserted clear with !pcsections
+// "cheri_inv_{own,loan,scope,free}" so an ELF-level verifier can count the
+// clears that reach the binary and check each one is a capability store.
+// Data only (no .text change).
+static cl::opt<bool> InvPcMap(
+    "cheri-invalidate-pc-map", cl::init(true), cl::Hidden,
+    cl::desc("M5r R6 (D48): record each inserted clear's pc in a "
+             "cheri_inv_* pcsections section (ELF verifier)"));
+static void markClear(Instruction *I, StringRef Sec) {
+  if (!InvPcMap || !I)
+    return;
+  LLVMContext &Ctx = I->getContext();
+  I->setMetadata(LLVMContext::MD_pcsections,
+                 MDNode::get(Ctx, {MDString::get(Ctx, Sec)}));
+}
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
+// [LLM-generated] R6 (D41): a loan slot may have its address passed to a
+// call or stored (fmt's `&&T` arguments). Every Rust pointer to the slot is a
+// borrow of it whose region is inside the slot's type region, which is inside
+// L's region, so nothing can legitimately read the slot after L ends, and a
+// callee's write leaves a value whose region is dead too. Only raw-pointer
+// reads after L ends (the gadget class) see the clear.
+static cl::opt<bool> InvLoanEscape(
+    "cheri-invalidate-loan-escape", cl::init(true), cl::Hidden,
+    cl::desc("M5r R6: loan slots may escape to calls/memory (NLL region "
+             "containment); variable-offset stores and atomics still disqualify"));
+static cl::opt<bool> InvLoanDebug(
+    "cheri-invalidate-loan-debug", cl::init(false), cl::Hidden,
+    cl::desc("M5r R6: print why each !mem.loan slot is (not) a loan slot"));
 static cl::opt<bool> InvAsmNoEscape(
     "cheri-invalidate-asm-noescape", cl::init(true), cl::Hidden,
     cl::desc("R5 (D37): an inline asm with an empty template (black_box) does "
@@ -75,7 +103,7 @@ struct Inv {
   bool Scope, Free, Loan;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
-  unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0,
+  unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0, LoanEscaped = 0,
            AsmNoEscape = 0;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
@@ -295,7 +323,8 @@ struct Inv {
   DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadLater;
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
-  void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len) {
+  void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len,
+                     StringRef RangeSec) {
     Type *CapTy = PointerType::get(M.getContext(), 200);
     Value *P = S.Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), S.A, S.Off) : S.A;
     LoadInst *C = B.CreateAlignedLoad(CapTy, P, Align(16), "cheri.inv.cap");
@@ -304,7 +333,8 @@ struct Inv {
     Value *In = B.CreateICmpULT(B.CreateSub(Bs, Lo), Len);
     Value *Kill = B.CreateAnd(T, In);
     Value *Cl = B.CreateCall(decl(Intrinsic::cheri_cap_tag_clear), {C});
-    B.CreateAlignedStore(B.CreateSelect(Kill, Cl, C), P, Align(16));
+    markClear(B.CreateAlignedStore(B.CreateSelect(Kill, Cl, C), P, Align(16)),
+              RangeSec);
     ++RangeChecks;
   }
 
@@ -333,6 +363,7 @@ struct Inv {
 
   void collectLoanSlots(Function &F) {
     LS.clear();
+    BadWhy.clear();
     unsigned LoanKind = M.getContext().getMDKindID(memannot::LoanMD);
     SmallPtrSet<AllocaInst *, 8> Bad;
     for (Instruction &I : instructions(F)) {
@@ -341,8 +372,10 @@ struct Inv {
         Value *Base = GetPointerBaseWithConstantOffset(SI->getPointerOperand(), Off, DL);
         auto *A = dyn_cast_or_null<AllocaInst>(Base);
         if (!A) {
-          if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand())))
+          if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand()))) {
             Bad.insert(U); // variable offset: may hit any slot
+            BadWhy[U] = "var-offset-store";
+          }
           continue;
         }
         MDNode *N = SI->getMetadata(LoanKind);
@@ -369,8 +402,10 @@ struct Inv {
       if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
         Value *P = isa<AtomicRMWInst>(I) ? cast<AtomicRMWInst>(I).getPointerOperand()
                                          : cast<AtomicCmpXchgInst>(I).getPointerOperand();
-        if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(P)))
+        if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(P))) {
           Bad.insert(U);
+          BadWhy[U] = "atomic";
+        }
         continue;
       }
       if (auto *CB = dyn_cast<CallBase>(&I)) {
@@ -379,17 +414,41 @@ struct Inv {
           continue;
         for (Value *Arg : CB->args())
           if (Arg->getType()->isPointerTy())
-            if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(Arg)))
+            if (auto *U = dyn_cast<AllocaInst>(getUnderlyingObject(Arg))) {
               Bad.insert(U); // memcpy/memset destination or a callee
+              if (BadWhy[U].empty())
+                BadWhy[U] = (Twine("call:") + (CB->getCalledFunction() ? CB->getCalledFunction()->getName() : StringRef("indirect"))).str();
+            }
       }
     }
     for (auto &[K, L] : LS) {
-      if (Bad.count(K.first) || L.Ids.empty() || L.Stores.empty() || escapes(K.first))
+      bool HadFact = any_of(L.Stores, [&](StoreInst *S) { return S->getMetadata(LoanKind); });
+      const char *Why = !L.OK ? "untagged-or-overlap" : nullptr;
+      if (!Why && Bad.count(K.first) && BadWhy.lookup(K.first).empty())
+        Why = "bad";
+      std::string BW = Bad.count(K.first) ? BadWhy.lookup(K.first) : "";
+      if (!Why && !BW.empty() && !(InvLoanEscape && StringRef(BW).starts_with("call:") &&
+                                            !StringRef(BW).starts_with("call:llvm.")))
+        Why = BW.c_str();
+      if (!Why && L.Ids.empty())
+        Why = "no-common-id";
+      if (!Why && L.Stores.empty())
+        Why = "no-stores";
+      if (!Why && !InvLoanEscape && escapes(K.first))
+        Why = "escapes";
+      if (!Why && InvLoanEscape && (!BW.empty() || escapes(K.first)))
+        ++LoanEscaped;
+      if (Why)
         L.OK = false;
       if (L.OK)
         ++LoanSlots;
+      if (InvLoanDebug && HadFact)
+        errs() << "loan-slot " << F.getName() << " " << K.first->getName() << "+"
+               << K.second << " stores=" << L.Stores.size() << ": "
+               << (Why ? Why : "OK") << "\n";
     }
   }
+  DenseMap<AllocaInst *, std::string> BadWhy;
 
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
@@ -415,9 +474,20 @@ struct Inv {
         L.Clears.push_back(B.CreateAlignedStore(ConstantPointerNull::get(
                                                     cast<PointerType>(CapTy)),
                                                 P, Align(16), InvVolatile));
+        markClear(L.Clears.back(), "cheri_inv_loan");
         ++LoanClears;
       }
     }
+    if (InvLoanDebug)
+      for (auto &[K, L] : LS)
+        if (L.OK && L.Clears.empty()) {
+          bool Any = any_of(Carriers, [&](Instruction *C) {
+            SmallVector<uint64_t, 4> Ids = mdIds(C->getMetadata(LUKind));
+            return any_of(L.Ids, [&](uint64_t X) { return is_contained(Ids, X); });
+          });
+          errs() << "loan-noclear " << F.getName() << " " << K.first->getName()
+                 << ": " << (Any ? "carrier-not-live-or-terminator" : "no-carrier") << "\n";
+        }
   }
 
   // Can From reach To without passing one of Block?
@@ -513,9 +583,9 @@ struct Inv {
         if (It != CapSlots.end())
           for (int64_t Off : It->second) {
             Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
-            B.CreateAlignedStore(
+            markClear(B.CreateAlignedStore(
                 ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
-                Align(16), InvVolatile);
+                Align(16), InvVolatile), "cheri_inv_own");
             ++OwnNulled;
           }
         Value *Lo = nullptr;
@@ -526,7 +596,8 @@ struct Inv {
             Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
           for (int64_t Off : Offs)
             if (mayHoldFrame({S, Off}, A) && !loanCovered(S, Off, E))
-              checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()));
+              checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()),
+                            "cheri_inv_scope");
         }
       }
     if (Free)
@@ -546,7 +617,7 @@ struct Inv {
             continue;
           for (int64_t Off : Offs)
             if (mayHoldHeap({S, Off}) && !loanCovered(S, Off, C))
-              checkAndClear(B, {S, Off}, Lo, Len);
+              checkAndClear(B, {S, Off}, Lo, Len, "cheri_inv_free");
         }
       }
   }
@@ -566,7 +637,7 @@ struct Inv {
            << " lu_carriers=" << LUCarriers
            << " lu_frame_copies=" << LUFrameCopies << " filtered=" << Filtered
            << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
-           << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped
+           << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
            << " asm_noescape=" << AsmNoEscape << "\n";
     }
   }
