@@ -25,6 +25,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
@@ -93,6 +94,11 @@ static cl::opt<bool> RecoverConst(
     cl::desc("R5 (D30): a split marker whose index is a constant on its edge "
              "recovers the constant-offset accesses of its base in its Ok "
              "block as guards (fully unrolled loops)"));
+static cl::opt<bool> TrapMap(
+    "cheri-trap-map", cl::init(true), cl::Hidden,
+    cl::desc("R5 (trap->panic): tag the accesses whose software check was "
+             "removed with !pcsections \"cheri_trap_map\" (pc -> panic "
+             "location) for the runtime's CHERI-fault handler"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -107,7 +113,7 @@ struct Stats {
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
   unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0, BorrowDeref = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
-  unsigned Recovered = 0, RecoveredMarkers = 0;
+  unsigned Recovered = 0, RecoveredMarkers = 0, TrapMapped = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
 };
@@ -991,12 +997,16 @@ struct Lowering {
         if (!OnEdge.empty())
           rewriteGuards(OnEdge, NarrowAt(B, true), Done);
         RewriteGroup(true);
+        tagTraps(Mk, OnEdge);
+        tagTraps(Mk, GroupG);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Pol == P_UB) { // Never
         if (!OnEdge.empty())
           rewriteGuards(OnEdge, NarrowAt(B, false), Done);
         RewriteGroup(false);
+        tagTraps(Mk, OnEdge);
+        tagTraps(Mk, GroupG);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Ex == E_Dynamic) {
@@ -1044,10 +1054,12 @@ struct Lowering {
           Cap->addIncoming(Exact, Mk.Pred);
           Cap->addIncoming(Rounded, Slow);
           rewriteGuards(OnEdge, Cap, Done);
+          tagTraps(Mk, OnEdge);
         } else {
           Value *Rounded = NarrowAt(B, false, Bytes, Base);
           Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
           rewriteGuards(OnEdge, Cap, Done);
+          tagTraps(Mk, OnEdge);
           for (PHINode &PN : Mk.Ok->phis())
             PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
         }
@@ -1072,6 +1084,81 @@ struct Lowering {
         if (!DT.dominates(I, T))
           return false;
     return true;
+  }
+
+  // R5 (trap->panic): the panic location of a marker, read from the
+  // `&'static Location` argument of its panic call: { &str file, u32 line,
+  // u32 col } (purecap: file cap at 0, len at 16, line at 32, col at 36).
+  // The record is !{i32 MAGIC, i32 line, i32 col, i32 kind, [32 x i8] file
+  // tail}; a runtime parses pc deltas up to a MAGIC word, then the record.
+  MDNode *trapRecord(const Marker &Mk) {
+    LLVMContext &Ctx = M.getContext();
+    for (unsigned A = Mk.Panic->arg_size(); A-- > 0;) {
+      auto *G = dyn_cast<GlobalVariable>(Mk.Panic->getArgOperand(A)->stripPointerCasts());
+      if (!G || !G->hasDefinitiveInitializer() || !DL.isFatPointer(G->getType()))
+        continue;
+      auto *ST = dyn_cast<StructType>(G->getValueType());
+      if (!ST || DL.getTypeAllocSize(ST) < 40)
+        continue;
+      Constant *Init = G->getInitializer();
+      auto At = [&](uint64_t Off, Type *T) -> Constant * {
+        return ConstantFoldLoadFromConst(Init, T, APInt(64, Off), DL);
+      };
+      auto *Line = dyn_cast_or_null<ConstantInt>(At(32, Type::getInt32Ty(Ctx)));
+      auto *Col = dyn_cast_or_null<ConstantInt>(At(36, Type::getInt32Ty(Ctx)));
+      auto *Len = dyn_cast_or_null<ConstantInt>(At(16, Type::getInt64Ty(Ctx)));
+      if (!Line || !Col || !Len || Line->isZero())
+        continue;
+      std::string File;
+      if (auto *CS = dyn_cast<ConstantStruct>(Init))
+        if (auto *FG = dyn_cast<GlobalVariable>(CS->getOperand(0)->stripPointerCasts()))
+          if (FG->hasDefinitiveInitializer())
+            if (auto *CD = dyn_cast<ConstantDataSequential>(FG->getInitializer()))
+              if (CD->isString())
+                File = CD->getAsString().take_front(Len->getZExtValue()).str();
+      if (File.size() > 32)
+        File = File.substr(File.size() - 32);
+      File.resize(32, '\0');
+      Type *I32 = Type::getInt32Ty(Ctx);
+      Metadata *Aux[] = {
+          ConstantAsMetadata::get(ConstantInt::get(I32, 0x7ca9f00d)),
+          ConstantAsMetadata::get(Line), ConstantAsMetadata::get(Col),
+          ConstantAsMetadata::get(ConstantInt::get(
+              I32, (Mk.Kind & memannot::CHKF_KindMask) | (uint64_t(++TrapSeq) << 8))),
+          ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
+      return MDNode::get(Ctx, {MDString::get(Ctx, "cheri_trap_map"),
+                               MDNode::get(Ctx, Aux)});
+    }
+    return nullptr;
+  }
+  unsigned TrapSeq = 0;
+  void tagTraps(const Marker &Mk, ArrayRef<GetElementPtrInst *> Gs) {
+    if (!TrapMap || Gs.empty())
+      return;
+    MDNode *MD = trapRecord(Mk);
+    if (!MD)
+      return;
+    SmallVector<Value *, 8> WL(Gs.begin(), Gs.end());
+    SmallPtrSet<Value *, 16> Seen;
+    while (!WL.empty()) {
+      Value *V = WL.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (isa<GetElementPtrInst>(I) || isa<CastInst>(I)) {
+          WL.push_back(I);
+          continue;
+        }
+        if ((getLoadStorePointerOperand(I) == V || isa<AnyMemIntrinsic>(I)) &&
+            !I->getMetadata(LLVMContext::MD_pcsections)) {
+          I->setMetadata(LLVMContext::MD_pcsections, MD);
+          ++S.TrapMapped;
+        }
+      }
+    }
   }
 
   static void rewriteGuards(ArrayRef<GetElementPtrInst *> Gs, Value *Cap,
@@ -1378,7 +1465,8 @@ struct Lowering {
            << " relink_markers=" << S.RelinkGuards
            << " parent_first=" << S.ParentFirst
            << " recovered=" << S.Recovered
-           << " recovered_markers=" << S.RecoveredMarkers << " claims=" << S.Claims
+           << " recovered_markers=" << S.RecoveredMarkers
+           << " trap_mapped=" << S.TrapMapped << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof
