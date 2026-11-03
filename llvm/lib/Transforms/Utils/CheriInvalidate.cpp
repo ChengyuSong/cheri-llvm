@@ -40,6 +40,13 @@ static cl::opt<std::string> InvalidateOpt(
     "cheri-invalidate", cl::init("none"), cl::Hidden,
     cl::desc("M5r Track B prototype: none, scope, free, loan, all, or a "
              "'+'-list (scope+free = R4 all)"));
+// [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
+// before lifetime.end, or a loan clear) is a dead store to codegen:
+// SelectionDAG drops stores to a frame object before its LIFETIME_END, so the
+// R4 own-slot nulling never reached the binary. Volatile keeps it.
+static cl::opt<bool> InvVolatile(
+    "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
+    cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
 static cl::opt<bool> InvAsmNoEscape(
     "cheri-invalidate-asm-noescape", cl::init(true), cl::Hidden,
     cl::desc("R5 (D37): an inline asm with an empty template (black_box) does "
@@ -407,7 +414,7 @@ struct Inv {
                             : K.first;
         L.Clears.push_back(B.CreateAlignedStore(ConstantPointerNull::get(
                                                     cast<PointerType>(CapTy)),
-                                                P, Align(16)));
+                                                P, Align(16), InvVolatile));
         ++LoanClears;
       }
     }
@@ -508,7 +515,7 @@ struct Inv {
             Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
             B.CreateAlignedStore(
                 ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
-                Align(16));
+                Align(16), InvVolatile);
             ++OwnNulled;
           }
         Value *Lo = nullptr;
