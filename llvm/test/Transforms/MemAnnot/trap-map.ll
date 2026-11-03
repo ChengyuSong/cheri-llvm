@@ -1,7 +1,8 @@
 ; [LLM-generated] M5r R5 (D38): trap -> panic. When the late pass removes a
 ; software check (ub here; elide's fast path likewise), the accesses of its
 ; guards get !pcsections "cheri_trap_map" with the panic location of the
-; removed check (line, col, kind|seq<<8, 32-byte file tail) after a MAGIC word,
+; removed check (line, col, kind|log2(esz)<<8|seq<<12 since R6 D45, 32-byte
+; NUL-terminated file tail) after a MAGIC word,
 ; so a CHERI fault on them can be reported as that panic. Kept checks and
 ; -cheri-trap-map=false leave no record.
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-bounds-policy=ub < %s | FileCheck %s --check-prefix=UB
@@ -32,7 +33,7 @@ fail:
 ; UB: %v = load i64, ptr addrspace(200) %g{{.*}}, !pcsections [[R:![0-9]+]]
 ; UB: store i64 1, ptr addrspace(200) %g2{{.*}}, !pcsections [[R]]
 ; UB: [[R]] = !{!"cheri_trap_map", [[AUX:![0-9]+]]}
-; UB: [[AUX]] = !{i32 2091511821, i32 33, i32 56, i32 256, [32 x i8] c"src/main.rs\00
+; UB: [[AUX]] = !{i32 2091511821, i32 33, i32 56, i32 4864, [32 x i8] c"src/main.rs\00
 ; OFF-NOT: !pcsections
 
 !0 = !{i64 3}

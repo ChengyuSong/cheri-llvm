@@ -99,6 +99,71 @@ static cl::opt<bool> TrapMap(
     cl::desc("R5 (trap->panic): tag the accesses whose software check was "
              "removed with !pcsections \"cheri_trap_map\" (pc -> panic "
              "location) for the runtime's CHERI-fault handler"));
+// [LLM-generated] M5r R6 (D46): a user (unsafe, manual) exact narrowing of a
+// tagged capability whose result is untagged (the requested bounds are not
+// inside the parent: the ub memcpy s7b) faults at the narrowing instead of at
+// a later access (in memcpy), through a mapped load: the trap map names the
+// function and kind 5 so the handler reports where the narrowing failed.
+static cl::opt<bool> NarrowTagCheck(
+    "cheri-narrow-tag-check", cl::init(false), cl::Hidden,
+    cl::desc("M5r R6 (D46): fault at a user exact narrowing that loses the "
+             "tag (diagnostic; costs a tag test per manual narrowing)"));
+static unsigned NarrowTagChecks = 0;
+static void runNarrowTagCheck(Module &M) {
+  if (!NarrowTagCheck)
+    return;
+  LLVMContext &Ctx = M.getContext();
+  unsigned Seq = 0x40000; // distinct from the marker records' seq (20 bits)
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<IntrinsicInst *, 4> Ns;
+    for (Instruction &I : instructions(F))
+      if (auto *II = dyn_cast<IntrinsicInst>(&I))
+        if (II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact)
+          Ns.push_back(II);
+    for (IntrinsicInst *N : Ns) {
+      std::string File = F.getName().str();
+      unsigned Line = 0, Col = 0;
+      if (const DILocation *DL = N->getDebugLoc()) {
+        File = DL->getFilename().str();
+        Line = DL->getLine();
+        Col = DL->getColumn();
+      }
+      if (File.size() > 31)
+        File = File.substr(File.size() - 31);
+      File.resize(32, '\0');
+      Type *I32 = Type::getInt32Ty(Ctx);
+      Metadata *Aux[] = {
+          ConstantAsMetadata::get(ConstantInt::get(I32, 0x7ca9f00d)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, Line)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, Col)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, 5 | (++Seq << 12))),
+          ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
+      MDNode *MD = MDNode::get(
+          Ctx, {MDString::get(Ctx, "cheri_trap_map"), MDNode::get(Ctx, Aux)});
+      Instruction *After = N->getNextNode();
+      IRBuilder<> B(After);
+      Function *TagF =
+          Intrinsic::getOrInsertDeclaration(&M, Intrinsic::cheri_cap_tag_get);
+      Value *In = N->getArgOperand(0);
+      Value *Lost = B.CreateAnd(B.CreateCall(TagF, {In}),
+                                B.CreateNot(B.CreateCall(TagF, {N})));
+      Instruction *Then = SplitBlockAndInsertIfThen(Lost, After, true);
+      IRBuilder<> TB(Then);
+      LoadInst *L = TB.CreateLoad(Type::getInt8Ty(Ctx), N, /*isVolatile=*/true);
+      L->setMetadata(LLVMContext::MD_pcsections, MD);
+      ++NarrowTagChecks;
+    }
+  }
+}
+
+// [LLM-generated] M5r R6 (D49, fixes D32): mem facts on a borrow guard do
+// not make the borrow escape (SmallVec Index::index after inlining).
+static cl::opt<bool> BorrowFactUsers(
+    "cheri-bounds-borrow-fact-users", cl::init(true), cl::Hidden,
+    cl::desc("M5r R6 (D49): ignore mem.fact users of a borrow guard when "
+             "testing that the borrow is only dereferenced"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -368,6 +433,10 @@ struct Lowering {
           auto *I = dyn_cast<Instruction>(U);
           if (!I || I->getParent() != Mk.Ok)
             return false;
+          // R6 (D32/D49): a fact on the borrow (mem.alloc_inbounds after
+          // inlining an index operator) is an annotation, stripped below.
+          if (BorrowFactUsers && memannot::isMemFact(I))
+            continue;
           if (auto *GG = dyn_cast<GetElementPtrInst>(I)) {
             if (GG->getPointerOperand() != V || !GG->hasAllConstantIndices())
               return false;
@@ -395,7 +464,8 @@ struct Lowering {
         continue;
       }
       if (isa<DbgInfoIntrinsic>(I) || I.isLifetimeStartOrEnd() ||
-          isa<AssumeInst>(I) || memannot::isMemClaim(&I))
+          isa<AssumeInst>(I) || memannot::isMemClaim(&I) ||
+          (BorrowFactUsers && memannot::isMemFact(&I)))
         continue;
       if (I.mayWriteToMemory() || I.mayThrow() || !I.willReturn())
         return false;
@@ -1116,15 +1186,18 @@ struct Lowering {
             if (auto *CD = dyn_cast<ConstantDataSequential>(FG->getInitializer()))
               if (CD->isString())
                 File = CD->getAsString().take_front(Len->getZExtValue()).str();
-      if (File.size() > 32)
-        File = File.substr(File.size() - 32);
+      if (File.size() > 31) // R6 (D47): always NUL-terminated
+        File = File.substr(File.size() - 31);
       File.resize(32, '\0');
       Type *I32 = Type::getInt32Ty(Ctx);
       Metadata *Aux[] = {
           ConstantAsMetadata::get(ConstantInt::get(I32, 0x7ca9f00d)),
           ConstantAsMetadata::get(Line), ConstantAsMetadata::get(Col),
           ConstantAsMetadata::get(ConstantInt::get(
-              I32, (Mk.Kind & memannot::CHKF_KindMask) | (uint64_t(++TrapSeq) << 8))),
+              I32, (Mk.Kind & memannot::CHKF_KindMask) |
+                       // R6 (D45): log2 element size for the handler's message
+                       (uint64_t(Mk.Esz && isPowerOf2_64(Mk.Esz) ? Log2_64(Mk.Esz) & 0xf : 0xf) << 8) |
+                       (uint64_t(++TrapSeq) << 12))),
           ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
       return MDNode::get(Ctx, {MDString::get(Ctx, "cheri_trap_map"),
                                MDNode::get(Ctx, Aux)});
@@ -1466,7 +1539,8 @@ struct Lowering {
            << " parent_first=" << S.ParentFirst
            << " recovered=" << S.Recovered
            << " recovered_markers=" << S.RecoveredMarkers
-           << " trap_mapped=" << S.TrapMapped << " claims=" << S.Claims
+           << " trap_mapped=" << S.TrapMapped
+           << " narrow_tag_checks=" << NarrowTagChecks << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof
@@ -1495,6 +1569,7 @@ Policy readPolicy(Module &M) {
 
 bool memannot::runCheriBoundsLowering(Module &M) {
   runCensusLate(M);
+  runNarrowTagCheck(M); // R6 (D46), user narrowings only (before the pass's own)
   Lowering L(M, readPolicy(M), cheriSkipNarrowEnabled());
   L.run();
   runCheriInvalidate(M); // R4 Track B (off by default), before the strip
