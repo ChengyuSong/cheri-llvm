@@ -2032,6 +2032,11 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
       // We've just hoisted DbgVariableRecords; move I1 after them (before TI)
       // and leave any that were not hoisted behind (by calling moveBefore
       // rather than moveBeforePreserving).
+      // [LLM-generated] M5r R6 (D44): I1's own loan ends were in its block;
+      // if the hoisted copy loses them (not common to all copies), they go to
+      // the next carrier in that block (a later end on the same path).
+      BasicBlock *I1BB = I1->getParent();
+      MDNode *I1LU = I1->getMetadata(memannot::LastUseMD);
       I1->moveBefore(TI->getIterator());
       for (auto &SuccIter : OtherSuccIterRange) {
         Instruction *I2 = &*SuccIter++;
@@ -2053,6 +2058,8 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
         I1->applyMergedLocation(I1->getDebugLoc(), I2->getDebugLoc());
         I2->eraseFromParent();
       }
+      if (I1LU && I1->getMetadata(memannot::LastUseMD) != I1LU)
+        memannot::forwardLastUse(*I1BB, I1LU);
       if (!Changed)
         NumHoistCommonCode += SuccIterPairs.size();
       Changed = true;

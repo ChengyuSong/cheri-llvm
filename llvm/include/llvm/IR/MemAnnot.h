@@ -34,6 +34,7 @@
 #include <cstdint>
 
 namespace llvm {
+class BasicBlock;
 class CallBase;
 class Instruction;
 class MDNode;
@@ -123,6 +124,9 @@ LLVM_ABI bool onlyMemBundles(const CallBase &CB);
 LLVM_ABI bool isLastUseCarrier(const Instruction &I);
 /// R4 (D28): add the loan ids of LU to To's !mem.last_use.
 LLVM_ABI void mergeLastUse(Instruction &To, MDNode *LU);
+/// [LLM-generated] M5r R6 (D44): put loan ids that ended at the start of BB on
+/// the next carrier on BB's unique forward path (fail-safe: lost if none).
+LLVM_ABI void forwardLastUse(BasicBlock &BB, MDNode *LU);
 } // namespace memannot
 } // namespace llvm
 #endif

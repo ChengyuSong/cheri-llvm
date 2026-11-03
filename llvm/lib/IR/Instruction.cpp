@@ -280,6 +280,26 @@ static void transferLastUse(Instruction &I) {
   }
 }
 
+void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
+  BasicBlock *BB = &Start;
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    for (Instruction &I : *BB)
+      if (memannot::isLastUseCarrier(I)) {
+        memannot::mergeLastUse(I, LU);
+        return;
+      }
+    if (BB->empty() || !BB->back().isTerminator())
+      return;
+    Instruction *T = &BB->back();
+    if (T->getNumSuccessors() != 1)
+      return;
+    BasicBlock *S = T->getSuccessor(0);
+    if (S == BB || !S->hasNPredecessors(1))
+      return;
+    BB = S;
+  }
+}
+
 BasicBlock::iterator Instruction::eraseFromParent() {
   transferLastUse(*this);
   handleMarkerRemoval();
