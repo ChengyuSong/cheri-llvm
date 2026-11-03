@@ -340,12 +340,15 @@ static void runCensusLateImpl(Module &M) {
   unsigned Stripped = 0;                  // checked-callee calls w/o bundle
   DenseSet<Metadata *> LateLoans;
   DenseSet<Metadata *> LateSlotLoans; // R7 (D50): loans of slots still in memory
+  DenseMap<Metadata *, std::string> SlotLoanFn; // R8: function of the slot
   unsigned LoanKindID = M.getContext().getMDKindID(memannot::LoanMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
       if (MDNode *LN = I.getMetadata(LoanKindID))
-        for (const MDOperand &Op : LN->operands())
+        for (const MDOperand &Op : LN->operands()) {
           LateSlotLoans.insert(loanKey(Op.get()));
+          SlotLoanFn.try_emplace(loanKey(Op.get()), F.getName().str());
+        }
       if (I.getMetadata(memannot::GuardMD))
         ++Late[K_Guard];
       if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
@@ -504,6 +507,10 @@ static void runCensusLateImpl(Module &M) {
       auto BI = ByLoan.find(L);
       if (BI == ByLoan.end()) {
         ++SLNone;
+        if (CensusVerbose)
+          SLLostInfo.push_back(
+              std::to_string(mdconst::extract<ConstantInt>(L)->getZExtValue()) +
+              " none-at-start");
         continue;
       }
       bool Promoted = false, AllDeleted = true;
@@ -598,6 +605,12 @@ static void runCensusLateImpl(Module &M) {
     OS << "\n";
     for (const std::string &X : SLLostInfo)
       OS << "mem-annot-census: slot-loan lost: " << X << "\n";
+    if (CensusVerbose)
+      for (Metadata *L : LateSlotLoans)
+        OS << "mem-annot-census: slot-loan fn: "
+           << mdconst::extract<ConstantInt>(L)->getZExtValue() << " "
+           << SlotLoanFn.lookup(L) << " "
+           << (LateLoans.count(L) ? "carrier" : "lost") << "\n";
   }
   OS << "mem-annot-census: " << M.getModuleIdentifier() << " lost:"
      << (LostStr.empty() ? std::string(" none") : LostStr) << "\n";

@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Instruction.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include <functional>
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/MemAnnot.h"
 #include "llvm/ADT/DenseSet.h"
@@ -164,6 +166,12 @@ static cl::opt<bool> MemLastUseTransferAlloca(
     cl::desc("M5r R7 (D52): also move !mem.last_use off an erased load/store "
              "of a stack slot (promoted by SROA/mem2reg)"));
 
+static cl::opt<bool> MemLastUseFanout(
+    "mem-last-use-fanout", cl::init(true), cl::Hidden,
+    cl::desc("M5r R8 (D59): a forward last_use transfer at a branch puts the "
+             "ids on the first carrier of every successor that has no other "
+             "predecessor"));
+
 static void transferLastUse(Instruction &I) {
   if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
     return;
@@ -268,26 +276,51 @@ static void transferLastUse(Instruction &I) {
       memannot::mergeLastUse(*C, LU);
     return;
   }
-  // Forward: the next carrier on the unique path from I.
-  BB = I.getParent();
-  Instruction *From = &I;
-  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
-    for (auto It = From ? std::next(From->getIterator()) : BB->begin(),
-              E = BB->end();
-         It != E; ++It)
-      if (&*It != &I && memannot::isLastUseCarrier(*It)) {
-        memannot::mergeLastUse(*It, LU);
-        return;
+  // Forward: the next carrier on the unique path from I. R8 (D59): at a
+  // branch, every successor whose only predecessor is this block takes the ids
+  // on the first carrier of its own straight-line path (each path ends the
+  // loan no earlier than before; a join successor is never entered, since its
+  // other predecessors may still use the loan).
+  std::function<bool(BasicBlock *, Instruction *, unsigned, unsigned &)> Fwd =
+      [&](BasicBlock *B, Instruction *From, unsigned Depth,
+          unsigned &Budget) -> bool {
+    for (unsigned Steps = 0; B && Steps < 4; ++Steps) {
+      for (auto It = From ? std::next(From->getIterator()) : B->begin(),
+                E = B->end();
+           It != E; ++It)
+        if (&*It != &I && memannot::isLastUseCarrier(*It)) {
+          memannot::mergeLastUse(*It, LU);
+          return true;
+        }
+      Instruction *T = Term(B);
+      if (!T || T->getNumSuccessors() == 0)
+        return false;
+      if (T->getNumSuccessors() == 1) {
+        BasicBlock *S = T->getSuccessor(0);
+        if (S == B || !S->hasNPredecessors(1))
+          return false;
+        B = S;
+        From = nullptr;
+        continue;
       }
-    Instruction *T = Term(BB);
-    if (!T || T->getNumSuccessors() != 1)
-      return;
-    BasicBlock *S = T->getSuccessor(0);
-    if (S == BB || !S->hasNPredecessors(1))
-      return;
-    BB = S;
-    From = nullptr;
-  }
+      if (!MemLastUseFanout || Depth >= 2)
+        return false;
+      bool Any = false;
+      SmallPtrSet<BasicBlock *, 4> Seen;
+      for (BasicBlock *S : successors(B)) {
+        if (!Seen.insert(S).second || S == B || S->getSinglePredecessor() != B)
+          continue;
+        if (Budget == 0)
+          break;
+        --Budget;
+        Any |= Fwd(S, nullptr, Depth + 1, Budget);
+      }
+      return Any;
+    }
+    return false;
+  };
+  unsigned Budget = 8;
+  Fwd(I.getParent(), &I, 0, Budget);
 }
 
 void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {

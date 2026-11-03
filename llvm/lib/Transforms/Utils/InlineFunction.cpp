@@ -2039,10 +2039,126 @@ static cl::opt<bool> InlineLastUseForward(
              "after the call site for return paths of the inlined body "
              "without a carrier"));
 
+static cl::opt<bool> InlineLastUsePaths(
+    "mem-inline-last-use-paths", cl::init(true), cl::Hidden,
+    cl::desc("M5r R8 (D60): place a call carrier's loan ids on the last "
+             "carrier of every path of the inlined body (joins included), not "
+             "only on single-predecessor chains"));
+
+static void mergeLU(Instruction &To, MDNode *LU) {
+  SmallVector<Metadata *, 4> Ids;
+  SmallPtrSet<Metadata *, 4> Seen;
+  if (MDNode *Old = To.getMetadata(memannot::LastUseMD))
+    for (const MDOperand &Op : Old->operands())
+      if (Seen.insert(Op.get()).second)
+        Ids.push_back(Op.get());
+  for (const MDOperand &Op : LU->operands())
+    if (Seen.insert(Op.get()).second)
+      Ids.push_back(Op.get());
+  To.setMetadata(memannot::LastUseMD, MDNode::get(To.getContext(), Ids));
+}
+
+// The first carrier after the call site on its straight-line continuation
+// (R7 D53), or null.
+static Instruction *carrierAfterCall(CallBase &CB) {
+  BasicBlock *B = CB.getParent();
+  Instruction *From = &CB;
+  if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+    B = II->getNormalDest();
+    From = nullptr;
+    if (!B->getSinglePredecessor())
+      return nullptr;
+  }
+  for (unsigned Steps = 0; B && Steps < 4; ++Steps) {
+    for (auto It = From ? std::next(From->getIterator()) : B->begin(),
+              E = B->end();
+         It != E; ++It)
+      if (isLastUseCarrier(*It))
+        return &*It;
+    Instruction *T = B->getTerminator();
+    if (!T || T->getNumSuccessors() != 1)
+      return nullptr;
+    BasicBlock *S = T->getSuccessor(0);
+    if (S == B || !S->getSinglePredecessor())
+      return nullptr;
+    B = S;
+    From = nullptr;
+  }
+  return nullptr;
+}
+
+// R8 (D60): NC = blocks of the inlined body from which every path reaches the
+// body's exit without a carrier. The loans end at the last carrier of each
+// block outside NC whose successors are all in NC: after it, no memory access
+// happens on any path before the call returns (a block in a loop with a
+// carrier never qualifies: the loop path back to it has a carrier). If the
+// body's entry is in NC, some path has no carrier at all: the ids also go
+// after the call (D53). Returns false if the body is too large or nothing
+// took the ids (the R7 per-return walk is tried then).
+static bool moveLastUseOnPaths(CallBase &CB, Function::iterator FirstNewBlock,
+                               MDNode *LU) {
+  Function *Caller = CB.getFunction();
+  SmallVector<BasicBlock *, 32> Body;
+  for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI) {
+    Body.push_back(&*BI);
+    if (Body.size() > 128)
+      return false;
+  }
+  if (Body.empty())
+    return false;
+  SmallPtrSet<BasicBlock *, 32> InBody(Body.begin(), Body.end());
+  auto HasCarrier = [](BasicBlock *B) {
+    for (Instruction &I : *B)
+      if (isLastUseCarrier(I))
+        return true;
+    return false;
+  };
+  SmallPtrSet<BasicBlock *, 32> NC;
+  for (bool Changed = true; Changed;) {
+    Changed = false;
+    for (BasicBlock *B : Body) {
+      if (NC.count(B) || HasCarrier(B))
+        continue;
+      bool All = true;
+      for (BasicBlock *S : successors(B))
+        All &= InBody.count(S) && NC.count(S);
+      if (All) {
+        NC.insert(B);
+        Changed = true;
+      }
+    }
+  }
+  bool Placed = false;
+  for (BasicBlock *B : Body) {
+    if (NC.count(B))
+      continue;
+    bool All = true;
+    for (BasicBlock *S : successors(B))
+      All &= InBody.count(S) && NC.count(S);
+    if (!All)
+      continue;
+    for (Instruction &I : reverse(*B))
+      if (isLastUseCarrier(I)) {
+        mergeLU(I, LU);
+        Placed = true;
+        break;
+      }
+  }
+  if (NC.count(Body.front()) && InlineLastUseForward)
+    if (Instruction *A = carrierAfterCall(CB)) {
+      mergeLU(*A, LU);
+      Placed = true;
+    }
+  return Placed;
+}
+
 static void moveLastUseIntoInlinedBody(CallBase &CB,
-                                       ArrayRef<ReturnInst *> Returns) {
+                                       ArrayRef<ReturnInst *> Returns,
+                                       Function::iterator FirstNewBlock) {
   MDNode *LU = CB.getMetadata(memannot::LastUseMD);
   if (!LU)
+    return;
+  if (InlineLastUsePaths && moveLastUseOnPaths(CB, FirstNewBlock, LU))
     return;
   LLVMContext &Ctx = CB.getContext();
   bool AfterSearched = false;
@@ -3229,7 +3345,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
     moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
     rekeyInlinedLoans(FirstNewBlock, Caller);
-    moveLastUseIntoInlinedBody(CB, Returns);
+    moveLastUseIntoInlinedBody(CB, Returns, FirstNewBlock);
 
     // For 'nodebug' functions, the associated DISubprogram is always null.
     // Conservatively avoid propagating the callsite debug location to

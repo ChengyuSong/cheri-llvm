@@ -112,6 +112,14 @@ static cl::opt<bool> NarrowTagCheckUserFrame(
     "cheri-narrow-tag-check-user-frame", cl::init(true), cl::Hidden,
     cl::desc("M5r R7 (D54): the D46 trap record names the innermost inlined "
              "frame outside the Rust library"));
+static cl::opt<bool> NarrowTagCheckConst(
+    "cheri-narrow-tag-check-const", cl::init(false), cl::Hidden,
+    cl::desc("M5r R8 (D61): also tag-check narrowings with a constant length"));
+static cl::opt<bool> NarrowTagCheckHoist(
+    "cheri-narrow-tag-check-hoist", cl::init(true), cl::Hidden,
+    cl::desc("M5r R8 (D61): hoist loop-invariant checked narrowings to the "
+             "preheader"));
+static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0;
 static unsigned NarrowTagChecks = 0;
 static void runNarrowTagCheck(Module &M) {
   if (!NarrowTagCheck)
@@ -126,7 +134,39 @@ static void runNarrowTagCheck(Module &M) {
       if (auto *II = dyn_cast<IntrinsicInst>(&I))
         if (II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact)
           Ns.push_back(II);
+    std::unique_ptr<DominatorTree> DT;
+    std::unique_ptr<LoopInfo> LI;
+    if (!Ns.empty() && NarrowTagCheckHoist) {
+      DT = std::make_unique<DominatorTree>(F);
+      LI = std::make_unique<LoopInfo>(*DT);
+    }
     for (IntrinsicInst *N : Ns) {
+      // R8 (D61): a constant length is the common safe case (a field or
+      // array of known size); only variable lengths are checked unless
+      // -cheri-narrow-tag-check-const.
+      if (!NarrowTagCheckConst && isa<ConstantInt>(N->getArgOperand(1))) {
+        ++NarrowTagSkippedConst;
+        continue;
+      }
+      // R8 (D61): a narrowing with loop-invariant operands whose block runs
+      // on every iteration moves to the preheader with its check (the first
+      // iteration would have run it; the value is the same every time).
+      if (LI)
+        while (Loop *L = LI->getLoopFor(N->getParent())) {
+          BasicBlock *PH = L->getLoopPreheader();
+          if (!PH || !L->isLoopInvariant(N->getArgOperand(0)) ||
+              !L->isLoopInvariant(N->getArgOperand(1)))
+            break;
+          SmallVector<BasicBlock *, 4> Exiting;
+          L->getExitingBlocks(Exiting);
+          bool Dom = true;
+          for (BasicBlock *E : Exiting)
+            Dom &= DT->dominates(N->getParent(), E);
+          if (!Dom)
+            break;
+          N->moveBefore(PH->getTerminator()->getIterator());
+          ++NarrowTagHoisted;
+        }
       std::string File = F.getName().str();
       unsigned Line = 0, Col = 0;
       if (const DILocation *DL = N->getDebugLoc()) {
@@ -1560,7 +1600,9 @@ struct Lowering {
            << " recovered=" << S.Recovered
            << " recovered_markers=" << S.RecoveredMarkers
            << " trap_mapped=" << S.TrapMapped
-           << " narrow_tag_checks=" << NarrowTagChecks << " claims=" << S.Claims
+           << " narrow_tag_checks=" << NarrowTagChecks
+           << " narrow_tag_const_skipped=" << NarrowTagSkippedConst
+           << " narrow_tag_hoisted=" << NarrowTagHoisted << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof
