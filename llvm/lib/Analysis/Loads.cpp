@@ -898,6 +898,9 @@ bool llvm::isReadOnlyLoop(
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
         if (!isDereferenceableAndAlignedInLoop(LI, L, *SE, *DT, AC, Predicates))
           NonDereferenceableAndAlignedLoads.push_back(LI);
+      } else if (auto *II = dyn_cast<IntrinsicInst>(&I);
+                 II && II->getIntrinsicID() == Intrinsic::mem_fact) {
+        continue; // [LLM-generated] M5r: annotation, not a memory access.
       } else if (I.mayReadFromMemory() || I.mayWriteToMemory() ||
                  I.mayThrow()) {
         return false;

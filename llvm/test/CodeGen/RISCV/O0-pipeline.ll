@@ -25,6 +25,8 @@
 ; CHECK-NEXT:       Expand Atomic instructions
 ; CHECK-NEXT:       RISC-V Zacas ABI fix 
 ; CHECK-NEXT:       CHERIoT zero sret
+; CHECK-NEXT:     RISC-V CHERI bounds lowering (M5r stub)
+; CHECK-NEXT:     FunctionPass Manager
 ; CHECK-NEXT:       CHERI add bounds to alloca instructions
 ; CHECK-NEXT:       Module Verifier
 ; CHECK-NEXT:       Lower Garbage Collection Instructions

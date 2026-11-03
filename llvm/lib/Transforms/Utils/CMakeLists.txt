@@ -14,6 +14,10 @@ add_llvm_component_library(LLVMTransformUtils
   CanonicalizeFreezeInLoops.cpp
   CheriSetBounds.cpp
   CheriLogSetBoundsPass.cpp
+  CheriBoundsLowering.cpp
+  CheriInvalidate.cpp
+  CheriSkipNarrow.cpp
+  MemAnnotCensus.cpp
   CloneFunction.cpp
   CloneModule.cpp
   CodeExtractor.cpp

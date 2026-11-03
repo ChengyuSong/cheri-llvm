@@ -1395,6 +1395,13 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
       continue;
     }
 
+    // [LLM-generated] M5r: llvm.mem.fact only writes inaccessible memory, for
+    // the same reason as assume; it must not bump the memory generation.
+    if (match(&Inst, m_Intrinsic<Intrinsic::mem_fact>())) {
+      LLVM_DEBUG(dbgs() << "EarlyCSE skipping mem.fact: " << Inst << '\n');
+      continue;
+    }
+
     // Skip sideeffect intrinsics, for the same reason as assume intrinsics.
     if (match(&Inst, m_Intrinsic<Intrinsic::sideeffect>())) {
       LLVM_DEBUG(dbgs() << "EarlyCSE skipping sideeffect: " << Inst << '\n');

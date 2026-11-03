@@ -43,6 +43,7 @@ add_llvm_component_library(LLVMCore
   InlineAsm.cpp
   Instruction.cpp
   Instructions.cpp
+  MemAnnot.cpp
   IntrinsicInst.cpp
   LLVMContext.cpp
   LLVMContextImpl.cpp

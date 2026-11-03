@@ -55,6 +55,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/MemoryModelRelaxationAnnotations.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/Operator.h"
@@ -2372,6 +2373,21 @@ static void sinkLastInstruction(ArrayRef<BasicBlock*> Blocks) {
   I0->moveBefore(*BBEnd, BBEnd->getFirstInsertionPt());
 
   // Update metadata and IR flags, and merge debug locations.
+  // [LLM-generated] M5r R4 (D28): the sunk instruction is the last use of
+  // every loan any of the commoned copies ended (each path reaches it at the
+  // same relative point). Clear the copies' ids so erasing them does not move
+  // the ids back to an earlier carrier.
+  MDNode *LU0 = nullptr;
+  SmallVector<MDNode *, 4> LUs;
+  for (auto *I : Insts)
+    if (MDNode *LU = I->getMetadata(memannot::LastUseMD))
+      LUs.push_back(LU);
+  if (!LUs.empty()) {
+    LU0 = I0->getMetadata(memannot::LastUseMD);
+    for (auto *I : Insts)
+      if (I != I0)
+        I->setMetadata(memannot::LastUseMD, nullptr);
+  }
   for (auto *I : Insts)
     if (I != I0) {
       // The debug location for the "common" instruction is the merged locations
@@ -2392,6 +2408,12 @@ static void sinkLastInstruction(ArrayRef<BasicBlock*> Blocks) {
         (void)Success;
       }
     }
+
+  if (!LUs.empty()) {
+    I0->setMetadata(memannot::LastUseMD, LU0);
+    for (MDNode *LU : LUs)
+      memannot::mergeLastUse(*I0, LU);
+  }
 
   for (User *U : make_early_inc_range(I0->users())) {
     // canSinkLastInstruction checked that all instructions are only used by
@@ -2523,6 +2545,14 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
     auto ProfitableToSinkInstruction = [&](LockstepReverseIterator<true> &LRI) {
       unsigned NumPHIInsts = 0;
       for (Use &U : (*LRI)[0]->operands()) {
+        // [LLM-generated] M5r: PHIs of "mem.check" operands are free (the
+        // bundle is stripped before ISel); sinking with markers must cost the
+        // same as without them.
+        if (auto *CB = dyn_cast<CallBase>(U.getUser());
+            CB && CB->isBundleOperand(U.getOperandNo()) &&
+            CB->getBundleOpInfoForOperand(U.getOperandNo()).Tag->getKey() ==
+                "mem.check")
+          continue;
         auto It = PHIOperands.find(&U);
         if (It != PHIOperands.end() && !all_of(It->second, [&](Value *V) {
               return InstructionsToSink.contains(V);

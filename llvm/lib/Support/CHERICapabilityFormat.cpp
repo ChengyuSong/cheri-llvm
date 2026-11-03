@@ -22,10 +22,25 @@ CHERICapabilityFormatBase<Derived, AddressType>::getRequiredTailPadding(
 template <typename AddressType, unsigned MW, unsigned MAX_E>
 AddressType RVYCapabilityFormat<AddressType, MW, MAX_E>::getAlignmentMaskImpl(
     uint64_t Length) {
-  static constexpr unsigned int IE_TAKE_BITS = 3;
-
   if (Length == 0)
     return RVYCapabilityFormat::AddressMask;
+
+  // Rounding Length up to the alignment implied by its own exponent can carry
+  // into the next exponent (e.g. 0x1ff9 rounds to 0x2000). CRAM/CRRL in the
+  // hardware use the exponent of the rounded length, so recompute from it.
+  AddressType Mask = getAlignmentMaskForExponentOf(Length);
+  uint64_t Rounded = (Length + static_cast<uint64_t>(~Mask)) &
+                     static_cast<uint64_t>(Mask);
+  if (Rounded == Length || Rounded == 0)
+    return Mask;
+  return getAlignmentMaskForExponentOf(Rounded);
+}
+
+template <typename AddressType, unsigned MW, unsigned MAX_E>
+AddressType
+RVYCapabilityFormat<AddressType, MW, MAX_E>::getAlignmentMaskForExponentOf(
+    uint64_t Length) {
+  static constexpr unsigned int IE_TAKE_BITS = 3;
 
   // Extract bits that overflow the uncompressed mantissa window.
   uint64_t Slice = static_cast<uint64_t>(Length) >> (MW - 1);

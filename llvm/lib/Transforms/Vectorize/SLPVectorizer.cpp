@@ -26306,6 +26306,7 @@ void BoUpSLP::BlockScheduling::initScheduleData(Instruction *FromI,
         !CanIgnoreLoad(I) &&
         (!isa<IntrinsicInst>(I) ||
          (cast<IntrinsicInst>(I)->getIntrinsicID() != Intrinsic::sideeffect &&
+          cast<IntrinsicInst>(I)->getIntrinsicID() != Intrinsic::mem_fact &&
           cast<IntrinsicInst>(I)->getIntrinsicID() !=
               Intrinsic::pseudoprobe))) {
       // Update the linked list of memory accessing instructions.

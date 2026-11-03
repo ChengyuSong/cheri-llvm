@@ -1220,7 +1220,10 @@ static bool areAllLoadsDereferenceable(VPBasicBlock *HeaderVPBB, Loop *TheLoop,
     for (VPRecipeBase &R : *VPBB) {
       auto *VPI = dyn_cast<VPInstructionWithType>(&R);
       if (!VPI || VPI->getOpcode() != Instruction::Load) {
-        assert(!R.mayReadFromMemory() && "unexpected recipe reading memory");
+        // [LLM-generated] M5r: llvm.mem.fact annotations are allowed.
+        assert((!R.mayReadFromMemory() ||
+                match(&R, m_Intrinsic<Intrinsic::mem_fact>())) &&
+               "unexpected recipe reading memory");
         continue;
       }
 
@@ -1694,7 +1697,9 @@ bool VPlanTransforms::handleMaxMinNumReductions(VPlan &Plan) {
            Plan.getVectorLoopRegion()->getEntryBasicBlock())) {
     auto *VPBB = cast<VPBasicBlock>(VPB);
     for (auto &R : *VPBB) {
-      if (R.mayWriteToMemory() && !match(&R, m_BranchOnCount()))
+      // [LLM-generated] M5r: re-executing an llvm.mem.fact is harmless.
+      if (R.mayWriteToMemory() && !match(&R, m_BranchOnCount()) &&
+          !match(&R, m_Intrinsic<Intrinsic::mem_fact>()))
         return false;
     }
   }

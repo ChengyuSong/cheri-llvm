@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCVTargetTransformInfo.h"
+#include "MCTargetDesc/RISCVCompressedCap.h"
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -3694,6 +3695,28 @@ bool RISCVTTIImpl::shouldCopyAttributeWhenOutliningFrom(
 
 std::optional<Instruction *>
 RISCVTTIImpl::instCombineIntrinsic(InstCombiner &IC, IntrinsicInst &II) const {
+  // CHERI: fold CRRL/CRAM of a constant length, so that IR-level passes (e.g.
+  // removal of unused heap allocations padded to a representable length) see
+  // constants instead of opaque calls.
+  if (II.getIntrinsicID() == Intrinsic::cheri_round_representable_length ||
+      II.getIntrinsicID() == Intrinsic::cheri_representable_alignment_mask) {
+    const APInt *Len;
+    if (ST->hasFeature(RISCV::FeatureVendorXCheri) &&
+        match(II.getArgOperand(0), m_APInt(Len)) && Len->getActiveBits() <= 64) {
+      uint64_t L = Len->getZExtValue();
+      uint64_t R =
+          II.getIntrinsicID() == Intrinsic::cheri_round_representable_length
+              ? RISCVCompressedCap::getRepresentableLength(L, *ST)
+              : RISCVCompressedCap::getAlignmentMask(L, *ST);
+      unsigned BW = II.getType()->getIntegerBitWidth();
+      return IC.replaceInstUsesWith(
+          II, ConstantInt::get(II.getType(),
+                               APInt(BW, R, /*isSigned=*/false,
+                                     /*implicitTrunc=*/true)));
+    }
+    return {};
+  }
+
   // If all operands of a vmv.v.x are constant, fold a bitcast(vmv.v.x) to scale
   // the vmv.v.x, enabling removal of the bitcast. The transform helps avoid
   // creating redundant masks.

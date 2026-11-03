@@ -1373,6 +1373,13 @@ bool LoopVectorizationLegality::blockCanBePredicated(
       continue;
     }
 
+    // [LLM-generated] M5r: a predicated llvm.mem.fact is replicated under the
+    // lane mask (never dropped: a claim must survive).
+    if (match(&I, m_Intrinsic<Intrinsic::mem_fact>())) {
+      MaskedOp.insert(&I);
+      continue;
+    }
+
     // Do not let llvm.experimental.noalias.scope.decl block the vectorization.
     // TODO: there might be cases that it should block the vectorization. Let's
     // ignore those for now.
@@ -1697,6 +1704,10 @@ bool LoopVectorizationLegality::isVectorizableEarlyExitLoop() {
   bool HasSideEffects = false;
   for (auto *BB : TheLoop->blocks())
     for (auto &I : *BB) {
+      // [LLM-generated] M5r: llvm.mem.fact annotations neither write memory
+      // nor trap; they are replicated per lane like any other fact.
+      if (match(&I, m_Intrinsic<Intrinsic::mem_fact>()))
+        continue;
       if (I.mayWriteToMemory()) {
         if (isa<StoreInst>(&I) && cast<StoreInst>(&I)->isSimple()) {
           HasSideEffects = true;

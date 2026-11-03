@@ -54,6 +54,8 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1819,6 +1821,216 @@ static void AddAlignmentAssumptions(CallBase &CB, InlineFunctionInfo &IFI) {
   }
 }
 
+// [LLM-generated] M5r: parameter/return facts carried as attributes are lost
+// when the callee is inlined; re-express them at the call site.
+//   "mem.alloc_inbounds"                 -> llvm.mem.fact "mem.alloc_inbounds"(v)
+//   "mem.untrusted" + dereferenceable(N) -> v' = llvm.mem.claim(v, N, Param|Untrusted)
+//   "mem.claim"="N"                      -> v' = llvm.mem.claim(v, N, Param|Untrusted)
+// A parameter claim replaces the argument in the inliner's value map (so the
+// inlined body uses v');
+// a return claim replaces the uses of the call value. Return facts are
+// attached to the call value and follow the inliner's RAUW.
+static void addMemFact(IRBuilderBase &B, StringRef Tag,
+                       ArrayRef<Value *> Ops) {
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
+  OperandBundleDef OB(Tag.str(), std::vector<Value *>(Ops.begin(), Ops.end()));
+  B.CreateCall(Fact, {}, {OB});
+}
+
+// D13 (R1): the legacy M2 "mem.alloc_inbounds" attribute is converted by
+// default; -mem-annot-inline-legacy-alloc-inbounds=false restores R0.
+static cl::opt<bool> MemAnnotInlineLegacyAllocInbounds(
+    "mem-annot-inline-legacy-alloc-inbounds", cl::init(true), cl::Hidden,
+    cl::desc("M5r: when inlining, turn the legacy mem.alloc_inbounds "
+             "argument/return attribute into a mem.alloc_inbounds fact"));
+
+static uint64_t claimBytes(const AttributeSet &A1, const AttributeSet &A2) {
+  uint64_t Bytes = 0;
+  for (const AttributeSet &A : {A1, A2}) {
+    if (A.hasAttribute("mem.claim")) {
+      uint64_t N = 0;
+      if (!A.getAttribute("mem.claim").getValueAsString().getAsInteger(10, N))
+        Bytes = std::max(Bytes, N);
+    }
+  }
+  if (!Bytes && (A1.hasAttribute("mem.untrusted") ||
+                 A2.hasAttribute("mem.untrusted")))
+    Bytes = std::max(A1.getDereferenceableBytes(), A2.getDereferenceableBytes());
+  return Bytes;
+}
+
+static Value *createMemClaim(IRBuilderBase &B, Value *V, uint64_t Bytes,
+                             uint64_t Kind) {
+  Type *I64 = B.getInt64Ty();
+  return B.CreateIntrinsic(Intrinsic::mem_claim, {V->getType()},
+                           {V, ConstantInt::get(I64, Bytes),
+                            ConstantInt::get(I64, Kind | memannot::CF_Untrusted)});
+}
+
+static void AddMemFactsFromAttributes(CallBase &CB, ValueToValueMapTy &VMap) {
+  Function *Callee = CB.getCalledFunction();
+  AttributeList CalleeAL = Callee->getAttributes(), CallAL = CB.getAttributes();
+  IRBuilder<> B(&CB);
+  auto HasAI = [](const AttributeSet &A1, const AttributeSet &A2) {
+    return MemAnnotInlineLegacyAllocInbounds &&
+           (A1.hasAttribute("mem.alloc_inbounds") ||
+            A2.hasAttribute("mem.alloc_inbounds"));
+  };
+  for (Argument &Arg : Callee->args()) {
+    if (!Arg.getType()->isPointerTy() || Arg.hasPassPointeeByValueCopyAttr() ||
+        Arg.hasInAllocaAttr() || Arg.hasPreallocatedAttr())
+      continue;
+    unsigned N = Arg.getArgNo();
+    AttributeSet A1 = CalleeAL.getParamAttrs(N), A2 = CallAL.getParamAttrs(N);
+    Value *V = CB.getArgOperand(N);
+    // R1: a fact on a stack/global object is implied by the allocation.
+    if (HasAI(A1, A2) &&
+        !memannot::isTriviallyAllocInbounds(V, CB.getDataLayout()))
+      addMemFact(B, memannot::TagAllocInbounds, {V});
+    if (uint64_t Bytes = claimBytes(A1, A2)) {
+      // The inlined body reads the argument through VMap.
+      auto It = VMap.find(&Arg);
+      if (It != VMap.end() && It->second == V)
+        It->second = createMemClaim(B, V, Bytes, memannot::CK_Param);
+    }
+  }
+  if (!CB.getType()->isPointerTy())
+    return;
+  AttributeSet R1 = CalleeAL.getRetAttrs(), R2 = CallAL.getRetAttrs();
+  uint64_t RetBytes = claimBytes(R1, R2);
+  if (!HasAI(R1, R2) && !RetBytes)
+    return;
+  BasicBlock::iterator IP;
+  if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+    BasicBlock *Normal = II->getNormalDest();
+    if (!Normal->getSinglePredecessor())
+      Normal = SplitEdge(II->getParent(), Normal);
+    IP = Normal->getFirstInsertionPt();
+  } else {
+    IP = std::next(CB.getIterator());
+  }
+  IRBuilder<> RB(IP->getParent(), IP);
+  if (HasAI(R1, R2))
+    addMemFact(RB, memannot::TagAllocInbounds, {&CB});
+  if (RetBytes) {
+    Value *C = createMemClaim(RB, &CB, RetBytes, memannot::CK_Ret);
+    CB.replaceUsesWithIf(C, [&](Use &U) {
+      return U.getUser() != C && !memannot::isMemFact(cast<Instruction>(U.getUser()));
+    });
+  }
+}
+
+// [LLM-generated] M5r: move a "mem.check" / "mem.free" bundle that sat on the
+// inlined call onto the matching calls of the inlined body (noreturn calls for
+// a check, deallocation calls for a free), with the census id.
+static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
+                                         Function::iterator FirstNewBlock,
+                                         Function *Caller) {
+  std::optional<OperandBundleUse> MB = CB.getOperandBundle(Tag);
+  if (!MB)
+    return;
+  OperandBundleDef Def(*MB);
+  MDNode *Id = CB.getMetadata(memannot::IdMD);
+  SmallVector<CallBase *, 4> Targets;
+  for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+    for (Instruction &I : *BI)
+      if (auto *C = dyn_cast<CallBase>(&I)) {
+        if (C->getOperandBundle(Tag))
+          continue;
+        if (Tag == memannot::TagCheck ? C->doesNotReturn()
+                                      : memannot::isDeallocCall(*C))
+          Targets.push_back(C);
+      }
+  // [LLM-generated] M5r R4: the inlined allocator shim (__rust_dealloc) may
+  // call a user GlobalAlloc::dealloc that is not a known deallocation
+  // function: the free moves to the inlined calls that take the freed pointer.
+  if (Tag == memannot::TagFree && Targets.empty() && !MB->Inputs.empty()) {
+    const Value *P = MB->Inputs[0]->stripPointerCasts();
+    for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
+      for (Instruction &I : *BI)
+        if (auto *C = dyn_cast<CallBase>(&I))
+          if (!C->getOperandBundle(Tag) && !isa<IntrinsicInst>(C) &&
+              any_of(C->args(), [&](Value *A) {
+                return A->stripPointerCasts() == P;
+              }))
+            Targets.push_back(C);
+  }
+  for (CallBase *C : Targets) {
+    SmallVector<OperandBundleDef, 2> OBs;
+    C->getOperandBundlesAsDefs(OBs);
+    OBs.push_back(Def);
+    CallBase *NewC = CallBase::Create(C, OBs, C->getIterator());
+    NewC->takeName(C);
+    NewC->copyMetadata(*C);
+    if (Id && !NewC->getMetadata(memannot::IdMD))
+      NewC->setMetadata(memannot::IdMD, Id);
+    C->replaceAllUsesWith(NewC);
+    C->eraseFromParent();
+  }
+}
+
+// [LLM-generated] M5r R2 (D16): a call's !mem.last_use means the loans end
+// after the call returns. When the call is inlined, put the ids on the last
+// memory access or call of each return path of the inlined body: walk back
+// from each return through single-predecessor blocks. A path without such an
+// instruction (within the walk limit) loses the ids, which is fail-safe.
+static bool isLastUseCarrier(const Instruction &I) {
+  if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
+      isa<AtomicCmpXchgInst>(I))
+    return true;
+  const auto *C = dyn_cast<CallBase>(&I);
+  if (!C)
+    return false;
+  if (const auto *II = dyn_cast<IntrinsicInst>(C)) {
+    if (isa<MemIntrinsic>(II))
+      return true;
+    return false; // lifetime, debug, assume, annotations, cheri/claim helpers
+  }
+  return true;
+}
+
+static void moveLastUseIntoInlinedBody(CallBase &CB,
+                                       ArrayRef<ReturnInst *> Returns) {
+  MDNode *LU = CB.getMetadata(memannot::LastUseMD);
+  if (!LU)
+    return;
+  LLVMContext &Ctx = CB.getContext();
+  for (ReturnInst *RI : Returns) {
+    Instruction *Found = nullptr;
+    BasicBlock *BB = RI->getParent();
+    Instruction *Start = RI;
+    for (unsigned Steps = 0; BB && Steps < 8 && !Found; ++Steps) {
+      for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
+        if (&*It != Start && isLastUseCarrier(*It)) {
+          Found = &*It;
+          break;
+        }
+      if (Found)
+        break;
+      BB = BB->getSinglePredecessor();
+      if (BB)
+        Start = BB->getTerminator();
+      if (BB && isLastUseCarrier(*Start)) { // invoke terminator
+        Found = Start;
+        break;
+      }
+    }
+    if (!Found)
+      continue; // fail-safe: this path loses the loan end
+    SmallVector<Metadata *, 4> Ids;
+    SmallPtrSet<Metadata *, 4> Seen;
+    if (MDNode *Old = Found->getMetadata(memannot::LastUseMD))
+      for (const MDOperand &Op : Old->operands())
+        if (Seen.insert(Op.get()).second)
+          Ids.push_back(Op.get());
+    for (const MDOperand &Op : LU->operands())
+      if (Seen.insert(Op.get()).second)
+        Ids.push_back(Op.get());
+    Found->setMetadata(memannot::LastUseMD, MDNode::get(Ctx, Ids));
+  }
+}
+
 static void HandleByValArgumentInit(Type *ByValType, Value *Dst, Value *Src,
                                     MaybeAlign SrcAlign, Module *M,
                                     BasicBlock *InsertBlock,
@@ -2614,6 +2826,11 @@ llvm::InlineResult llvm::CanInlineCallSite(const CallBase &CB,
         IFI.ConvergenceControlToken = OBUse.Inputs[0].get();
         continue;
       }
+      // [LLM-generated] M5r: a "mem.check" marker is moved onto the inlined
+      // body's noreturn calls (see InlineFunctionImpl).
+      if (OBUse.getTagName() == memannot::TagCheck ||
+          OBUse.getTagName() == memannot::TagFree)
+        continue;
 
       return InlineResult::failure("unsupported operand bundle");
     }
@@ -2828,6 +3045,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // instructions are actually cloned into the caller so that we can easily
     // check what will be known at the start of the inlined code.
     AddAlignmentAssumptions(CB, IFI);
+    AddMemFactsFromAttributes(CB, VMap); // [LLM-generated] M5r
 
     AssumptionCache *AC =
         IFI.GetAssumptionCache ? &IFI.GetAssumptionCache(*Caller) : nullptr;
@@ -2918,6 +3136,12 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
         ICS->eraseFromParent();
       }
     }
+
+    // [LLM-generated] M5r: keep "mem.check" / "mem.free" markers that sat on
+    // the call.
+    moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
+    moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
+    moveLastUseIntoInlinedBody(CB, Returns);
 
     // For 'nodebug' functions, the associated DISubprogram is always null.
     // Conservatively avoid propagating the callsite debug location to

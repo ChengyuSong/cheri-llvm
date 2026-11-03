@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "LLVMContextImpl.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -629,24 +630,41 @@ CallBase *CallBase::removeOperandBundleAt(CallBase *CB, size_t Offset,
   return Create(CB, Bundles, InsertPt);
 }
 
+// [LLM-generated] M5r: "mem." annotation bundles (llvm/IR/MemAnnot.h) are
+// pure information; they neither read nor clobber memory.
+static bool hasNonMemBundlesOtherThan(const CallBase &CB,
+                                      ArrayRef<uint32_t> IDs) {
+  for (unsigned I = 0, E = CB.getNumOperandBundles(); I != E; ++I) {
+    OperandBundleUse OBU = CB.getOperandBundleAt(I);
+    if (is_contained(IDs, OBU.getTagID()))
+      continue;
+    if (memannot::isMemTag(OBU.getTagName()))
+      continue;
+    return true;
+  }
+  return false;
+}
+
 bool CallBase::hasReadingOperandBundles() const {
   // Implementation note: this is a conservative implementation of operand
   // bundle semantics, where *any* non-assume operand bundle (other than
   // ptrauth) forces a callsite to be at least readonly.
-  return hasOperandBundlesOtherThan({LLVMContext::OB_ptrauth,
-                                     LLVMContext::OB_kcfi,
-                                     LLVMContext::OB_convergencectrl,
-                                     LLVMContext::OB_deactivation_symbol}) &&
-         getIntrinsicID() != Intrinsic::assume;
+  return hasNonMemBundlesOtherThan(*this, {LLVMContext::OB_ptrauth,
+                                           LLVMContext::OB_kcfi,
+                                           LLVMContext::OB_convergencectrl,
+                                           LLVMContext::OB_deactivation_symbol}) &&
+         getIntrinsicID() != Intrinsic::assume &&
+         getIntrinsicID() != Intrinsic::mem_fact;
 }
 
 bool CallBase::hasClobberingOperandBundles() const {
-  return hasOperandBundlesOtherThan(
-             {LLVMContext::OB_deopt, LLVMContext::OB_funclet,
-              LLVMContext::OB_ptrauth, LLVMContext::OB_kcfi,
-              LLVMContext::OB_convergencectrl,
-              LLVMContext::OB_deactivation_symbol}) &&
-         getIntrinsicID() != Intrinsic::assume;
+  return hasNonMemBundlesOtherThan(
+             *this, {LLVMContext::OB_deopt, LLVMContext::OB_funclet,
+                     LLVMContext::OB_ptrauth, LLVMContext::OB_kcfi,
+                     LLVMContext::OB_convergencectrl,
+                     LLVMContext::OB_deactivation_symbol}) &&
+         getIntrinsicID() != Intrinsic::assume &&
+         getIntrinsicID() != Intrinsic::mem_fact;
 }
 
 MemoryEffects CallBase::getMemoryEffects() const {
@@ -737,14 +755,17 @@ CaptureInfo CallBase::getCaptureInfo(unsigned OpNo) const {
     return CI;
   }
 
-  // Bundles on assumes are captures(none).
-  if (getIntrinsicID() == Intrinsic::assume)
+  // Bundles on assumes (and M5r mem.fact) are captures(none).
+  if (getIntrinsicID() == Intrinsic::assume ||
+      getIntrinsicID() == Intrinsic::mem_fact)
     return CaptureInfo::none();
 
-  // deopt operand bundles are captures(none)
+  // deopt and "mem." annotation operand bundles are captures(none)
   auto &BOI = getBundleOpInfoForOperand(OpNo);
   auto OBU = operandBundleFromBundleOpInfo(BOI);
-  return OBU.isDeoptOperandBundle() ? CaptureInfo::none() : CaptureInfo::all();
+  return (OBU.isDeoptOperandBundle() || memannot::isMemTag(OBU.getTagName()))
+             ? CaptureInfo::none()
+             : CaptureInfo::all();
 }
 
 bool CallBase::hasArgumentWithAdditionalReturnCaptureComponents() const {

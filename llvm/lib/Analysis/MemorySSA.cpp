@@ -293,6 +293,7 @@ instructionClobbersQuery(const MemoryDef *MD, const MemoryLocation &UseLoc,
     case Intrinsic::assume:
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
+    case Intrinsic::mem_fact: // [LLM-generated] M5r
       return false;
     case Intrinsic::dbg_declare:
     case Intrinsic::dbg_label:
@@ -1776,6 +1777,7 @@ MemoryUseOrDef *MemorySSA::createNewAccess(Instruction *I,
     case Intrinsic::assume:
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
+    case Intrinsic::mem_fact: // [LLM-generated] M5r: like assume, no access
       return nullptr;
     }
   }

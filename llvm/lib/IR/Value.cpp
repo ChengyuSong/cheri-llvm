@@ -25,6 +25,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/TypedPointerType.h"
@@ -230,6 +231,27 @@ void Value::dropDroppableUse(Use &U) {
       CallInst::BundleOpInfo &BOI = Assume->getBundleOpInfoForOperand(OpNo);
       BOI.Tag = Assume->getContext().pImpl->getOrInsertBundleTag("ignore");
     }
+    return;
+  }
+
+  // [LLM-generated] M5r: a dropped fact keeps its call (for the census) with
+  // the tag renamed to "mem.dropped" and the operand poisoned.
+  if (auto *II = dyn_cast<IntrinsicInst>(U.getUser());
+      II && II->getIntrinsicID() == Intrinsic::mem_fact) {
+    unsigned OpNo = U.getOperandNo();
+    U.set(PoisonValue::get(U.get()->getType()));
+    CallInst::BundleOpInfo &BOI = II->getBundleOpInfoForOperand(OpNo);
+    BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag("mem.dropped");
+    return;
+  }
+  // [LLM-generated] M5r: a "mem.check" base whose object was promoted out of
+  // memory: poison the operand, keep the marker (the late pass then keeps the
+  // software check).
+  if (auto *CB = dyn_cast<CallBase>(U.getUser());
+      CB && CB->isBundleOperand(U.getOperandNo()) &&
+      memannot::isMemTag(CB->getBundleOpInfoForOperand(U.getOperandNo())
+          .Tag->getKey())) {
+    U.set(PoisonValue::get(U.get()->getType()));
     return;
   }
 
@@ -697,7 +719,9 @@ static const Value *stripPointerCastsAndOffsets(
         // special case.
         if (StripKind == PSK_ForAliasAnalysis &&
             (Call->getIntrinsicID() == Intrinsic::launder_invariant_group ||
-             Call->getIntrinsicID() == Intrinsic::strip_invariant_group)) {
+             Call->getIntrinsicID() == Intrinsic::strip_invariant_group ||
+             // [LLM-generated] M5r: llvm.mem.claim returns its argument.
+             Call->getIntrinsicID() == Intrinsic::mem_claim)) {
           V = Call->getArgOperand(0);
           continue;
         }

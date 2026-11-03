@@ -2802,6 +2802,8 @@ void LoopVectorizationCostModel::collectLoopUniforms(ElementCount VF) {
         case Intrinsic::sideeffect:
         case Intrinsic::experimental_noalias_scope_decl:
         case Intrinsic::assume:
+        case Intrinsic::mem_fact: // [LLM-generated] M5r
+        case Intrinsic::mem_claim:
         case Intrinsic::lifetime_start:
         case Intrinsic::lifetime_end:
           if (TheLoop->hasLoopInvariantOperands(&I))

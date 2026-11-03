@@ -2152,7 +2152,10 @@ static void computeKnownBitsFromOperator(const Operator *I,
     if (std::optional<ConstantRange> Range = CB->getRange())
       Known = Known.unionWith(Range->toKnownBits());
 
-    if (const Value *RV = CB->getReturnedArgOperand()) {
+    const Value *RV = CB->getReturnedArgOperand();
+    if (!RV && CB->getIntrinsicID() == Intrinsic::mem_claim) // [LLM-generated]
+      RV = CB->getArgOperand(0);
+    if (RV) {
       if (RV->getType() == I->getType()) {
         computeKnownBits(RV, Known2, Q, Depth + 1);
         Known = Known.unionWith(Known2);
@@ -3733,6 +3736,9 @@ static bool isKnownNonZeroFromOperator(const Operator *I,
       if (const Value *RV = Call->getReturnedArgOperand())
         if (RV->getType() == I->getType() && isKnownNonZero(RV, Q, Depth))
           return true;
+      if (Call->getIntrinsicID() == Intrinsic::mem_claim && // [LLM-generated]
+          isKnownNonZero(Call->getArgOperand(0), Q, Depth))
+        return true;
     }
 
     if (auto *II = dyn_cast<IntrinsicInst>(I)) {
@@ -7158,6 +7164,7 @@ bool llvm::isIntrinsicReturningPointerAliasingArgumentWithoutCapturing(
   case Intrinsic::cheri_bounded_stack_cap_dynamic:
   case Intrinsic::launder_invariant_group:
   case Intrinsic::strip_invariant_group:
+  case Intrinsic::mem_claim: // [LLM-generated] M5r: returns its argument
   case Intrinsic::aarch64_irg:
   case Intrinsic::aarch64_tagp:
   // The amdgcn_make_buffer_rsrc function does not alter the address of the

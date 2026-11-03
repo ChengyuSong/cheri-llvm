@@ -22,6 +22,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -648,6 +649,8 @@ static Instruction *GetLoopInvariantInsertPosition(Loop *L, Instruction *Hint) {
 
 /// Replace the UseInst with a loop invariant expression if it is safe.
 bool SimplifyIndvar::replaceIVUserWithLoopInvariant(Instruction *I) {
+  if (memannot::isMemClaim(I)) // [LLM-generated] M5r R1: see eliminateIdentitySCEV
+    return false;
   if (!SE->isSCEVable(I->getType()))
     return false;
 
@@ -751,6 +754,10 @@ bool SimplifyIndvar::replaceFloatIVWithIntegerIV(Instruction *UseInst) {
 /// Eliminate any operation that SCEV can prove is an identity function.
 bool SimplifyIndvar::eliminateIdentitySCEV(Instruction *UseInst,
                                            Instruction *IVOperand) {
+  // [LLM-generated] M5r R1: a claim has its operand's SCEV, but replacing it
+  // with the IV would drop the claim's information; keep it (the stub strips it).
+  if (memannot::isMemClaim(UseInst))
+    return false;
   if (!SE->isSCEVable(UseInst->getType()) ||
       UseInst->getType() != IVOperand->getType())
     return false;

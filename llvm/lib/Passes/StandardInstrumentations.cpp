@@ -42,6 +42,7 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include <utility>
 #include <vector>
 
@@ -2507,8 +2508,76 @@ void PrintCrashIRInstrumentation::registerCallbacks(
       });
 }
 
+// [LLM-generated] M5r R1: -mem-annot-census-per-pass. Counts annotations in
+// the functions of each pass's IR unit before and after the pass and records
+// the change (wrappers/adaptors are skipped so nested passes count once).
+// Functions deleted outside the unit (e.g. dead callees after inlining) are
+// not attributed; the late census reports the residual.
+namespace {
+struct MemAnnotUnitCount {
+  const Module *M = nullptr;
+  unsigned C[memannot::NumCensusKinds] = {};
+};
+MemAnnotUnitCount countMemAnnotUnit(Any IR) {
+  MemAnnotUnitCount U;
+  auto Fn = [&](const Function &F) {
+    U.M = F.getParent();
+    memannot::countAnnotations(F, U.C);
+  };
+  if (const auto *M = unwrapIR<Module>(IR)) {
+    U.M = M;
+    for (const Function &F : *M)
+      memannot::countAnnotations(F, U.C);
+  } else if (const auto *F = unwrapIR<Function>(IR)) {
+    Fn(*F);
+  } else if (const auto *C = unwrapIR<LazyCallGraph::SCC>(IR)) {
+    for (const LazyCallGraph::Node &N : *C)
+      Fn(N.getFunction());
+  } else if (const auto *L = unwrapIR<Loop>(IR)) {
+    Fn(*L->getHeader()->getParent());
+  }
+  return U;
+}
+bool memAnnotSkipPass(StringRef P) {
+  for (StringRef S : {"PassManager", "PassAdaptor", "RepeatedPass", "DevirtSCC",
+                      "InlinerWrapperPass", "RequireAnalysisPass",
+                      "InvalidateAnalysisPass", "VerifierPass", "PrintModulePass",
+                      "PrintFunctionPass"})
+    if (P.contains(S))
+      return true;
+  return false;
+}
+void registerMemAnnotPerPass(PassInstrumentationCallbacks &PIC) {
+  auto Stack = std::make_shared<std::vector<MemAnnotUnitCount>>();
+  PIC.registerBeforeNonSkippedPassCallback([Stack](StringRef P, Any IR) {
+    if (memAnnotSkipPass(P))
+      return;
+    memannot::setCurrentPass(P);
+    Stack->push_back(countMemAnnotUnit(IR));
+  });
+  PIC.registerAfterPassCallback(
+      [Stack](StringRef P, Any IR, const PreservedAnalyses &) {
+        if (memAnnotSkipPass(P) || Stack->empty())
+          return;
+        MemAnnotUnitCount B = Stack->back();
+        Stack->pop_back();
+        MemAnnotUnitCount A = countMemAnnotUnit(IR);
+        if (B.M)
+          memannot::notePassDelta(B.M, P, B.C, A.C);
+      });
+  PIC.registerAfterPassInvalidatedCallback(
+      [Stack](StringRef P, const PreservedAnalyses &) {
+        if (memAnnotSkipPass(P) || Stack->empty())
+          return;
+        Stack->pop_back();
+      });
+}
+} // namespace
+
 void StandardInstrumentations::registerCallbacks(
     PassInstrumentationCallbacks &PIC, ModuleAnalysisManager *MAM) {
+  if (memannot::censusPerPass())
+    registerMemAnnotPerPass(PIC);
   PrintIR.registerCallbacks(PIC);
   PrintPass.registerCallbacks(PIC);
   TimePasses.registerCallbacks(PIC);

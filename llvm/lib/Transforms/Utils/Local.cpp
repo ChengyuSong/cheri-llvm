@@ -58,6 +58,7 @@
 #include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/MemoryModelRelaxationAnnotations.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -1530,6 +1531,10 @@ bool llvm::EliminateDuplicatePHINodes(BasicBlock *BB) {
 Align llvm::tryEnforceAlignment(Value *V, Align PrefAlign,
                                 const DataLayout &DL) {
   V = V->stripPointerCasts();
+  // [LLM-generated] M5r R1: llvm.mem.claim returns its argument, so raising
+  // the alignment of the claimed object is as valid as without the claim.
+  while (memannot::isMemClaim(V))
+    V = cast<CallBase>(V)->getArgOperand(0)->stripPointerCasts();
 
   if (AllocaInst *AI = dyn_cast<AllocaInst>(V)) {
     // TODO: Ideally, this function would not be called if PrefAlign is smaller
@@ -2957,9 +2962,17 @@ static void combineMetadata(Instruction *K, const Instruction *J,
 
     // TODO: Assert that this switch is exhaustive for fixed MD kinds.
     switch (Kind) {
-      default:
+      default: {
+        // [LLM-generated] M5r: !mem.last_use / !mem.guard survive a merge only
+        // when both instructions carry the identical node (fail-safe drop).
+        LLVMContext &Ctx = K->getContext();
+        if ((Kind == Ctx.getMDKindID("mem.last_use") ||
+             Kind == Ctx.getMDKindID("mem.guard")) &&
+            KMD == JMD)
+          break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata
         break;
+      }
       case LLVMContext::MD_dbg:
         llvm_unreachable("getAllMetadataOtherThanDebugLoc returned a MD_dbg");
       case LLVMContext::MD_DIAssignID:
@@ -3941,8 +3954,11 @@ bool llvm::canReplaceOperandWithVariable(const Instruction *I, unsigned OpIdx) {
 
     // Constant bundle operands may need to retain their constant-ness for
     // correctness.
+    // [LLM-generated] M5r: "mem.check" operands may become PHIs when
+    // SimplifyCFG sinks/merges failure calls; the late pass reads the site of
+    // each incoming edge. This keeps code generation identical with markers.
     if (CB.isBundleOperand(OpIdx))
-      return false;
+      return CB.getBundleOpInfoForOperand(OpIdx).Tag->getKey() == "mem.check";
 
     if (OpIdx < CB.arg_size()) {
       // Some variadic intrinsics require constants in the variadic arguments,

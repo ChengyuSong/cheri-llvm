@@ -41,8 +41,18 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Vectorize/LoopIdiomVectorize.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include <optional>
 using namespace llvm;
+
+// [LLM-generated] M5r R3 (D23): test-only. Also run the late CHERI pass at
+// OptimizerLast so a front end's emitted IR (rustc --emit=llvm-ir codegen
+// tests) shows its decisions. The codegen-pipeline run then finds no
+// annotations left and does nothing.
+static cl::opt<bool> CheriBoundsLoweringInOpt(
+    "cheri-bounds-lowering-in-opt", cl::Hidden, cl::init(false),
+    cl::desc("Also run the late CHERI pass at the end of the optimization "
+             "pipeline (for tests that check emitted IR)"));
 
 static cl::opt<bool> EnableRedundantCopyElimination(
     "riscv-enable-copyelim",
@@ -132,6 +142,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVQCRelaxMarkingPass(*PR);
   initializeRISCVGatherScatterLoweringPass(*PR);
   initializeRISCVCodeGenPrepareLegacyPassPass(*PR);
+  initializeRISCVCheriBoundsLoweringPass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
   initializeRISCVMergeBaseOffsetOptPass(*PR);
   initializeRISCVOptWInstrsPass(*PR);
@@ -495,6 +506,9 @@ void RISCVPassConfig::addIRPasses() {
   }
 
   addPass(createCheriotZeroSRetPass());
+  // [LLM-generated] M5r R1: the late CHERI pass runs before CheriBoundAllocas
+  // (which then sees the lowered, annotation-free IR) and before LSR.
+  addPass(createRISCVCheriBoundsLoweringPass());
   addPass(createCheriBoundAllocasLegacyPass());
   TargetPassConfig::addIRPasses();
 
@@ -694,6 +708,11 @@ void RISCVTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
     if (Level != OptimizationLevel::O0)
       LPM.addPass(LoopIdiomVectorizePass(LoopIdiomVectorizeStyle::Predicated));
   });
+  if (CheriBoundsLoweringInOpt)
+    PB.registerOptimizerLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
+          MPM.addPass(CheriBoundsLoweringPass());
+        });
 }
 
 yaml::MachineFunctionInfo *

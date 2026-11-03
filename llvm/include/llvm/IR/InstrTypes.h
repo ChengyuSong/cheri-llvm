@@ -1086,6 +1086,10 @@ struct OperandBundleUse {
     if (isDeoptOperandBundle())
       if (A == Attribute::ReadOnly)
         return Inputs[Idx]->getType()->isPointerTy();
+    // [LLM-generated] M5r "mem." annotation bundles neither read nor write.
+    if (getTagName().starts_with("mem.") && getTagName() != "mem.checked")
+      if (A == Attribute::ReadOnly || A == Attribute::ReadNone)
+        return Inputs[Idx]->getType()->isPointerTy();
 
     // Conservative answer:  no operands have any attributes.
     return false;
