@@ -2033,12 +2033,20 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
       }
 }
 
+static cl::opt<bool> InlineLastUseForward(
+    "mem-inline-last-use-forward", cl::init(true), cl::Hidden,
+    cl::desc("M5r R7 (D53): a call carrier's loan ids go to the next carrier "
+             "after the call site for return paths of the inlined body "
+             "without a carrier"));
+
 static void moveLastUseIntoInlinedBody(CallBase &CB,
                                        ArrayRef<ReturnInst *> Returns) {
   MDNode *LU = CB.getMetadata(memannot::LastUseMD);
   if (!LU)
     return;
   LLVMContext &Ctx = CB.getContext();
+  bool AfterSearched = false;
+  Instruction *After = nullptr;
   for (ReturnInst *RI : Returns) {
     Instruction *Found = nullptr;
     BasicBlock *BB = RI->getParent();
@@ -2058,6 +2066,42 @@ static void moveLastUseIntoInlinedBody(CallBase &CB,
         Found = Start;
         break;
       }
+    }
+    if (!Found && InlineLastUseForward) {
+      // R7 (D53): no carrier on this return path of the body: the loans end
+      // at the next carrier after the call site (a later end is never too
+      // early; only straight-line, unique-predecessor continuations).
+      if (!AfterSearched) {
+        AfterSearched = true;
+        BasicBlock *B = CB.getParent();
+        Instruction *From = &CB;
+        if (auto *II = dyn_cast<InvokeInst>(&CB)) {
+          B = II->getNormalDest();
+          From = nullptr;
+          if (!B->getSinglePredecessor())
+            B = nullptr;
+        }
+        for (unsigned Steps = 0; B && Steps < 4 && !After; ++Steps) {
+          for (auto It = From ? std::next(From->getIterator()) : B->begin(),
+                    E = B->end();
+               It != E; ++It)
+            if (isLastUseCarrier(*It)) {
+              After = &*It;
+              break;
+            }
+          if (After)
+            break;
+          Instruction *T = B->getTerminator();
+          if (!T || T->getNumSuccessors() != 1)
+            break;
+          BasicBlock *S = T->getSuccessor(0);
+          if (S == B || !S->getSinglePredecessor())
+            break;
+          B = S;
+          From = nullptr;
+        }
+      }
+      Found = After;
     }
     if (!Found)
       continue; // fail-safe: this path loses the loan end

@@ -154,6 +154,16 @@ void llvm::memannot::mergeLastUse(Instruction &To, MDNode *LU) {
   To.setMetadata(LastUseMD, MDNode::get(To.getContext(), Ids));
 }
 
+// [LLM-generated] M5r R7 (D52): a carrier that accesses a stack slot used to
+// keep its ids only while the slot lived (SROA promoting that slot erased
+// them). The ids name loans of *other* slots, which may survive SROA (e.g. a
+// loan whose last use is the store of a call result into a promoted return
+// slot), so they now move like any other carrier's.
+static cl::opt<bool> MemLastUseTransferAlloca(
+    "mem-last-use-transfer-alloca", cl::init(true), cl::Hidden,
+    cl::desc("M5r R7 (D52): also move !mem.last_use off an erased load/store "
+             "of a stack slot (promoted by SROA/mem2reg)"));
+
 static void transferLastUse(Instruction &I) {
   if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
     return;
@@ -165,7 +175,7 @@ static void transferLastUse(Instruction &I) {
     P = LI->getPointerOperand();
   else if (auto *SI = dyn_cast<StoreInst>(&I))
     P = SI->getPointerOperand();
-  for (unsigned D = 0; P && D < 8; ++D) {
+  for (unsigned D = 0; P && !MemLastUseTransferAlloca && D < 8; ++D) {
     P = P->stripPointerCasts();
     if (isa<AllocaInst>(P))
       return;
