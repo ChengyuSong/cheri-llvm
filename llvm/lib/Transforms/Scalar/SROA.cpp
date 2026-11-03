@@ -4059,6 +4059,11 @@ private:
     }
     NewSI->copyMetadata(SI, {LLVMContext::MD_mem_parallel_loop_access,
                              LLVMContext::MD_access_group});
+    // [LLM-generated] M5r R5 (D35): the rewritten store of a reference into
+    // the new (smaller) slot keeps its loan slot fact.
+    if (MDNode *Loan = SI.getMetadata(memannot::LoanMD))
+      if (NewSI->getValueOperand()->getType()->isPointerTy())
+        NewSI->setMetadata(memannot::LoanMD, Loan);
     if (AATags)
       NewSI->setAAMetadata(AATags.adjustForAccess(NewBeginOffset - BeginOffset,
                                                   V->getType(), DL));
