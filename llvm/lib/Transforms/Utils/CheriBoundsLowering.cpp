@@ -108,6 +108,10 @@ static cl::opt<bool> NarrowTagCheck(
     "cheri-narrow-tag-check", cl::init(false), cl::Hidden,
     cl::desc("M5r R6 (D46): fault at a user exact narrowing that loses the "
              "tag (diagnostic; costs a tag test per manual narrowing)"));
+static cl::opt<bool> NarrowTagCheckUserFrame(
+    "cheri-narrow-tag-check-user-frame", cl::init(true), cl::Hidden,
+    cl::desc("M5r R7 (D54): the D46 trap record names the innermost inlined "
+             "frame outside the Rust library"));
 static unsigned NarrowTagChecks = 0;
 static void runNarrowTagCheck(Module &M) {
   if (!NarrowTagCheck)
@@ -126,6 +130,18 @@ static void runNarrowTagCheck(Module &M) {
       std::string File = F.getName().str();
       unsigned Line = 0, Col = 0;
       if (const DILocation *DL = N->getDebugLoc()) {
+        // R7 (D54): with line tables the narrowing usually sits in an inlined
+        // library wrapper (core::arch::cheri); report the innermost frame
+        // outside the Rust library (the user's call), else the innermost one.
+        if (NarrowTagCheckUserFrame)
+          for (const DILocation *D = DL; D; D = D->getInlinedAt()) {
+            StringRef FN = D->getFilename();
+            if (!FN.contains("library/core/") && !FN.contains("library/alloc/") &&
+                !FN.contains("library/std/")) {
+              DL = D;
+              break;
+            }
+          }
         File = DL->getFilename().str();
         Line = DL->getLine();
         Col = DL->getColumn();
