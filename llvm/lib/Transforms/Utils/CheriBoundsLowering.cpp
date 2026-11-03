@@ -135,10 +135,13 @@ static void runNarrowTagCheck(Module &M) {
         // outside the Rust library (the user's call), else the innermost one.
         if (NarrowTagCheckUserFrame)
           for (const DILocation *D = DL; D; D = D->getInlinedAt()) {
-            StringRef FN = D->getFilename();
-            if (!FN.contains("library/core/") && !FN.contains("library/alloc/") &&
-                !FN.contains("library/std/") && !FN.contains("library/stdarch/") &&
-                !FN.contains("library/portable-simd/")) {
+            // The file may be relative to the DIFile directory (rustc emits
+            // "src/../../stdarch/..." under ".../library/core"): test both.
+            std::string FN = (D->getDirectory() + "/" + D->getFilename()).str();
+            StringRef F(FN);
+            if (!F.contains("library/core/") && !F.contains("library/alloc/") &&
+                !F.contains("library/std/") && !F.contains("/stdarch/") &&
+                !F.contains("library/portable-simd/")) {
               DL = D;
               break;
             }

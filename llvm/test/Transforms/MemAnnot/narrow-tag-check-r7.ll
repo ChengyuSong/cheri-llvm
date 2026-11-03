@@ -18,7 +18,8 @@ define ptr addrspace(200) @user2(ptr addrspace(200) %p, i64 %n) !dbg !10 {
   %q = call ptr addrspace(200) @llvm.cheri.cap.bounds.set.exact.i64(ptr addrspace(200) %p, i64 %n), !dbg !13
   ret ptr addrspace(200) %q
 }
-; R7: core::arch::cheri lives in library/stdarch (seen on s7b): skipped too.
+; R7: core::arch::cheri lives in library/stdarch, named relative to the
+; library/core directory (seen on s7b): skipped too.
 ; CHECK: !{i32 2091511821, i32 50, i32 9, i32 {{[0-9]+}}, [32 x i8] c"src/main.rs\00
 
 !llvm.dbg.cu = !{!0}
@@ -32,7 +33,7 @@ define ptr addrspace(200) @user2(ptr addrspace(200) %p, i64 %n) !dbg !10 {
 !6 = distinct !DISubprogram(name: "bounds_set_exact", scope: !2, file: !2, line: 5, type: !4, spFlags: DISPFlagDefinition, unit: !0)
 !8 = distinct !DILocation(line: 42, column: 13, scope: !5)
 !9 = !DILocation(line: 7, column: 5, scope: !6, inlinedAt: !8)
-!11 = !DIFile(filename: "/w/library/stdarch/crates/core_arch/src/cheri/mod.rs", directory: "")
+!11 = !DIFile(filename: "src/../../stdarch/crates/core_arch/src/cheri/mod.rs", directory: "/w/library/core")
 !10 = distinct !DISubprogram(name: "user2", scope: !1, file: !1, line: 48, type: !4, spFlags: DISPFlagDefinition, unit: !0)
 !12 = distinct !DISubprogram(name: "bounds_set", scope: !11, file: !11, line: 138, type: !4, spFlags: DISPFlagDefinition, unit: !0)
 !14 = distinct !DILocation(line: 50, column: 9, scope: !10)
