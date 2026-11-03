@@ -45,7 +45,7 @@
 ; CHECK-NEXT:       Interleaved Access Pass
 ; CHECK-NEXT:       RISC-V CodeGenPrepare
 ; CHECK-NEXT:       CHERIoT zero sret 
-; CHECK-NEXT:     RISC-V CHERI bounds lowering (M5r stub)
+; CHECK-NEXT:     RISC-V CHERI bounds lowering (M5r)
 ; CHECK-NEXT:     FunctionPass Manager
 ; CHECK-NEXT:       CHERI add bounds to alloca instructions
 ; CHECK-NEXT:       Module Verifier

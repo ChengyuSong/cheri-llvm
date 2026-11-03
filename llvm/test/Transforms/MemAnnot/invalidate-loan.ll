@@ -3,6 +3,9 @@
 ; filters (D37). A frame slot whose every capability store carries the rustc
 ; slot fact !mem.loan !{L} is nulled after the !mem.last_use carrier of L.
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s --check-prefix=LOAN
+; R8 (D57): loan is the default mode.
+; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=LOAN
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=SF
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=scope+free < %s | FileCheck %s --check-prefix=SF
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all < %s | FileCheck %s --check-prefix=ALL
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-loan-skip=false < %s | FileCheck %s --check-prefix=NOSKIP

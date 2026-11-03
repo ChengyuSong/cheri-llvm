@@ -37,8 +37,8 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("none"), cl::Hidden,
-    cl::desc("M5r Track B prototype: none, scope, free, loan, all, or a "
+    "cheri-invalidate", cl::init("loan"), cl::Hidden,
+    cl::desc("M5r Track B: none, scope, free, loan (default, R8 D57), all, or a "
              "'+'-list (scope+free = R4 all)"));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
 // before lifetime.end, or a loan clear) is a dead store to codegen:
