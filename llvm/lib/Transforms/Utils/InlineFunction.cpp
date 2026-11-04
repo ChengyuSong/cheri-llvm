@@ -55,6 +55,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/MemAnnot.h"
+#include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -1929,7 +1930,8 @@ static cl::opt<bool> InlineFreeFact(
     "mem-inline-free-fact", cl::init(true), cl::Hidden,
     cl::desc("M5r R9 (D67): a \"mem.free\" bundle of an inlined call whose body "
              "has no call to carry it becomes an llvm.mem.fact [\"mem.free\"] "
-             "at each return of the inlined body"));
+             "at each return of the inlined body (R9: only when -cheri-invalidate "
+             "includes free)"));
 
 static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
                                          Function::iterator FirstNewBlock,
@@ -1969,7 +1971,7 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
   // as llvm.mem.fact ["mem.free"(p)] where the inlined call would have
   // returned (the free has happened there on every path that returns).
   if (Tag == memannot::TagFree && Targets.empty() && !MB->Inputs.empty() &&
-      InlineFreeFact) {
+      InlineFreeFact && memannot::cheriInvalidateFreeActive()) {
     Function *FactF = Intrinsic::getOrInsertDeclaration(Caller->getParent(),
                                                         Intrinsic::mem_fact);
     for (ReturnInst *R : Returns) {

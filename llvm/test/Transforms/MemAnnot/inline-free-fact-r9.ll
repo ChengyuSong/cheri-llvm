@@ -1,8 +1,9 @@
 ; [LLM-generated] M5r R9 (D67): an inlined deallocator with no call left in its
 ; body (a free-list GlobalAlloc) keeps the free as llvm.mem.fact ["mem.free"]
-; at each return of the inlined body (prefix OFF = R8, the fact is dropped).
+; at each return of the inlined body (prefix OFF = R8, the fact is dropped). R9 (D67 gating): only when -cheri-invalidate includes free (the D69 default loan+free does).
 ; RUN: opt -S -passes=inline < %s | FileCheck %s
 ; RUN: opt -S -passes=inline -mem-inline-free-fact=false < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt -S -passes=inline -cheri-invalidate=loan < %s | FileCheck %s --check-prefix=OFF
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
 @FREE = global i64 0

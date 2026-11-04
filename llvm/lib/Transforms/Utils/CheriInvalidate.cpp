@@ -37,8 +37,9 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("loan"), cl::Hidden,
-    cl::desc("M5r Track B: none, scope, free, loan (default, R8 D57), all, or a "
+    "cheri-invalidate", cl::init("loan+free"), cl::Hidden,
+    cl::desc("M5r Track B: none, scope, free, loan, loan+free (default, R9 "
+             "D69; R8 D57: loan), all, or a "
              "'+'-list (scope+free = R4 all)"));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
 // before lifetime.end, or a loan clear) is a dead store to codegen:
@@ -643,6 +644,13 @@ struct Inv {
   }
 };
 } // namespace
+
+// [LLM-generated] R9 (D67 gating): the inliner keeps an inlined
+// deallocator's free fact only when free mode is on.
+bool memannot::cheriInvalidateFreeActive() {
+  StringRef Mode = InvalidateOpt;
+  return Mode == "all" || Mode.contains("free");
+}
 
 bool memannot::runCheriInvalidate(Module &M) {
   StringRef Mode = InvalidateOpt;
