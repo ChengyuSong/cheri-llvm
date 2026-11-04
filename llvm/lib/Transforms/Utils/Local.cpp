@@ -2949,6 +2949,12 @@ bool llvm::removeUnreachableBlocks(Function &F, DomTreeUpdater *DTU,
   return Changed;
 }
 
+// [LLM-generated] M5r R6 (D44).
+static cl::opt<bool> MemLastUseKeepK(
+    "mem-last-use-keep-k", cl::init(true), cl::Hidden,
+    cl::desc("M5r R6 (D44): CSE keeps the surviving carrier's own "
+             "!mem.last_use when it does not move"));
+
 /// If AAOnly is set, only intersect alias analysis metadata and preserve other
 /// known metadata. Unknown metadata is always dropped.
 static void combineMetadata(Instruction *K, const Instruction *J,
@@ -2966,8 +2972,15 @@ static void combineMetadata(Instruction *K, const Instruction *J,
         // [LLM-generated] M5r: !mem.last_use / !mem.guard survive a merge only
         // when both instructions carry the identical node (fail-safe drop).
         LLVMContext &Ctx = K->getContext();
+        // R6 (D44): a K that stays in place keeps its own loan ends (the
+        // erased J hands its ids on in eraseFromParent). A moving K (hoist,
+        // PRE) keeps only ids common to both.
+        if (Kind == Ctx.getMDKindID("mem.last_use") && !DoesKMove &&
+            MemLastUseKeepK)
+          break;
         if ((Kind == Ctx.getMDKindID("mem.last_use") ||
-             Kind == Ctx.getMDKindID("mem.guard")) &&
+             Kind == Ctx.getMDKindID("mem.guard") ||
+             Kind == Ctx.getMDKindID("mem.loan")) &&
             KMD == JMD)
           break;
         K->setMetadata(Kind, nullptr); // Remove unknown metadata

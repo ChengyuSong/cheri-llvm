@@ -22,6 +22,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 
@@ -139,14 +140,25 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
 // late census can say why a loan id vanished: its carrier accessed a stack
 // slot that was promoted to SSA (nothing left in memory to invalidate), the
 // carrier was deleted for another reason, or the metadata was dropped.
+// R5: loan ids are counted by their original id (the LLVM inliner re-keys a
+// cloned body's ids in the high bits, D35).
+static Metadata *loanKey(Metadata *M) {
+  if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(M))
+    if (C->getBitWidth() == 64)
+      return ConstantAsMetadata::get(
+          ConstantInt::get(C->getType(), C->getZExtValue() & memannot::LoanKeyMask));
+  return M;
+}
+
 struct LUWatch final : CallbackVH {
   SmallVector<Metadata *, 2> Loans;
   WeakVH Alloca; // underlying alloca of a load/store carrier
   bool AllocaAccess = false;
   bool Deleted = false;
+  std::string DelPass; // R7 (D50): the pass that deleted the carrier
   explicit LUWatch(Instruction *I, MDNode *LU) : CallbackVH(I) {
     for (const MDOperand &Op : LU->operands())
-      Loans.push_back(Op.get());
+      Loans.push_back(loanKey(Op.get()));
     if (Value *P = getLoadStorePointerOperand(I))
       if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(P))) {
         Alloca = A;
@@ -155,6 +167,7 @@ struct LUWatch final : CallbackVH {
   }
   void deleted() override {
     Deleted = true;
+    DelPass = CurrentPass.empty() ? std::string("?") : CurrentPass;
     setValPtr(nullptr);
   }
   void allUsesReplacedWith(Value *) override {}
@@ -254,7 +267,7 @@ bool memannot::runCensusStart(Module &M) {
   auto CountLoans = [](Instruction &I, DenseSet<Metadata *> &Set) {
     if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
       for (const MDOperand &Op : LU->operands())
-        Set.insert(Op.get());
+        Set.insert(loanKey(Op.get()));
   };
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
@@ -326,13 +339,21 @@ static void runCensusLateImpl(Module &M) {
   DenseSet<uint64_t> SeenSites;           // "mem.check" sites still present
   unsigned Stripped = 0;                  // checked-callee calls w/o bundle
   DenseSet<Metadata *> LateLoans;
+  DenseSet<Metadata *> LateSlotLoans; // R7 (D50): loans of slots still in memory
+  DenseMap<Metadata *, std::string> SlotLoanFn; // R8: function of the slot
+  unsigned LoanKindID = M.getContext().getMDKindID(memannot::LoanMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
+      if (MDNode *LN = I.getMetadata(LoanKindID))
+        for (const MDOperand &Op : LN->operands()) {
+          LateSlotLoans.insert(loanKey(Op.get()));
+          SlotLoanFn.try_emplace(loanKey(Op.get()), F.getName().str());
+        }
       if (I.getMetadata(memannot::GuardMD))
         ++Late[K_Guard];
       if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
         for (const MDOperand &Op : LU->operands())
-          LateLoans.insert(Op.get());
+          LateLoans.insert(loanKey(Op.get()));
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
@@ -464,6 +485,10 @@ static void runCensusLateImpl(Module &M) {
   }
   // R3 (D18): why each lost loan id vanished.
   unsigned LUPromoted = 0, LUCarrierDeleted = 0, LUDropped = 0;
+  // R7 (D50): the same for loans whose slot survived (Track B can clear it).
+  unsigned SLWith = 0, SLPromoted = 0, SLDeleted = 0, SLDropped = 0, SLNone = 0;
+  std::map<std::string, unsigned> SLByPass;
+  std::vector<std::string> SLLostInfo;
   {
     DenseMap<Metadata *, SmallVector<LUWatch *, 2>> ByLoan;
     auto Add = [&](LUWatch *W) {
@@ -474,6 +499,44 @@ static void runCensusLateImpl(Module &M) {
       Add(W.get());
     for (auto &W : SP->LURetired)
       Add(W.get());
+    for (Metadata *L : LateSlotLoans) {
+      if (LateLoans.count(L)) {
+        ++SLWith;
+        continue;
+      }
+      auto BI = ByLoan.find(L);
+      if (BI == ByLoan.end()) {
+        ++SLNone;
+        if (CensusVerbose)
+          SLLostInfo.push_back(
+              std::to_string(mdconst::extract<ConstantInt>(L)->getZExtValue()) +
+              " none-at-start");
+        continue;
+      }
+      bool Promoted = false, AllDeleted = true;
+      std::set<std::string> Ps;
+      for (LUWatch *W : BI->second) {
+        Promoted |= W->Deleted && W->AllocaAccess && !W->Alloca;
+        AllDeleted &= W->Deleted;
+        if (W->Deleted)
+          Ps.insert(W->DelPass);
+      }
+      if (CensusVerbose) {
+        std::string Why = Promoted ? "promoted" : AllDeleted ? "carrier-deleted" : "md-dropped";
+        for (const std::string &P : Ps)
+          Why += " " + P;
+        SLLostInfo.push_back(std::to_string(
+            mdconst::extract<ConstantInt>(L)->getZExtValue()) + " " + Why);
+      }
+      if (Promoted)
+        ++SLPromoted;
+      else if (AllDeleted) {
+        ++SLDeleted;
+        for (const std::string &P : Ps)
+          ++SLByPass[P];
+      } else
+        ++SLDropped;
+    }
     for (auto &[L, Ws] : ByLoan) {
       if (LateLoans.count(L))
         continue;
@@ -526,6 +589,29 @@ static void runCensusLateImpl(Module &M) {
   if (Stripped)
     LOS << " check-bundle-stripped=" << Stripped;
   LOS.flush();
+  // R7 (D51): survival over the ids that can still be used (promoted slots
+  // have nothing left in memory, so they leave the starting set).
+  {
+    unsigned S = SP->Start[K_LastUse], L = Late[K_LastUse];
+    OS << "mem-annot-census: " << M.getModuleIdentifier()
+       << " last_use-live: start=" << (S > LUPromoted ? S - LUPromoted : 0)
+       << " late=" << L << " promoted=" << LUPromoted << "\n";
+    OS << "mem-annot-census: " << M.getModuleIdentifier()
+       << " slot-loans: live=" << LateSlotLoans.size() << " with_carrier=" << SLWith
+       << " lost(promoted=" << SLPromoted << ",carrier-deleted=" << SLDeleted
+       << ",md-dropped=" << SLDropped << ",none-at-start=" << SLNone << ")";
+    for (auto &[P, N] : SLByPass)
+      OS << " " << P << "=" << N;
+    OS << "\n";
+    for (const std::string &X : SLLostInfo)
+      OS << "mem-annot-census: slot-loan lost: " << X << "\n";
+    if (CensusVerbose)
+      for (Metadata *L : LateSlotLoans)
+        OS << "mem-annot-census: slot-loan fn: "
+           << mdconst::extract<ConstantInt>(L)->getZExtValue() << " "
+           << SlotLoanFn.lookup(L) << " "
+           << (LateLoans.count(L) ? "carrier" : "lost") << "\n";
+  }
   OS << "mem-annot-census: " << M.getModuleIdentifier() << " lost:"
      << (LostStr.empty() ? std::string(" none") : LostStr) << "\n";
   for (const std::string &U : Unexplained)
@@ -571,9 +657,10 @@ bool memannot::stripAnnotations(Module &M) {
   unsigned GuardKind = M.getContext().getMDKindID(memannot::GuardMD);
   unsigned LastUseKind = M.getContext().getMDKindID(memannot::LastUseMD);
   unsigned IdKind = M.getContext().getMDKindID(memannot::IdMD);
+  unsigned LoanKind = M.getContext().getMDKindID(memannot::LoanMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
-      for (unsigned MK : {GuardKind, LastUseKind, IdKind})
+      for (unsigned MK : {GuardKind, LastUseKind, IdKind, LoanKind})
         if (I.getMetadata(MK)) {
           I.setMetadata(MK, nullptr);
           Changed = true;

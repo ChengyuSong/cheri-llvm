@@ -25,6 +25,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
@@ -88,6 +89,141 @@ static cl::opt<bool> BorrowDeref(
     cl::desc("R4: a borrow check whose borrow is only dereferenced in the Ok "
              "block, with no side effect before the access, is treated as an "
              "access check (Vec/SmallVec Index borrows after inlining)"));
+static cl::opt<bool> RecoverConst(
+    "cheri-bounds-recover-const", cl::init(true), cl::Hidden,
+    cl::desc("R5 (D30): a split marker whose index is a constant on its edge "
+             "recovers the constant-offset accesses of its base in its Ok "
+             "block as guards (fully unrolled loops)"));
+static cl::opt<bool> TrapMap(
+    "cheri-trap-map", cl::init(true), cl::Hidden,
+    cl::desc("R5 (trap->panic): tag the accesses whose software check was "
+             "removed with !pcsections \"cheri_trap_map\" (pc -> panic "
+             "location) for the runtime's CHERI-fault handler"));
+// [LLM-generated] M5r R6 (D46): a user (unsafe, manual) exact narrowing of a
+// tagged capability whose result is untagged (the requested bounds are not
+// inside the parent: the ub memcpy s7b) faults at the narrowing instead of at
+// a later access (in memcpy), through a mapped load: the trap map names the
+// function and kind 5 so the handler reports where the narrowing failed.
+static cl::opt<bool> NarrowTagCheck(
+    "cheri-narrow-tag-check", cl::init(false), cl::Hidden,
+    cl::desc("M5r R6 (D46): fault at a user exact narrowing that loses the "
+             "tag (diagnostic; costs a tag test per manual narrowing)"));
+static cl::opt<bool> NarrowTagCheckUserFrame(
+    "cheri-narrow-tag-check-user-frame", cl::init(true), cl::Hidden,
+    cl::desc("M5r R7 (D54): the D46 trap record names the innermost inlined "
+             "frame outside the Rust library"));
+static cl::opt<bool> NarrowTagCheckConst(
+    "cheri-narrow-tag-check-const", cl::init(false), cl::Hidden,
+    cl::desc("M5r R8 (D61): also tag-check narrowings with a constant length"));
+static cl::opt<bool> NarrowTagCheckHoist(
+    "cheri-narrow-tag-check-hoist", cl::init(true), cl::Hidden,
+    cl::desc("M5r R8 (D61): hoist loop-invariant checked narrowings to the "
+             "preheader"));
+static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0;
+static unsigned NarrowTagChecks = 0;
+static void runNarrowTagCheck(Module &M) {
+  if (!NarrowTagCheck)
+    return;
+  LLVMContext &Ctx = M.getContext();
+  unsigned Seq = 0x40000; // distinct from the marker records' seq (20 bits)
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<IntrinsicInst *, 4> Ns;
+    for (Instruction &I : instructions(F))
+      if (auto *II = dyn_cast<IntrinsicInst>(&I))
+        if (II->getIntrinsicID() == Intrinsic::cheri_cap_bounds_set_exact)
+          Ns.push_back(II);
+    std::unique_ptr<DominatorTree> DT;
+    std::unique_ptr<LoopInfo> LI;
+    if (!Ns.empty() && NarrowTagCheckHoist) {
+      DT = std::make_unique<DominatorTree>(F);
+      LI = std::make_unique<LoopInfo>(*DT);
+    }
+    for (IntrinsicInst *N : Ns) {
+      // R8 (D61): a constant length is the common safe case (a field or
+      // array of known size); only variable lengths are checked unless
+      // -cheri-narrow-tag-check-const.
+      if (!NarrowTagCheckConst && isa<ConstantInt>(N->getArgOperand(1))) {
+        ++NarrowTagSkippedConst;
+        continue;
+      }
+      // R8 (D61): a narrowing with loop-invariant operands whose block runs
+      // on every iteration moves to the preheader with its check (the first
+      // iteration would have run it; the value is the same every time).
+      if (LI)
+        while (Loop *L = LI->getLoopFor(N->getParent())) {
+          BasicBlock *PH = L->getLoopPreheader();
+          if (!PH || !L->isLoopInvariant(N->getArgOperand(0)) ||
+              !L->isLoopInvariant(N->getArgOperand(1)))
+            break;
+          SmallVector<BasicBlock *, 4> Exiting;
+          L->getExitingBlocks(Exiting);
+          bool Dom = true;
+          for (BasicBlock *E : Exiting)
+            Dom &= DT->dominates(N->getParent(), E);
+          if (!Dom)
+            break;
+          N->moveBefore(PH->getTerminator()->getIterator());
+          ++NarrowTagHoisted;
+        }
+      std::string File = F.getName().str();
+      unsigned Line = 0, Col = 0;
+      if (const DILocation *DL = N->getDebugLoc()) {
+        // R7 (D54): with line tables the narrowing usually sits in an inlined
+        // library wrapper (core::arch::cheri); report the innermost frame
+        // outside the Rust library (the user's call), else the innermost one.
+        if (NarrowTagCheckUserFrame)
+          for (const DILocation *D = DL; D; D = D->getInlinedAt()) {
+            // The file may be relative to the DIFile directory (rustc emits
+            // "src/../../stdarch/..." under ".../library/core"): test both.
+            std::string FN = (D->getDirectory() + "/" + D->getFilename()).str();
+            StringRef F(FN);
+            if (!F.contains("library/core/") && !F.contains("library/alloc/") &&
+                !F.contains("library/std/") && !F.contains("/stdarch/") &&
+                !F.contains("library/portable-simd/")) {
+              DL = D;
+              break;
+            }
+          }
+        File = DL->getFilename().str();
+        Line = DL->getLine();
+        Col = DL->getColumn();
+      }
+      if (File.size() > 31)
+        File = File.substr(File.size() - 31);
+      File.resize(32, '\0');
+      Type *I32 = Type::getInt32Ty(Ctx);
+      Metadata *Aux[] = {
+          ConstantAsMetadata::get(ConstantInt::get(I32, 0x7ca9f00d)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, Line)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, Col)),
+          ConstantAsMetadata::get(ConstantInt::get(I32, 5 | (++Seq << 12))),
+          ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
+      MDNode *MD = MDNode::get(
+          Ctx, {MDString::get(Ctx, "cheri_trap_map"), MDNode::get(Ctx, Aux)});
+      Instruction *After = N->getNextNode();
+      IRBuilder<> B(After);
+      Function *TagF =
+          Intrinsic::getOrInsertDeclaration(&M, Intrinsic::cheri_cap_tag_get);
+      Value *In = N->getArgOperand(0);
+      Value *Lost = B.CreateAnd(B.CreateCall(TagF, {In}),
+                                B.CreateNot(B.CreateCall(TagF, {N})));
+      Instruction *Then = SplitBlockAndInsertIfThen(Lost, After, true);
+      IRBuilder<> TB(Then);
+      LoadInst *L = TB.CreateLoad(Type::getInt8Ty(Ctx), N, /*isVolatile=*/true);
+      L->setMetadata(LLVMContext::MD_pcsections, MD);
+      ++NarrowTagChecks;
+    }
+  }
+}
+
+// [LLM-generated] M5r R6 (D49, fixes D32): mem facts on a borrow guard do
+// not make the borrow escape (SmallVec Index::index after inlining).
+static cl::opt<bool> BorrowFactUsers(
+    "cheri-bounds-borrow-fact-users", cl::init(true), cl::Hidden,
+    cl::desc("M5r R6 (D49): ignore mem.fact users of a borrow guard when "
+             "testing that the borrow is only dereferenced"));
 static cl::opt<std::string> StatsOut(
     "cheri-bounds-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module decision counts to this file"));
@@ -102,6 +238,7 @@ struct Stats {
            Kept = 0, Guards = 0, NoEdge = 0, Hoisted = 0, CSEd = 0, AlreadyNarrow = 0;
   unsigned TwoVersionInLoop = 0, SplitMarkers = 0, Adopted = 0, BorrowDeref = 0;
   unsigned Uncovered = 0, Relinked = 0, RelinkGuards = 0, ParentFirst = 0;
+  unsigned Recovered = 0, RecoveredMarkers = 0, TrapMapped = 0;
   unsigned Claims = 0, ClaimNarrowed = 0, ClaimVerified = 0, ClaimProof = 0,
            ClaimCoalesced = 0, CoalesceGroups = 0;
 };
@@ -331,6 +468,8 @@ struct Lowering {
     BasicBlock *Ok = nullptr;
     Value *ParentBase = nullptr, *ParentLen = nullptr; // range markers (R3)
     Value *Index = nullptr; // the checked index, from Pred's compare (R3)
+    ConstantInt *ConstIdx = nullptr; // R5 (D30): constant index on this edge
+    SmallVector<GetElementPtrInst *, 2> Recov; // R5 (D30): its recovered guards
     SmallVector<GetElementPtrInst *, 2> Group; // re-linked shared guards
   };
 
@@ -354,6 +493,10 @@ struct Lowering {
           auto *I = dyn_cast<Instruction>(U);
           if (!I || I->getParent() != Mk.Ok)
             return false;
+          // R6 (D32/D49): a fact on the borrow (mem.alloc_inbounds after
+          // inlining an index operator) is an annotation, stripped below.
+          if (BorrowFactUsers && memannot::isMemFact(I))
+            continue;
           if (auto *GG = dyn_cast<GetElementPtrInst>(I)) {
             if (GG->getPointerOperand() != V || !GG->hasAllConstantIndices())
               return false;
@@ -381,7 +524,8 @@ struct Lowering {
         continue;
       }
       if (isa<DbgInfoIntrinsic>(I) || I.isLifetimeStartOrEnd() ||
-          isa<AssumeInst>(I) || memannot::isMemClaim(&I))
+          isa<AssumeInst>(I) || memannot::isMemClaim(&I) ||
+          (BorrowFactUsers && memannot::isMemFact(&I)))
         continue;
       if (I.mayWriteToMemory() || I.mayThrow() || !I.willReturn())
         return false;
@@ -434,6 +578,8 @@ struct Lowering {
                const SmallPtrSetImpl<GetElementPtrInst *> &Narrowed) {
     if (!CoverageCheck)
       return true;
+    if (!Mk.Index && Mk.ConstIdx)
+      return coveredConst(Mk, DT, Narrowed);
     if (!Mk.Index)
       return false;
     BasicBlockEdge E(Mk.Pred, Mk.Ok);
@@ -467,6 +613,162 @@ struct Lowering {
     }
     return true;
   }
+
+  // R5 (D30): coverage for a constant-index marker. Every access in the
+  // region its success edge dominates whose address is the marker's base
+  // plus anything must go through a guard (its own, a recovered one of a
+  // sibling marker, or a !mem.guard GEP); a call taking a pointer derived
+  // from the base is not covered.
+  bool coveredConst(const Marker &Mk, DominatorTree &DT,
+                    const SmallPtrSetImpl<GetElementPtrInst *> &Narrowed) {
+    BasicBlockEdge E(Mk.Pred, Mk.Ok);
+    auto FromBase = [&](Value *P) {
+      return getUnderlyingObject(P, 8) == getUnderlyingObject(Mk.Base, 8);
+    };
+    // A guard GEP, or an address computed from a capability this pass (or
+    // an earlier one) already narrowed: the hardware checks it.
+    auto IsGuard = [&](Value *P) {
+      for (unsigned D = 0; D < 6; ++D) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(P)) {
+          if (G->getMetadata(memannot::GuardMD) || Narrowed.count(G) ||
+              RecoveredG.count(G))
+            return true;
+          P = G->getPointerOperand();
+        } else if (auto *CI = dyn_cast<CallBase>(P)) {
+          return CI->doesNotAccessMemory() && P != Mk.Base;
+        } else if (auto *PN = dyn_cast<PHINode>(P)) {
+          return PN->getName().starts_with("cheri.cap");
+        } else
+          return false;
+      }
+      return false;
+    };
+    for (BasicBlock &BB : *Mk.Pred->getParent()) {
+      if (!DT.dominates(E, &BB))
+        continue;
+      for (Instruction &I : BB) {
+        if (Value *Ptr = getLoadStorePointerOperand(&I)) {
+          if (FromBase(Ptr) && !IsGuard(Ptr))
+            return false;
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB == Mk.Panic || memannot::isMemFact(CB) || isa<DbgInfoIntrinsic>(CB) ||
+              CB->doesNotAccessMemory())
+            continue;
+          for (Value *A : CB->args())
+            if (A->getType()->isPointerTy() && FromBase(A))
+              return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // R5 (D30): the Ok edge of Mk's compare excludes the constant K as an
+  // out-of-range index: `Len != K` (an unrolled `icmp eq` loop exit; the
+  // earlier unrolled checks give Len >= K) or `K <u Len`.
+  static bool edgeExcludes(const Marker &Mk, ConstantInt *K) {
+    using namespace PatternMatch;
+    auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
+    CmpPredicate P;
+    Value *A, *B;
+    if (!match(Br->getCondition(), m_ICmp(P, m_Value(A), m_Value(B))))
+      return false;
+    ICmpInst::Predicate Pr = P;
+    if (Br->getSuccessor(0) != Mk.Ok)
+      Pr = ICmpInst::getInversePredicate(Pr);
+    auto IsK = [&](Value *V) {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && C->getValue() == K->getValue();
+    };
+    if (Pr == ICmpInst::ICMP_NE)
+      return (A == Mk.Len && IsK(B)) || (B == Mk.Len && IsK(A));
+    if (Pr == ICmpInst::ICMP_ULT)
+      return IsK(A) && B == Mk.Len;
+    if (Pr == ICmpInst::ICMP_UGT)
+      return A == Mk.Len && IsK(B);
+    return false;
+  }
+
+  // R5 (D30): base-wide guard recovery for fully unrolled loops. After full
+  // unrolling the per-iteration accesses are constant-offset GEPs of the
+  // base (or the base itself) and carry no !mem.guard, and the exit tests
+  // are `icmp eq Len, K`. A split marker whose panic index is the constant K
+  // on its edge, and whose edge excludes K, adopts the accesses of its Ok
+  // block at exactly base + K * esz (access size <= esz) as its guards. A
+  // narrow of (base, Len * esz) then traps exactly where the compare would
+  // have panicked.
+  void recoverConst(SmallVectorImpl<Marker> &Ms,
+                    DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards) {
+    if (!RecoverConst)
+      return;
+    for (Marker &Mk : Ms) {
+      if (!Mk.Pred || Mk.Index || !Mk.Group.empty() ||
+          (Mk.Kind & memannot::CHKF_KindMask) != memannot::CHK_Index ||
+          Mk.Esz == 0 || Mk.Panic->arg_size() < 2)
+        continue;
+      bool Has = false;
+      for (GetElementPtrInst *G : Guards.lookup(Mk.Site))
+        Has |= G->getPointerOperand() == Mk.Base && !RecoveredG.count(G);
+      if (Has)
+        continue;
+      Value *IdxV = Mk.Panic->getArgOperand(0);
+      if (auto *PN = dyn_cast<PHINode>(IdxV))
+        if (PN->getParent() == Mk.Panic->getParent())
+          IdxV = PN->getIncomingValueForBlock(Mk.Pred);
+      auto *K = dyn_cast<ConstantInt>(IdxV);
+      if (!K || K->getValue().getActiveBits() > 32 || !edgeExcludes(Mk, K))
+        continue;
+      if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+        if (LI->getParent() == Mk.Ok)
+          continue;
+      int64_t Want = (int64_t)(K->getZExtValue() * Mk.Esz);
+      SmallVector<Instruction *, 2> Acc;
+      for (Instruction &I : *Mk.Ok) {
+        Value *P = getLoadStorePointerOperand(&I);
+        if (!P)
+          continue;
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+          if (SI->getValueOperand() == Mk.Base)
+            continue;
+        int64_t C = 0;
+        if (P != Mk.Base) {
+          auto *G = dyn_cast<GetElementPtrInst>(P);
+          if (!G || G->getPointerOperand() != Mk.Base)
+            continue;
+          APInt Off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+          if (!G->accumulateConstantOffset(DL, Off))
+            continue;
+          C = Off.getSExtValue();
+        }
+        Type *T = isa<LoadInst>(&I) ? I.getType()
+                                    : cast<StoreInst>(&I)->getValueOperand()->getType();
+        if (C != Want || DL.getTypeStoreSize(T).getKnownMinValue() > Mk.Esz)
+          continue;
+        Acc.push_back(&I);
+      }
+      if (Acc.empty())
+        continue;
+      for (Instruction *I : Acc) {
+        unsigned PI = isa<LoadInst>(I) ? 0 : 1;
+        Value *P = I->getOperand(PI);
+        auto *G = dyn_cast<GetElementPtrInst>(P);
+        if (!G || G->getParent() != Mk.Ok || !G->hasOneUse()) {
+          // A private guard GEP for this access (the original may be
+          // shared, or the access may use the base directly).
+          IRBuilder<> IB(I);
+          G = cast<GetElementPtrInst>(IB.CreateGEP(
+              IB.getInt8Ty(), Mk.Base, IB.getInt64(Want), "cheri.recovered"));
+          I->setOperand(PI, G);
+        }
+        Mk.Recov.push_back(G);
+        RecoveredG.insert(G);
+        ++S.Recovered;
+      }
+      Mk.ConstIdx = K;
+      ++S.RecoveredMarkers;
+    }
+  }
+  SmallPtrSet<GetElementPtrInst *, 16> RecoveredG;
 
   // R3 (D19): a marker whose guard GEP was merged with another site's (e.g.
   // SimplifyCFG sinking two `store out[i]` into a common block drops both
@@ -664,6 +966,8 @@ struct Lowering {
       for (GetElementPtrInst *G : Mk.Group)
         Narrowable.insert(G);
     adopt(Markers, DT, Guards);
+    RecoveredG.clear();
+    recoverConst(Markers, Guards);
     SmallPtrSet<GetElementPtrInst *, 8> Done;
     SmallVector<BasicBlock *, 4> DeadPanics;
     for (Marker &Mk : Markers) {
@@ -672,7 +976,15 @@ struct Lowering {
       bool RawSite = CK == memannot::CHK_RawChecked;
       // Guards of this marker: same site, same base.
       SmallVector<GetElementPtrInst *, 2> Mine, OnEdge;
+      // R5 (D30): a constant-index marker owns exactly its recovered guards.
+      for (GetElementPtrInst *G : Mk.Recov)
+        if (!Done.count(G)) {
+          Mine.push_back(G);
+          OnEdge.push_back(G);
+        }
       for (GetElementPtrInst *G : Guards.lookup(Mk.Site)) {
+        if (Mk.ConstIdx)
+          break;
         if (Done.count(G) || G->getPointerOperand() != Mk.Base)
           continue;
         if (auto *LI = dyn_cast<Instruction>(Mk.Len))
@@ -815,12 +1127,16 @@ struct Lowering {
         if (!OnEdge.empty())
           rewriteGuards(OnEdge, NarrowAt(B, true), Done);
         RewriteGroup(true);
+        tagTraps(Mk, OnEdge);
+        tagTraps(Mk, GroupG);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Pol == P_UB) { // Never
         if (!OnEdge.empty())
           rewriteGuards(OnEdge, NarrowAt(B, false), Done);
         RewriteGroup(false);
+        tagTraps(Mk, OnEdge);
+        tagTraps(Mk, GroupG);
         removeCheck(Mk, DeadPanics);
         ++S.Removed;
       } else if (Ex == E_Dynamic) {
@@ -868,10 +1184,12 @@ struct Lowering {
           Cap->addIncoming(Exact, Mk.Pred);
           Cap->addIncoming(Rounded, Slow);
           rewriteGuards(OnEdge, Cap, Done);
+          tagTraps(Mk, OnEdge);
         } else {
           Value *Rounded = NarrowAt(B, false, Bytes, Base);
           Value *Cap = B.CreateSelect(Tag, Exact, Rounded);
           rewriteGuards(OnEdge, Cap, Done);
+          tagTraps(Mk, OnEdge);
           for (PHINode &PN : Mk.Ok->phis())
             PN.addIncoming(PN.getIncomingValueForBlock(Mk.Pred), Slow);
         }
@@ -896,6 +1214,84 @@ struct Lowering {
         if (!DT.dominates(I, T))
           return false;
     return true;
+  }
+
+  // R5 (trap->panic): the panic location of a marker, read from the
+  // `&'static Location` argument of its panic call: { &str file, u32 line,
+  // u32 col } (purecap: file cap at 0, len at 16, line at 32, col at 36).
+  // The record is !{i32 MAGIC, i32 line, i32 col, i32 kind, [32 x i8] file
+  // tail}; a runtime parses pc deltas up to a MAGIC word, then the record.
+  MDNode *trapRecord(const Marker &Mk) {
+    LLVMContext &Ctx = M.getContext();
+    for (unsigned A = Mk.Panic->arg_size(); A-- > 0;) {
+      auto *G = dyn_cast<GlobalVariable>(Mk.Panic->getArgOperand(A)->stripPointerCasts());
+      if (!G || !G->hasDefinitiveInitializer() || !DL.isFatPointer(G->getType()))
+        continue;
+      auto *ST = dyn_cast<StructType>(G->getValueType());
+      if (!ST || DL.getTypeAllocSize(ST) < 40)
+        continue;
+      Constant *Init = G->getInitializer();
+      auto At = [&](uint64_t Off, Type *T) -> Constant * {
+        return ConstantFoldLoadFromConst(Init, T, APInt(64, Off), DL);
+      };
+      auto *Line = dyn_cast_or_null<ConstantInt>(At(32, Type::getInt32Ty(Ctx)));
+      auto *Col = dyn_cast_or_null<ConstantInt>(At(36, Type::getInt32Ty(Ctx)));
+      auto *Len = dyn_cast_or_null<ConstantInt>(At(16, Type::getInt64Ty(Ctx)));
+      if (!Line || !Col || !Len || Line->isZero())
+        continue;
+      std::string File;
+      if (auto *CS = dyn_cast<ConstantStruct>(Init))
+        if (auto *FG = dyn_cast<GlobalVariable>(CS->getOperand(0)->stripPointerCasts()))
+          if (FG->hasDefinitiveInitializer())
+            if (auto *CD = dyn_cast<ConstantDataSequential>(FG->getInitializer()))
+              if (CD->isString())
+                File = CD->getAsString().take_front(Len->getZExtValue()).str();
+      if (File.size() > 31) // R6 (D47): always NUL-terminated
+        File = File.substr(File.size() - 31);
+      File.resize(32, '\0');
+      Type *I32 = Type::getInt32Ty(Ctx);
+      Metadata *Aux[] = {
+          ConstantAsMetadata::get(ConstantInt::get(I32, 0x7ca9f00d)),
+          ConstantAsMetadata::get(Line), ConstantAsMetadata::get(Col),
+          ConstantAsMetadata::get(ConstantInt::get(
+              I32, (Mk.Kind & memannot::CHKF_KindMask) |
+                       // R6 (D45): log2 element size for the handler's message
+                       (uint64_t(Mk.Esz && isPowerOf2_64(Mk.Esz) ? Log2_64(Mk.Esz) & 0xf : 0xf) << 8) |
+                       (uint64_t(++TrapSeq) << 12))),
+          ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
+      return MDNode::get(Ctx, {MDString::get(Ctx, "cheri_trap_map"),
+                               MDNode::get(Ctx, Aux)});
+    }
+    return nullptr;
+  }
+  unsigned TrapSeq = 0;
+  void tagTraps(const Marker &Mk, ArrayRef<GetElementPtrInst *> Gs) {
+    if (!TrapMap || Gs.empty())
+      return;
+    MDNode *MD = trapRecord(Mk);
+    if (!MD)
+      return;
+    SmallVector<Value *, 8> WL(Gs.begin(), Gs.end());
+    SmallPtrSet<Value *, 16> Seen;
+    while (!WL.empty()) {
+      Value *V = WL.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (isa<GetElementPtrInst>(I) || isa<CastInst>(I)) {
+          WL.push_back(I);
+          continue;
+        }
+        if ((getLoadStorePointerOperand(I) == V || isa<AnyMemIntrinsic>(I)) &&
+            !I->getMetadata(LLVMContext::MD_pcsections)) {
+          I->setMetadata(LLVMContext::MD_pcsections, MD);
+          ++S.TrapMapped;
+        }
+      }
+    }
   }
 
   static void rewriteGuards(ArrayRef<GetElementPtrInst *> Gs, Value *Cap,
@@ -1200,7 +1596,13 @@ struct Lowering {
            << " csed=" << S.CSEd << " already=" << S.AlreadyNarrow
            << " uncovered=" << S.Uncovered << " relinked=" << S.Relinked
            << " relink_markers=" << S.RelinkGuards
-           << " parent_first=" << S.ParentFirst << " claims=" << S.Claims
+           << " parent_first=" << S.ParentFirst
+           << " recovered=" << S.Recovered
+           << " recovered_markers=" << S.RecoveredMarkers
+           << " trap_mapped=" << S.TrapMapped
+           << " narrow_tag_checks=" << NarrowTagChecks
+           << " narrow_tag_const_skipped=" << NarrowTagSkippedConst
+           << " narrow_tag_hoisted=" << NarrowTagHoisted << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof
@@ -1229,6 +1631,7 @@ Policy readPolicy(Module &M) {
 
 bool memannot::runCheriBoundsLowering(Module &M) {
   runCensusLate(M);
+  runNarrowTagCheck(M); // R6 (D46), user narrowings only (before the pass's own)
   Lowering L(M, readPolicy(M), cheriSkipNarrowEnabled());
   L.run();
   runCheriInvalidate(M); // R4 Track B (off by default), before the strip

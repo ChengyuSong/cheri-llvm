@@ -11,6 +11,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Instruction.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include <functional>
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/MemAnnot.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -123,6 +126,10 @@ static cl::opt<bool> MemLastUseTransfer(
     "mem-last-use-transfer", cl::init(true), cl::Hidden,
     cl::desc("M5r R4 (D28): move !mem.last_use from an erased carrier to the "
              "previous carrier on its path"));
+static cl::opt<bool> MemLastUseTransferStrict(
+    "mem-last-use-transfer-strict", cl::init(true), cl::Hidden,
+    cl::desc("M5r R5 (D39): straight-line last_use transfers only (no move "
+             "into a branching predecessor), join predecessors, then forward"));
 
 bool llvm::memannot::isLastUseCarrier(const Instruction &I) {
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
@@ -149,6 +156,22 @@ void llvm::memannot::mergeLastUse(Instruction &To, MDNode *LU) {
   To.setMetadata(LastUseMD, MDNode::get(To.getContext(), Ids));
 }
 
+// [LLM-generated] M5r R7 (D52): a carrier that accesses a stack slot used to
+// keep its ids only while the slot lived (SROA promoting that slot erased
+// them). The ids name loans of *other* slots, which may survive SROA (e.g. a
+// loan whose last use is the store of a call result into a promoted return
+// slot), so they now move like any other carrier's.
+static cl::opt<bool> MemLastUseTransferAlloca(
+    "mem-last-use-transfer-alloca", cl::init(true), cl::Hidden,
+    cl::desc("M5r R7 (D52): also move !mem.last_use off an erased load/store "
+             "of a stack slot (promoted by SROA/mem2reg)"));
+
+static cl::opt<bool> MemLastUseFanout(
+    "mem-last-use-fanout", cl::init(true), cl::Hidden,
+    cl::desc("M5r R8 (D59): a forward last_use transfer at a branch puts the "
+             "ids on the first carrier of every successor that has no other "
+             "predecessor"));
+
 static void transferLastUse(Instruction &I) {
   if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
     return;
@@ -160,7 +183,7 @@ static void transferLastUse(Instruction &I) {
     P = LI->getPointerOperand();
   else if (auto *SI = dyn_cast<StoreInst>(&I))
     P = SI->getPointerOperand();
-  for (unsigned D = 0; P && D < 8; ++D) {
+  for (unsigned D = 0; P && !MemLastUseTransferAlloca && D < 8; ++D) {
     P = P->stripPointerCasts();
     if (isa<AllocaInst>(P))
       return;
@@ -175,23 +198,148 @@ static void transferLastUse(Instruction &I) {
   for (Instruction &O : *BB)
     if (&O != &I && O.getMetadata(memannot::LastUseMD) == LU)
       return;
-  Instruction *Start = &I;
-  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
-    for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
-      if (&*It != Start && &*It != &I && memannot::isLastUseCarrier(*It)) {
-        memannot::mergeLastUse(*It, LU);
+  // R5 (D39): only straight-line moves. Backward, a predecessor must branch
+  // only to this block: the other successors of a branching predecessor may
+  // still use the loan, so clearing there would be too early. All the
+  // predecessors of a join (each ending in a carrier and branching only here)
+  // take the ids. Otherwise forward: the next carrier on the unique path (a
+  // later end is never too early; the window grows by no memory access).
+  if (!MemLastUseTransferStrict) {
+    Instruction *Start = &I;
+    for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+      for (auto It = Start->getReverseIterator(), E = BB->rend(); It != E; ++It)
+        if (&*It != Start && &*It != &I && memannot::isLastUseCarrier(*It)) {
+          memannot::mergeLastUse(*It, LU);
+          return;
+        }
+      BB = BB->getSinglePredecessor();
+      if (!BB)
+        return;
+      Start = BB->getTerminator();
+      if (!Start)
+        return;
+      if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
+        memannot::mergeLastUse(*Start, LU);
         return;
       }
-    BB = BB->getSinglePredecessor();
-    if (!BB)
-      return;
-    Start = BB->getTerminator();
-    if (!Start)
-      return;
-    if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
-      memannot::mergeLastUse(*Start, LU);
+    }
+    return;
+  }
+  // Passes erase while blocks are being rewritten: never assert on a block
+  // without a terminator (it just ends the walk).
+  auto Term = [](BasicBlock *B) -> Instruction * {
+    return (B && !B->empty() && B->back().isTerminator()) ? &B->back() : nullptr;
+  };
+  auto LastCarrierIn = [&](BasicBlock *B, Instruction *From) -> Instruction * {
+    auto It = From ? From->getReverseIterator() : B->rbegin();
+    for (auto E = B->rend(); It != E; ++It)
+      if (&*It != &I && &*It != From && memannot::isLastUseCarrier(*It))
+        return &*It;
+    return nullptr;
+  };
+  Instruction *Start = &I;
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    if (Instruction *C = LastCarrierIn(BB, Start)) {
+      memannot::mergeLastUse(*C, LU);
       return;
     }
+    SmallVector<BasicBlock *, 4> Preds(predecessors(BB));
+    if (Preds.empty())
+      break;
+    bool Straight = true;
+    for (BasicBlock *P : Preds)
+      Straight &= P != BB && Term(P) &&
+                  Term(P)->getNumSuccessors() == 1;
+    if (!Straight)
+      break;
+    if (Preds.size() == 1) {
+      BB = Preds[0];
+      Start = nullptr;
+      if (Instruction *T = Term(BB);
+          T && T != &I && memannot::isLastUseCarrier(*T)) { // invoke
+        memannot::mergeLastUse(*T, LU);
+        return;
+      }
+      continue;
+    }
+    // A join: every predecessor must end in a carrier of its own.
+    SmallVector<Instruction *, 4> Cs;
+    for (BasicBlock *P : Preds) {
+      Instruction *C = LastCarrierIn(P, nullptr);
+      if (!C)
+        break;
+      Cs.push_back(C);
+    }
+    if (Cs.size() != Preds.size())
+      break;
+    for (Instruction *C : Cs)
+      memannot::mergeLastUse(*C, LU);
+    return;
+  }
+  // Forward: the next carrier on the unique path from I. R8 (D59): at a
+  // branch, every successor whose only predecessor is this block takes the ids
+  // on the first carrier of its own straight-line path (each path ends the
+  // loan no earlier than before; a join successor is never entered, since its
+  // other predecessors may still use the loan).
+  std::function<bool(BasicBlock *, Instruction *, unsigned, unsigned &)> Fwd =
+      [&](BasicBlock *B, Instruction *From, unsigned Depth,
+          unsigned &Budget) -> bool {
+    for (unsigned Steps = 0; B && Steps < 4; ++Steps) {
+      for (auto It = From ? std::next(From->getIterator()) : B->begin(),
+                E = B->end();
+           It != E; ++It)
+        if (&*It != &I && memannot::isLastUseCarrier(*It)) {
+          memannot::mergeLastUse(*It, LU);
+          return true;
+        }
+      Instruction *T = Term(B);
+      if (!T || T->getNumSuccessors() == 0)
+        return false;
+      if (T->getNumSuccessors() == 1) {
+        BasicBlock *S = T->getSuccessor(0);
+        if (S == B || !S->hasNPredecessors(1))
+          return false;
+        B = S;
+        From = nullptr;
+        continue;
+      }
+      if (!MemLastUseFanout || Depth >= 2)
+        return false;
+      bool Any = false;
+      SmallPtrSet<BasicBlock *, 4> Seen;
+      for (BasicBlock *S : successors(B)) {
+        if (!Seen.insert(S).second || S == B || S->getSinglePredecessor() != B)
+          continue;
+        if (Budget == 0)
+          break;
+        --Budget;
+        Any |= Fwd(S, nullptr, Depth + 1, Budget);
+      }
+      return Any;
+    }
+    return false;
+  };
+  unsigned Budget = 8;
+  Fwd(I.getParent(), &I, 0, Budget);
+}
+
+void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
+  BasicBlock *BB = &Start;
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    for (Instruction &I : *BB)
+      if (memannot::isLastUseCarrier(I)) {
+        memannot::mergeLastUse(I, LU);
+        return;
+      }
+    if (BB->empty() || !BB->back().isTerminator())
+      return;
+    Instruction *T = &BB->back();
+    if (T->getNumSuccessors() != 1)
+      return;
+    BasicBlock *S = T->getSuccessor(0);
+    if (S == BB || !S->hasNPredecessors(1))
+      return;
+    BB = S;
   }
 }
 

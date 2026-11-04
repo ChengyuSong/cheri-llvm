@@ -1,0 +1,110 @@
+; [LLM-generated] M5r R5 Track B: loan-end invalidation (D36) and the cheaper
+; R5 (D40): the clears are volatile stores (SelectionDAG drops a store to a dying frame slot).
+; filters (D37). A frame slot whose every capability store carries the rustc
+; slot fact !mem.loan !{L} is nulled after the !mem.last_use carrier of L.
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s --check-prefix=LOAN
+; R8 (D57): loan is the default mode.
+; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=LOAN
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=SF
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=scope+free < %s | FileCheck %s --check-prefix=SF
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all < %s | FileCheck %s --check-prefix=ALL
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-loan-skip=false < %s | FileCheck %s --check-prefix=NOSKIP
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-escape=false < %s | FileCheck %s --check-prefix=NOESC
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-escape=false -cheri-invalidate-asm-noescape=false < %s | FileCheck %s --check-prefix=ASMESC
+; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
+target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+
+declare void @g()
+declare void @use(ptr addrspace(200))
+declare void @llvm.lifetime.start.p200(ptr addrspace(200))
+declare void @llvm.lifetime.end.p200(ptr addrspace(200))
+
+; The slot only ever holds loan 5's reference: nulled after its last use.
+define void @loan(ptr addrspace(200) %p) {
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
+  %v = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16, !mem.last_use !0
+  call void @g()
+  ret void
+}
+; LOAN-LABEL: define void @loan(
+; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
+; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r, align 16
+; LOAN-NEXT: call addrspace(200) void @g()
+; SF-LABEL: define void @loan(
+; SF-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; SF: ret void
+
+; An untagged store may put another value in the slot: no clear.
+define void @mixed(ptr addrspace(200) %p, ptr addrspace(200) %q) {
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
+  %v = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16, !mem.last_use !0
+  store volatile ptr addrspace(200) %q, ptr addrspace(200) %r, align 16
+  call void @g()
+  ret void
+}
+; LOAN-LABEL: define void @mixed(
+; LOAN-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; LOAN: ret void
+
+; The slot escapes into a call. R5: no clear. R6 (D41): the slot's type
+; region is inside the loan region, and any borrow of the slot is inside the
+; slot's region, so a callee cannot use the slot after the loan end: cleared
+; (prefix NOESC checks the R5 rule). An empty-asm (black_box) use never counts as an escape.
+define void @escaped(ptr addrspace(200) %p) {
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
+  call void @use(ptr addrspace(200) %r)
+  %v = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16, !mem.last_use !0
+  ret void
+}
+; LOAN-LABEL: define void @escaped(
+; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
+; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r, align 16, !pcsections [[PCL:![0-9]+]]
+; NOESC-LABEL: define void @escaped(
+; NOESC-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; NOESC: ret void
+define void @blackbox(ptr addrspace(200) %p) {
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  store volatile ptr addrspace(200) %p, ptr addrspace(200) %r, align 16, !mem.loan !0
+  call void asm sideeffect "", "C,~{memory}"(ptr addrspace(200) %r)
+  %v = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16, !mem.last_use !0
+  call void @g()
+  ret void
+}
+; LOAN-LABEL: define void @blackbox(
+; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r
+; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r
+; ASMESC-LABEL: define void @blackbox(
+; ASMESC-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; ASMESC: ret void
+
+; A reference into %buf in a loan slot: its clear lies on every path to the
+; end of %buf's scope, so the scope event needs no range check for it.
+define void @skip() {
+  %buf = alloca [4 x i64], align 16, addrspace(200)
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.lifetime.start.p200(ptr addrspace(200) %buf)
+  %e = getelementptr inbounds i8, ptr addrspace(200) %buf, i64 8
+  store volatile ptr addrspace(200) %e, ptr addrspace(200) %r, align 16, !mem.loan !1
+  %v = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16, !mem.last_use !1
+  call void @g()
+  call void @llvm.lifetime.end.p200(ptr addrspace(200) %buf)
+  %w = load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
+  ret void
+}
+; ALL-LABEL: define void @skip(
+; ALL: %v = load volatile
+; ALL-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r
+; ALL-NOT: cheri.inv.cap
+; ALL: ret void
+; NOSKIP-LABEL: define void @skip(
+; NOSKIP: %cheri.inv.cap = load ptr addrspace(200), ptr addrspace(200) %r
+; NOSKIP: call addrspace(200) void @llvm.lifetime.end
+; STATS: loan_facts=5 loan_slots=4 loan_clears=4 loan_skipped=1 loan_escaped=1
+; R6 (D48): each clear is recorded in a cheri_inv_* pcsections section.
+; LOAN: [[PCL]] = !{!"cheri_inv_loan"}
+
+!0 = !{i64 5}
+!1 = !{i64 9}

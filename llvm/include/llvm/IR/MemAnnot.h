@@ -34,6 +34,7 @@
 #include <cstdint>
 
 namespace llvm {
+class BasicBlock;
 class CallBase;
 class Instruction;
 class MDNode;
@@ -53,6 +54,12 @@ inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
 /// !mem.last_use !{i64 loan, ...}: last use of each loan on this path (R1).
 inline constexpr StringRef LastUseMD = "mem.last_use";
+/// [LLM-generated] M5r R5 (D35): rustc slot fact on a store: the stored value
+/// is the reference of borrowck loan(s) !{i64 L, ...} (Track B loan-end).
+inline constexpr StringRef LoanMD = "mem.loan";
+/// R5: the LLVM inliner re-keys a cloned body's loan ids in bits 42..62; the
+/// low bits keep the original id (census key).
+inline constexpr uint64_t LoanKeyMask = (uint64_t(1) << 42) - 1;
 inline constexpr StringRef IdMD = "mem.annot.id";
 /// Set on a claim just before InstCombine folds it as object-exact (R1), so
 /// the census can classify the RAUW as explained.
@@ -117,6 +124,9 @@ LLVM_ABI bool onlyMemBundles(const CallBase &CB);
 LLVM_ABI bool isLastUseCarrier(const Instruction &I);
 /// R4 (D28): add the loan ids of LU to To's !mem.last_use.
 LLVM_ABI void mergeLastUse(Instruction &To, MDNode *LU);
+/// [LLM-generated] M5r R6 (D44): put loan ids that ended at the start of BB on
+/// the next carrier on BB's unique forward path (fail-safe: lost if none).
+LLVM_ABI void forwardLastUse(BasicBlock &BB, MDNode *LU);
 } // namespace memannot
 } // namespace llvm
 #endif

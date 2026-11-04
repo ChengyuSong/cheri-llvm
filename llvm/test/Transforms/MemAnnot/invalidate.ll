@@ -43,7 +43,7 @@ define void @scope(ptr addrspace(200) %v) {
   ret void
 }
 ; CHECK-LABEL: define void @scope(
-; CHECK:         store ptr addrspace(200) null, ptr addrspace(200) %x, align 16
+; CHECK:         store volatile ptr addrspace(200) null, ptr addrspace(200) %x, align 16
 ; CHECK:         @llvm.cheri.cap.address.get.i64(ptr addrspace(200) %x)
 ; CHECK:         load ptr addrspace(200), ptr addrspace(200) %slot, align 16
 ; CHECK:         @llvm.cheri.cap.tag.clear(
