@@ -119,7 +119,11 @@ static cl::opt<bool> NarrowTagCheckHoist(
     "cheri-narrow-tag-check-hoist", cl::init(true), cl::Hidden,
     cl::desc("M5r R8 (D61): hoist loop-invariant checked narrowings to the "
              "preheader"));
-static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0;
+static cl::opt<bool> NarrowTagCheckLazy(
+    "cheri-narrow-tag-check-lazy", cl::init(true), cl::Hidden,
+    cl::desc("M5r R9 (D66): branch on the narrowed result's tag first and read "
+             "the input's tag only on the cold path"));
+static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0, NarrowTagLazy = 0;
 static unsigned NarrowTagChecks = 0;
 static void runNarrowTagCheck(Module &M) {
   if (!NarrowTagCheck)
@@ -207,9 +211,21 @@ static void runNarrowTagCheck(Module &M) {
       Function *TagF =
           Intrinsic::getOrInsertDeclaration(&M, Intrinsic::cheri_cap_tag_get);
       Value *In = N->getArgOperand(0);
-      Value *Lost = B.CreateAnd(B.CreateCall(TagF, {In}),
-                                B.CreateNot(B.CreateCall(TagF, {N})));
-      Instruction *Then = SplitBlockAndInsertIfThen(Lost, After, true);
+      Instruction *Then;
+      if (NarrowTagCheckLazy) {
+        // R9 (D66): test the result's tag first; the input's tag is read only
+        // on the (cold) untagged-result path. The hot path is one tag read and
+        // one branch per narrowing instead of two of each (same trap set).
+        Value *NoTag = B.CreateNot(B.CreateCall(TagF, {N}));
+        Instruction *Cold = SplitBlockAndInsertIfThen(NoTag, After, false);
+        IRBuilder<> CB(Cold);
+        Then = SplitBlockAndInsertIfThen(CB.CreateCall(TagF, {In}), Cold, true);
+        ++NarrowTagLazy;
+      } else {
+        Value *Lost = B.CreateAnd(B.CreateCall(TagF, {In}),
+                                  B.CreateNot(B.CreateCall(TagF, {N})));
+        Then = SplitBlockAndInsertIfThen(Lost, After, true);
+      }
       IRBuilder<> TB(Then);
       LoadInst *L = TB.CreateLoad(Type::getInt8Ty(Ctx), N, /*isVolatile=*/true);
       L->setMetadata(LLVMContext::MD_pcsections, MD);
@@ -1602,7 +1618,8 @@ struct Lowering {
            << " trap_mapped=" << S.TrapMapped
            << " narrow_tag_checks=" << NarrowTagChecks
            << " narrow_tag_const_skipped=" << NarrowTagSkippedConst
-           << " narrow_tag_hoisted=" << NarrowTagHoisted << " claims=" << S.Claims
+           << " narrow_tag_hoisted=" << NarrowTagHoisted
+           << " narrow_tag_lazy=" << NarrowTagLazy << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof
