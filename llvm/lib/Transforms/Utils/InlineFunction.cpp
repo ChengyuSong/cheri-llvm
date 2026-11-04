@@ -1925,9 +1925,16 @@ static void AddMemFactsFromAttributes(CallBase &CB, ValueToValueMapTy &VMap) {
 // [LLM-generated] M5r: move a "mem.check" / "mem.free" bundle that sat on the
 // inlined call onto the matching calls of the inlined body (noreturn calls for
 // a check, deallocation calls for a free), with the census id.
+static cl::opt<bool> InlineFreeFact(
+    "mem-inline-free-fact", cl::init(true), cl::Hidden,
+    cl::desc("M5r R9 (D67): a \"mem.free\" bundle of an inlined call whose body "
+             "has no call to carry it becomes an llvm.mem.fact [\"mem.free\"] "
+             "at each return of the inlined body"));
+
 static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
                                          Function::iterator FirstNewBlock,
-                                         Function *Caller) {
+                                         Function *Caller,
+                                         ArrayRef<ReturnInst *> Returns = {}) {
   std::optional<OperandBundleUse> MB = CB.getOperandBundle(Tag);
   if (!MB)
     return;
@@ -1956,6 +1963,23 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
                 return A->stripPointerCasts() == P;
               }))
             Targets.push_back(C);
+  }
+  // [LLM-generated] M5r R9 (D67): the whole deallocator was inlined (e.g. a
+  // free-list GlobalAlloc): no call is left to carry the free. Keep the fact
+  // as llvm.mem.fact ["mem.free"(p)] where the inlined call would have
+  // returned (the free has happened there on every path that returns).
+  if (Tag == memannot::TagFree && Targets.empty() && !MB->Inputs.empty() &&
+      InlineFreeFact) {
+    Function *FactF = Intrinsic::getOrInsertDeclaration(Caller->getParent(),
+                                                        Intrinsic::mem_fact);
+    for (ReturnInst *R : Returns) {
+      if (!R || !R->getParent())
+        continue;
+      CallInst *F = CallInst::Create(FactF, {}, {Def}, "", R->getIterator());
+      if (Id)
+        F->setMetadata(memannot::IdMD, Id);
+    }
+    return;
   }
   for (CallBase *C : Targets) {
     SmallVector<OperandBundleDef, 2> OBs;
@@ -3343,7 +3367,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     // [LLM-generated] M5r: keep "mem.check" / "mem.free" markers that sat on
     // the call.
     moveMemBundleIntoInlinedBody(CB, memannot::TagCheck, FirstNewBlock, Caller);
-    moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller);
+    moveMemBundleIntoInlinedBody(CB, memannot::TagFree, FirstNewBlock, Caller, Returns);
     rekeyInlinedLoans(FirstNewBlock, Caller);
     moveLastUseIntoInlinedBody(CB, Returns, FirstNewBlock);
 

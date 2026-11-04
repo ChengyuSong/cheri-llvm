@@ -4156,8 +4156,7 @@ void Verifier::visitCallBase(CallBase &Call) {
       }
       if (T == memannot::TagFree) {
         // R1: "mem.free"(ptr base) on the real deallocation call.
-        Check(!IsFact, "\"mem.free\" belongs on the deallocation call, not on "
-                       "llvm.mem.fact", Call);
+        // R9 (D67): or on llvm.mem.fact where an inlined deallocator returned.
         Check(In.size() == 1 && IsPtr(In[0]),
               "\"mem.free\" bundle must be (ptr base)", Call);
         continue;

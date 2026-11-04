@@ -22,6 +22,8 @@ define void @good(ptr %p, ptr %q, i64 %n, i64 %i) {
   call void @panic(i64 %i, i64 %n) [ "mem.check"(ptr %p, i64 %n, i64 4, i64 7, i64 0) ]
   call void @panic(i64 %i, i64 %n) [ "mem.check"(ptr %q, i64 %n, i64 4, i64 8, i64 1, ptr %p, i64 %n) ]
   call void @free(ptr %p) [ "mem.free"(ptr %p) ]
+  ; R9 (D67): an inlined deallocator's free is kept on llvm.mem.fact.
+  call void @llvm.mem.fact() [ "mem.free"(ptr %p) ]
   ret void
 }
 !0 = !{i64 7}
@@ -42,8 +44,6 @@ define void @bad(ptr %p, i64 %n, i64 %i) {
   call void @llvm.mem.fact() [ "mem.alloc_inbounds"(i64 %n) ]
 ; CHECK: "mem.inbounds" must be (ptr, ptr base, iN bytes)
   call void @llvm.mem.fact() [ "mem.inbounds"(ptr %p, i64 %n) ]
-; CHECK: "mem.free" belongs on the deallocation call, not on llvm.mem.fact
-  call void @llvm.mem.fact() [ "mem.free"(ptr %p) ]
 ; CHECK: unknown "mem." bundle tag
   call void @llvm.mem.fact() [ "mem.invalidate"(ptr %p, i64 0) ]
 ; CHECK: unknown "mem." bundle tag
