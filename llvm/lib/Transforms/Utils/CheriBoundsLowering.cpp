@@ -178,7 +178,13 @@ narrowAccessesOnly(Instruction *N) {
           Work.push_back(C);
       } else if (auto *C = dyn_cast<CallBase>(I);
                  C && C->getCalledFunction() &&
-                 C->getCalledFunction()->getIntrinsicID() == Intrinsic::trap &&
+                 (C->getCalledFunction()->getIntrinsicID() == Intrinsic::trap ||
+                  // [LLM-generated] R13 (D81): k5_fields_sum's slice-iterator
+                  // select of two N-derived arms is used by an `assume`
+                  // "nonnull" bundle and a rustc "mem.alloc_inbounds" fact:
+                  // also facts, not accesses.
+                  C->getCalledFunction()->getIntrinsicID() == Intrinsic::assume ||
+                  C->getCalledFunction()->getName().starts_with("llvm.mem.fact")) &&
                  llvm::count(C->args(), V) == 0) {
         // [LLM-generated] R12 (D78/D76b): V only appears in an operand bundle
         // (the "mem.check" record of a bounds trap): a fact, not an access.
