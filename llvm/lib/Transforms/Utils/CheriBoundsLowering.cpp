@@ -142,6 +142,7 @@ narrowAccessesOnly(Instruction *N) {
   SmallPtrSet<Value *, 16> D;
   SmallVector<Value *, 16> Work{N};
   SmallVector<PHINode *, 4> Phis;
+  SmallVector<SelectInst *, 4> Sels;
   SmallVector<Instruction *, 8> Acc;
   D.insert(N);
   while (!Work.empty()) {
@@ -175,6 +176,22 @@ narrowAccessesOnly(Instruction *N) {
         // argument unchanged; follow it like a GEP.
         if (D.insert(C).second)
           Work.push_back(C);
+      } else if (auto *C = dyn_cast<CallBase>(I);
+                 C && C->getCalledFunction() &&
+                 C->getCalledFunction()->getIntrinsicID() == Intrinsic::trap &&
+                 llvm::count(C->args(), V) == 0) {
+        // [LLM-generated] R12 (D78/D76b): V only appears in an operand bundle
+        // (the "mem.check" record of a bounds trap): a fact, not an access.
+        continue;
+      } else if (auto *Sel = dyn_cast<SelectInst>(I);
+                 Sel && Sel->getCondition() != V) {
+        // [LLM-generated] R12 (D78/D76b): a select between N-derived values
+        // and values with the same underlying base as N's input; the other
+        // arm is checked below (like a PHI incoming).
+        if (D.insert(Sel).second) {
+          Sels.push_back(Sel);
+          Work.push_back(Sel);
+        }
       } else if (auto *P = dyn_cast<PHINode>(I)) {
         if (D.insert(P).second) {
           Phis.push_back(P);
@@ -189,6 +206,30 @@ narrowAccessesOnly(Instruction *N) {
     for (Value *In : P->incoming_values())
       if (!D.count(In))
         return std::nullopt;
+  auto Base = [](Value *X) {
+    for (;;) {
+      X = X->stripPointerCasts();
+      if (auto *G = dyn_cast<GetElementPtrInst>(X))
+        X = G->getPointerOperand();
+      else if (auto *C = dyn_cast<CallBase>(X);
+               C && C->getCalledFunction() &&
+               (C->getCalledFunction()->getName().starts_with("llvm.mem.claim") ||
+                C->getCalledFunction()->getIntrinsicID() ==
+                    Intrinsic::cheri_cap_bounds_set_exact ||
+                C->getCalledFunction()->getIntrinsicID() ==
+                    Intrinsic::cheri_cap_bounds_set))
+        X = C->getArgOperand(0);
+      else
+        return X;
+    }
+  };
+  Value *NB = Base(N->getOperand(0));
+  for (SelectInst *Sel : Sels)
+    for (Value *In : {Sel->getTrueValue(), Sel->getFalseValue()})
+      if (!D.count(In) && Base(In) != NB) {
+        NarrowEsc = Sel;
+        return std::nullopt;
+      }
   return Acc;
 }
 static unsigned NarrowTagChecks = 0;

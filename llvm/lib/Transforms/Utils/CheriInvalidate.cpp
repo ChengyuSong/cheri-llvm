@@ -14,6 +14,7 @@
 // (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
 // or a '+'-list (e.g. scope+free, the R4 "all").
 //===----------------------------------------------------------------------===//
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -121,7 +122,8 @@ struct Slot {
 struct Inv {
   Module &M;
   const DataLayout &DL;
-  bool Scope, Free, Loan, FLog = false;
+  bool Scope, Free, Loan, FLog = false, AFLog = false;
+  unsigned AFLogSkipFree = 0, AFLogSkipCall = 0;
   unsigned FLogFrees = 0, FLogCalls = 0;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
@@ -598,6 +600,81 @@ struct Inv {
       }
     }
   }
+  // [LLM-generated] R12 (D80, "aflog"): argument-free free log. Only frees of
+  // objects reached from a function argument append to the log, and only calls
+  // passing a pointer to a callee that may free through that argument check it
+  // (lu6: an owner moved into a callee that drops it). Frees of a function's
+  // own allocations and calls that cannot free a caller's object stay unchecked.
+  DenseMap<const Function *, SmallBitVector> FreesArg;
+  static int argOf(Value *V) {
+    SmallPtrSet<Value *, 16> Seen;
+    SmallVector<Value *, 8> W{V};
+    while (!W.empty()) {
+      Value *X = W.pop_back_val()->stripPointerCasts();
+      if (!Seen.insert(X).second)
+        continue;
+      if (auto *A = dyn_cast<Argument>(X))
+        return A->getArgNo();
+      if (auto *G = dyn_cast<GetElementPtrInst>(X))
+        W.push_back(G->getPointerOperand());
+      else if (auto *L = dyn_cast<LoadInst>(X))
+        W.push_back(L->getPointerOperand());
+      else if (auto *P = dyn_cast<PHINode>(X))
+        for (Value *In : P->incoming_values())
+          W.push_back(In);
+      else if (auto *S = dyn_cast<SelectInst>(X)) {
+        W.push_back(S->getTrueValue());
+        W.push_back(S->getFalseValue());
+      } else if (auto *C = dyn_cast<CallBase>(X); C && C->arg_size() &&
+                 C->getCalledFunction() && C->getCalledFunction()->isIntrinsic() &&
+                 C->getArgOperand(0)->getType()->isPointerTy())
+        W.push_back(C->getArgOperand(0));
+      else if (auto *C = dyn_cast<CallBase>(X); C && C->getCalledFunction() &&
+                 C->getCalledFunction()->getName().starts_with("llvm.mem.claim"))
+        W.push_back(C->getArgOperand(0));
+      else if (auto *I2P = dyn_cast<IntToPtrInst>(X))
+        W.push_back(I2P->getOperand(0));
+    }
+    return -1;
+  }
+  bool callFreesArg(const CallBase *C, unsigned J) const {
+    const Function *Fn = C->getCalledFunction();
+    if (!Fn)
+      return false;
+    auto It = FreesArg.find(Fn);
+    return It != FreesArg.end() && J < It->second.size() && It->second.test(J);
+  }
+  void computeFreesArg() {
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+      for (Function &F : M) {
+        if (F.isDeclaration())
+          continue;
+        SmallBitVector &BV = FreesArg[&F];
+        if (BV.size() < F.arg_size())
+          BV.resize(F.arg_size());
+        for (Instruction &I : instructions(F)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+          SmallVector<Value *, 4> Freed;
+          if (auto OB = CB->getOperandBundle(memannot::TagFree))
+            Freed.push_back(OB->Inputs[0]);
+          for (unsigned J = 0; J < CB->arg_size(); ++J)
+            if (callFreesArg(CB, J))
+              Freed.push_back(CB->getArgOperand(J));
+          for (Value *P : Freed) {
+            int A = argOf(P);
+            if (A >= 0 && !BV.test(A)) {
+              BV.set(A);
+              Changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
   GlobalVariable *FLogGV = nullptr;
   GlobalVariable *flog() {
     if (FLogGV)
@@ -644,6 +721,15 @@ struct Inv {
         if (FLogMayFree && !callMayFree(CB)) {
           ++FLogNoFree;
           continue;
+        }
+        if (AFLog) {
+          bool Any = false;
+          for (unsigned J = 0; J < CB->arg_size() && !Any; ++J)
+            Any = CB->getArgOperand(J)->getType()->isPointerTy() && callFreesArg(CB, J);
+          if (!Any) {
+            ++AFLogSkipCall;
+            continue;
+          }
         }
         Calls.push_back(CB);
       }
@@ -692,6 +778,10 @@ struct Inv {
           if (!isa<InvokeInst>(CB))
             if (auto OB = CB->getOperandBundle(memannot::TagFree))
               if (DL.isFatPointer(OB->Inputs[0]->getType())) {
+                if (AFLog && argOf(OB->Inputs[0]) < 0) {
+                  ++AFLogSkipFree;
+                  continue;
+                }
                 IRBuilder<> B(CB);
                 Value *P = OB->Inputs[0];
                 Value *Lo = B.CreateCall(decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}), {P});
@@ -789,6 +879,8 @@ struct Inv {
     FLogCheck = std::min<unsigned>(FLogChecks, FLogN);
     if (FLog && FLogMayFree)
       computeMayFree();
+    if (AFLog)
+      computeFreesArg();
     for (Function &F : M)
       if (!F.isDeclaration())
         runOn(F);
@@ -805,7 +897,8 @@ struct Inv {
            << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
            << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
            << " asm_noescape=" << AsmNoEscape << " flog_frees=" << FLogFrees
-         << " flog_calls=" << FLogCalls << " flog_nofree=" << FLogNoFree << "\n";
+         << " flog_calls=" << FLogCalls << " flog_nofree=" << FLogNoFree
+         << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall << "\n";
     }
   }
 };
@@ -832,6 +925,7 @@ bool memannot::runCheriInvalidate(Module &M) {
     return false;
   Inv I(M, Scope, Free, Loan);
   I.FLog = FLogOn;
+  I.AFLog = Mode.contains("aflog");
   I.run();
   return Scope || Free || Loan || FLogOn;
 }
