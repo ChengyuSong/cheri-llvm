@@ -70,6 +70,16 @@ static cl::opt<bool> InvOwnNull(
     cl::desc("M5r R10 (D73): at a lifetime.end, null the dying object's own "
              "capability slots (default; =false keeps only the range checks)"));
 static bool InvOwnNullEff = true;
+// [LLM-generated] R11 (D77): cheaper free log.
+static cl::opt<bool> FLogMayFree(
+    "cheri-flog-may-free", cl::init(true), cl::Hidden,
+    cl::desc("M5r R11 (D77): check the free log only after calls that may free "
+             "(module may-free fixpoint; nofree declarations/intrinsics skip)"));
+static cl::opt<unsigned> FLogRing("cheri-flog-ring", cl::init(4), cl::Hidden,
+    cl::desc("M5r R11 (D77): free log ring entries (power of 2; R10: 8)"));
+static cl::opt<unsigned> FLogChecks("cheri-flog-checks", cl::init(2), cl::Hidden,
+    cl::desc("M5r R11 (D77): entries checked after a call (R10: 4)"));
+static unsigned FLogNoFree = 0;
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
@@ -554,7 +564,40 @@ struct Inv {
   // caller whose live heap-capable frame slots are read after a call checks
   // them against the entries the call appended (frees in other frames, hu5).
   // Fail-safe: an overflowed ring only misses clears, it never adds one.
-  static constexpr unsigned FLogN = 8, FLogCheck = 4;
+  // R11 (D77): ring size and entries checked per call are options; the
+  // global's name carries the size so differently built crates cannot mix.
+  unsigned FLogN = 8, FLogCheck = 4;
+  SmallPtrSet<const Function *, 32> MayFree;
+  bool callMayFree(const CallBase *C) const {
+    if (C->hasFnAttr(Attribute::NoFree))
+      return false;
+    if (C->getOperandBundle(memannot::TagFree))
+      return true;
+    const Function *Fn = C->getCalledFunction();
+    if (!Fn)
+      return true;
+    if (Fn->isIntrinsic())
+      return false;
+    if (Fn->isDeclaration())
+      return !Fn->doesNotFreeMemory();
+    return MayFree.count(Fn);
+  }
+  void computeMayFree() {
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+      for (Function &F : M) {
+        if (F.isDeclaration() || MayFree.count(&F))
+          continue;
+        for (Instruction &I : instructions(F))
+          if (auto *CB = dyn_cast<CallBase>(&I); CB && callMayFree(CB)) {
+            MayFree.insert(&F);
+            Changed = true;
+            break;
+          }
+      }
+    }
+  }
   GlobalVariable *FLogGV = nullptr;
   GlobalVariable *flog() {
     if (FLogGV)
@@ -562,10 +605,11 @@ struct Inv {
     Type *I64 = Type::getInt64Ty(M.getContext());
     auto *Ent = ArrayType::get(I64, 2 * FLogN);
     auto *Ty = StructType::get(M.getContext(), {I64, Ent});
-    FLogGV = M.getGlobalVariable("__cheri_free_log");
+    std::string Name = FLogN == 8 ? "__cheri_free_log" : "__cheri_free_log" + std::to_string(FLogN);
+    FLogGV = M.getGlobalVariable(Name);
     if (!FLogGV) {
       FLogGV = new GlobalVariable(M, Ty, false, GlobalValue::LinkOnceODRLinkage,
-                                  Constant::getNullValue(Ty), "__cheri_free_log",
+                                  Constant::getNullValue(Ty), Name,
                                   nullptr, GlobalValue::NotThreadLocal, 200);
       FLogGV->setVisibility(GlobalValue::HiddenVisibility);
       FLogGV->setAlignment(Align(16));
@@ -597,6 +641,10 @@ struct Inv {
             CB->getOperandBundle(memannot::TagFree) || CB->doesNotReturn() ||
             CB->onlyReadsMemory() || CB->onlyAccessesInaccessibleMemory())
           continue;
+        if (FLogMayFree && !callMayFree(CB)) {
+          ++FLogNoFree;
+          continue;
+        }
         Calls.push_back(CB);
       }
     // Decide every call first: the splits below invalidate DT.
@@ -737,6 +785,10 @@ struct Inv {
   }
 
   void run() {
+    FLogN = FLogRing;
+    FLogCheck = std::min<unsigned>(FLogChecks, FLogN);
+    if (FLog && FLogMayFree)
+      computeMayFree();
     for (Function &F : M)
       if (!F.isDeclaration())
         runOn(F);
@@ -753,7 +805,7 @@ struct Inv {
            << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
            << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
            << " asm_noescape=" << AsmNoEscape << " flog_frees=" << FLogFrees
-         << " flog_calls=" << FLogCalls << "\n";
+         << " flog_calls=" << FLogCalls << " flog_nofree=" << FLogNoFree << "\n";
     }
   }
 };
