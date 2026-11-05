@@ -2,7 +2,7 @@
 ; that turns a tagged capability into an untagged one faults right there, via
 ; a volatile load of the result tagged with a cheri_trap_map record (kind 5,
 ; no debug location: the function name as the file, line 0).
-; RUN: opt -S -passes=cheri-bounds-lowering -cheri-narrow-tag-check < %s | FileCheck %s
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-narrow-tag-check -cheri-narrow-tag-check-lazy=false < %s | FileCheck %s
 ; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=OFF
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 

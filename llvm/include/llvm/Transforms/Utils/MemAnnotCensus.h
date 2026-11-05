@@ -55,6 +55,8 @@ LLVM_ABI bool runCheriBoundsLoweringStub(Module &M);
 LLVM_ABI bool runCheriBoundsLowering(Module &M);
 /// [LLM-generated] M5r R4 Track B prototype (-cheri-invalidate).
 LLVM_ABI bool runCheriInvalidate(Module &M);
+/// [LLM-generated] M5r R9: -cheri-invalidate includes free (D67 gating).
+LLVM_ABI bool cheriInvalidateFreeActive();
 /// Set by -mem-annot-census: add the start census at pipeline start.
 LLVM_ABI bool censusAtPipelineStart();
 /// True while a start census is pending for \p M (D14: InstCombine keeps

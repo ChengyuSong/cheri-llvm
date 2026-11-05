@@ -1,7 +1,8 @@
 ; [LLM-generated] M5r R4 Track B prototype (-cheri-invalidate): frame capability
 ; slots are cleared at a free ("mem.free") and at a lifetime.end (scope).
+; R9 (D69): the default is loan+free, so NONE (no free/scope clear) now names -cheri-invalidate=loan.
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all < %s | FileCheck %s
-; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=NONE
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s --check-prefix=NONE
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=all -cheri-invalidate-filter=false < %s | FileCheck %s --check-prefix=NOFILT
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
