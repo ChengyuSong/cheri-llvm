@@ -38,9 +38,11 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("loan+free"), cl::Hidden,
-    cl::desc("M5r Track B: none, scope, free, loan, loan+free (default, R9 "
-             "D69; R8 D57: loan), all, or a "
+    "cheri-invalidate", cl::init("loan+free+slite"), cl::Hidden,
+    cl::desc("M5r Track B: none, scope, slite (scope range checks without "
+             "own-slot nulls, R10 D73), free, loan, flog (R10 D72 free log, "
+             "opt-in), loan+free+slite (default, owner-approved R10; R9 D69: "
+             "loan+free; R8 D57: loan), all, or a "
              "'+'-list (scope+free = R4 all)"));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
 // before lifetime.end, or a loan clear) is a dead store to codegen:
@@ -67,6 +69,7 @@ static cl::opt<bool> InvOwnNull(
     "cheri-invalidate-own-null", cl::init(true), cl::Hidden,
     cl::desc("M5r R10 (D73): at a lifetime.end, null the dying object's own "
              "capability slots (default; =false keeps only the range checks)"));
+static bool InvOwnNullEff = true;
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
@@ -689,7 +692,7 @@ struct Inv {
         ++ScopeEvents;
         B.SetInsertPoint(E);
         auto It = CapSlots.find(A);
-        if (It != CapSlots.end() && InvOwnNull)
+        if (It != CapSlots.end() && InvOwnNullEff)
           for (int64_t Off : It->second) {
             Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
             markClear(B.CreateAlignedStore(
@@ -766,7 +769,10 @@ bool memannot::cheriInvalidateFreeActive() {
 bool memannot::runCheriInvalidate(Module &M) {
   StringRef Mode = InvalidateOpt;
   bool All = Mode == "all";
-  bool Scope = All || Mode.contains("scope");
+  // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
+  bool SLite = Mode.contains("slite");
+  bool Scope = All || Mode.contains("scope") || SLite;
+  InvOwnNullEff = InvOwnNull && !(SLite && !Mode.contains("scope") && !All);
   bool Free = All || Mode.contains("free");
   bool Loan = All || Mode.contains("loan");
   bool FLogOn = Mode.contains("flog");
