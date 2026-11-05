@@ -123,7 +123,61 @@ static cl::opt<bool> NarrowTagCheckLazy(
     "cheri-narrow-tag-check-lazy", cl::init(true), cl::Hidden,
     cl::desc("M5r R9 (D66): branch on the narrowed result's tag first and read "
              "the input's tag only on the cold path"));
-static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0, NarrowTagLazy = 0;
+static cl::opt<bool> NarrowTagCheckMapUses(
+    "cheri-narrow-tag-check-map-uses", cl::init(true), cl::Hidden,
+    cl::desc("M5r R10 (D70): a narrowing whose result is only ever accessed "
+             "(loads/stores through it, GEPs/PHIs of it, compares) gets no "
+             "explicit check; its accesses carry the kind-5 trap record so a "
+             "tag fault there reports the narrowing"));
+static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0, NarrowTagLazy = 0,
+                NarrowTagMapped = 0;
+// [LLM-generated] R10 (D70): the accesses through N if N never escapes (every
+// derived value is a GEP/PHI of N-derived values used only by loads, stores
+// as the address, compares, or more of those). Empty optional: escapes.
+static std::optional<SmallVector<Instruction *, 8>>
+narrowAccessesOnly(Instruction *N) {
+  SmallPtrSet<Value *, 16> D;
+  SmallVector<Value *, 16> Work{N};
+  SmallVector<PHINode *, 4> Phis;
+  SmallVector<Instruction *, 8> Acc;
+  D.insert(N);
+  while (!Work.empty()) {
+    Value *V = Work.pop_back_val();
+    for (User *U : V->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        return std::nullopt;
+      if (auto *L = dyn_cast<LoadInst>(I)) {
+        if (L->getPointerOperand() != V)
+          return std::nullopt;
+        Acc.push_back(L);
+      } else if (auto *S = dyn_cast<StoreInst>(I)) {
+        if (S->getPointerOperand() != V || S->getValueOperand() == V)
+          return std::nullopt;
+        Acc.push_back(S);
+      } else if (isa<ICmpInst>(I)) {
+        continue;
+      } else if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+        if (G->getPointerOperand() != V)
+          return std::nullopt;
+        if (D.insert(G).second)
+          Work.push_back(G);
+      } else if (auto *P = dyn_cast<PHINode>(I)) {
+        if (D.insert(P).second) {
+          Phis.push_back(P);
+          Work.push_back(P);
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+  }
+  for (PHINode *P : Phis)
+    for (Value *In : P->incoming_values())
+      if (!D.count(In))
+        return std::nullopt;
+  return Acc;
+}
 static unsigned NarrowTagChecks = 0;
 static void runNarrowTagCheck(Module &M) {
   if (!NarrowTagCheck)
@@ -206,6 +260,16 @@ static void runNarrowTagCheck(Module &M) {
           ConstantAsMetadata::get(ConstantDataArray::getString(Ctx, File, false))};
       MDNode *MD = MDNode::get(
           Ctx, {MDString::get(Ctx, "cheri_trap_map"), MDNode::get(Ctx, Aux)});
+      if (NarrowTagCheckMapUses)
+        if (auto Acc = narrowAccessesOnly(N)) {
+          // R10 (D70): an untagged result faults at its first access anyway;
+          // map that access to the narrowing instead of testing every time.
+          for (Instruction *A : *Acc)
+            if (!A->getMetadata(LLVMContext::MD_pcsections))
+              A->setMetadata(LLVMContext::MD_pcsections, MD);
+          ++NarrowTagMapped;
+          continue;
+        }
       Instruction *After = N->getNextNode();
       IRBuilder<> B(After);
       Function *TagF =
@@ -1619,7 +1683,8 @@ struct Lowering {
            << " narrow_tag_checks=" << NarrowTagChecks
            << " narrow_tag_const_skipped=" << NarrowTagSkippedConst
            << " narrow_tag_hoisted=" << NarrowTagHoisted
-           << " narrow_tag_lazy=" << NarrowTagLazy << " claims=" << S.Claims
+           << " narrow_tag_lazy=" << NarrowTagLazy
+           << " narrow_tag_mapped=" << NarrowTagMapped << " claims=" << S.Claims
            << " claim_narrowed=" << S.ClaimNarrowed
            << " claim_verified=" << S.ClaimVerified
            << " claim_proof=" << S.ClaimProof

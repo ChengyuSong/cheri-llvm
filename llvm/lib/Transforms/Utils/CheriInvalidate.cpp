@@ -26,6 +26,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/MemAnnot.h"
@@ -60,6 +61,12 @@ static void markClear(Instruction *I, StringRef Sec) {
   I->setMetadata(LLVMContext::MD_pcsections,
                  MDNode::get(Ctx, {MDString::get(Ctx, Sec)}));
 }
+// [LLM-generated] R10 (D73): scope mode without the own-slot nulls (the
+// range checks of other slots into the dying object stay: u2).
+static cl::opt<bool> InvOwnNull(
+    "cheri-invalidate-own-null", cl::init(true), cl::Hidden,
+    cl::desc("M5r R10 (D73): at a lifetime.end, null the dying object's own "
+             "capability slots (default; =false keeps only the range checks)"));
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
@@ -101,7 +108,8 @@ struct Slot {
 struct Inv {
   Module &M;
   const DataLayout &DL;
-  bool Scope, Free, Loan;
+  bool Scope, Free, Loan, FLog = false;
+  unsigned FLogFrees = 0, FLogCalls = 0;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
   unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0, LoanEscaped = 0,
@@ -538,9 +546,109 @@ struct Inv {
     return true;
   }
 
+  // [LLM-generated] R10 (D72) free log: a small global ring of the last
+  // freed [base, len) ranges and a free counter. A free event appends; a
+  // caller whose live heap-capable frame slots are read after a call checks
+  // them against the entries the call appended (frees in other frames, hu5).
+  // Fail-safe: an overflowed ring only misses clears, it never adds one.
+  static constexpr unsigned FLogN = 8, FLogCheck = 4;
+  GlobalVariable *FLogGV = nullptr;
+  GlobalVariable *flog() {
+    if (FLogGV)
+      return FLogGV;
+    Type *I64 = Type::getInt64Ty(M.getContext());
+    auto *Ent = ArrayType::get(I64, 2 * FLogN);
+    auto *Ty = StructType::get(M.getContext(), {I64, Ent});
+    FLogGV = M.getGlobalVariable("__cheri_free_log");
+    if (!FLogGV) {
+      FLogGV = new GlobalVariable(M, Ty, false, GlobalValue::LinkOnceODRLinkage,
+                                  Constant::getNullValue(Ty), "__cheri_free_log",
+                                  nullptr, GlobalValue::NotThreadLocal, 200);
+      FLogGV->setVisibility(GlobalValue::HiddenVisibility);
+      FLogGV->setAlignment(Align(16));
+    }
+    return FLogGV;
+  }
+  Value *flogCount(IRBuilder<> &B) {
+    return B.CreateAlignedLoad(B.getInt64Ty(), flog(), Align(8), true, "cheri.flog.n");
+  }
+  Value *flogEnt(IRBuilder<> &B, Value *Idx, unsigned Field) {
+    Type *I64 = B.getInt64Ty();
+    Value *I = B.CreateAdd(B.CreateShl(B.CreateAnd(Idx, FLogN - 1), 1), B.getInt64(Field));
+    return B.CreateInBoundsGEP(flog()->getValueType(), flog(), {B.getInt32(0), B.getInt32(1), I});
+    (void)I64;
+  }
+  void flogAppend(IRBuilder<> &B, Value *Lo, Value *Len) {
+    Value *N = flogCount(B);
+    B.CreateAlignedStore(Lo, flogEnt(B, N, 0), Align(8), true);
+    B.CreateAlignedStore(Len, flogEnt(B, N, 1), Align(8), true);
+    B.CreateAlignedStore(B.CreateAdd(N, B.getInt64(1)), flog(), Align(8), true);
+    ++FLogFrees;
+  }
+  void flogCalls(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &CapSlots,
+                 DominatorTree &DT) {
+    SmallVector<CallBase *, 8> Calls;
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        if (isa<IntrinsicInst>(CB) || CB->isInlineAsm() || isa<InvokeInst>(CB) ||
+            CB->getOperandBundle(memannot::TagFree) || CB->doesNotReturn() ||
+            CB->onlyReadsMemory() || CB->onlyAccessesInaccessibleMemory())
+          continue;
+        Calls.push_back(CB);
+      }
+    // Decide every call first: the splits below invalidate DT.
+    SmallVector<std::pair<CallBase *, SmallVector<Slot, 4>>, 8> Todo;
+    for (CallBase *C : Calls) {
+      SmallVector<Slot, 4> Ss;
+      // An escaping slot may be rewritten by the callee with a capability to
+      // an object allocated in a block the same call freed: not checked.
+      for (auto &[S, Offs] : CapSlots)
+        if (!escapes(S) && liveAt(S, C, DT) && readLater(S, C, DT))
+          for (int64_t Off : Offs)
+            if (mayHoldHeap({S, Off}))
+              Ss.push_back({S, Off});
+      if (!Ss.empty())
+        Todo.push_back({C, Ss});
+    }
+    for (auto &[C, Ss] : Todo) {
+      IRBuilder<> B(C);
+      Value *N0 = flogCount(B);
+      B.SetInsertPoint(C->getNextNode());
+      Value *N1 = flogCount(B);
+      Value *D = B.CreateSub(N1, N0);
+      Instruction *Then = SplitBlockAndInsertIfThen(B.CreateICmpNE(D, B.getInt64(0)),
+                                                    &*B.GetInsertPoint(), false);
+      IRBuilder<> TB(Then);
+      for (unsigned K = 0; K < FLogCheck; ++K) {
+        Value *Idx = TB.CreateSub(N1, TB.getInt64(K + 1));
+        Value *Lo = TB.CreateAlignedLoad(TB.getInt64Ty(), flogEnt(TB, Idx, 0), Align(8), true);
+        Value *Len = TB.CreateAlignedLoad(TB.getInt64Ty(), flogEnt(TB, Idx, 1), Align(8), true);
+        Len = TB.CreateSelect(TB.CreateICmpUGT(D, TB.getInt64(K)), Len, TB.getInt64(0));
+        for (Slot S : Ss)
+          checkAndClear(TB, S, Lo, Len, "cheri_inv_free");
+      }
+      ++FLogCalls;
+    }
+  }
+
   void runOn(Function &F) {
     MapVector<AllocaInst *, SmallVector<int64_t, 2>> CapSlots;
     collectSlots(F, CapSlots);
+    if (FLog) {
+      // R10 (D72): every free event of every function appends to the log.
+      for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (!isa<InvokeInst>(CB))
+            if (auto OB = CB->getOperandBundle(memannot::TagFree))
+              if (DL.isFatPointer(OB->Inputs[0]->getType())) {
+                IRBuilder<> B(CB);
+                Value *P = OB->Inputs[0];
+                Value *Lo = B.CreateCall(decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}), {P});
+                Value *Len = B.CreateCall(decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}), {P});
+                Value *T = B.CreateCall(decl(Intrinsic::cheri_cap_tag_get), {P});
+                flogAppend(B, Lo, B.CreateSelect(T, Len, B.getInt64(0)));
+              }
+    }
     // Feasibility count for loan-end invalidation (design only, 7.2).
     for (Instruction &I : instructions(F))
       if (I.getMetadata(memannot::LastUseMD)) {
@@ -581,7 +689,7 @@ struct Inv {
         ++ScopeEvents;
         B.SetInsertPoint(E);
         auto It = CapSlots.find(A);
-        if (It != CapSlots.end())
+        if (It != CapSlots.end() && InvOwnNull)
           for (int64_t Off : It->second) {
             Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
             markClear(B.CreateAlignedStore(
@@ -621,6 +729,8 @@ struct Inv {
               checkAndClear(B, {S, Off}, Lo, Len, "cheri_inv_free");
         }
       }
+    if (FLog)
+      flogCalls(F, CapSlots, DT); // last: it splits blocks
   }
 
   void run() {
@@ -639,7 +749,8 @@ struct Inv {
            << " lu_frame_copies=" << LUFrameCopies << " filtered=" << Filtered
            << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
            << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
-           << " asm_noescape=" << AsmNoEscape << "\n";
+           << " asm_noescape=" << AsmNoEscape << " flog_frees=" << FLogFrees
+         << " flog_calls=" << FLogCalls << "\n";
     }
   }
 };
@@ -658,9 +769,11 @@ bool memannot::runCheriInvalidate(Module &M) {
   bool Scope = All || Mode.contains("scope");
   bool Free = All || Mode.contains("free");
   bool Loan = All || Mode.contains("loan");
-  if (!Scope && !Free && !Loan && InvStatsOut.empty())
+  bool FLogOn = Mode.contains("flog");
+  if (!Scope && !Free && !Loan && !FLogOn && InvStatsOut.empty())
     return false;
   Inv I(M, Scope, Free, Loan);
+  I.FLog = FLogOn;
   I.run();
-  return Scope || Free || Loan;
+  return Scope || Free || Loan || FLogOn;
 }
