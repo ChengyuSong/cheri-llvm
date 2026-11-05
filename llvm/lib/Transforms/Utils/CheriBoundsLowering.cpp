@@ -134,17 +134,22 @@ static unsigned NarrowTagSkippedConst = 0, NarrowTagHoisted = 0, NarrowTagLazy =
 // [LLM-generated] R10 (D70): the accesses through N if N never escapes (every
 // derived value is a GEP/PHI of N-derived values used only by loads, stores
 // as the address, compares, or more of those). Empty optional: escapes.
+static User *NarrowEsc = nullptr;
+static cl::opt<bool> NarrowTagDebug("cheri-narrow-tag-check-debug", cl::init(false),
+                                    cl::Hidden);
 static std::optional<SmallVector<Instruction *, 8>>
 narrowAccessesOnly(Instruction *N) {
   SmallPtrSet<Value *, 16> D;
   SmallVector<Value *, 16> Work{N};
   SmallVector<PHINode *, 4> Phis;
+  SmallVector<SelectInst *, 4> Sels;
   SmallVector<Instruction *, 8> Acc;
   D.insert(N);
   while (!Work.empty()) {
     Value *V = Work.pop_back_val();
     for (User *U : V->users()) {
       auto *I = dyn_cast<Instruction>(U);
+      NarrowEsc = U;
       if (!I)
         return std::nullopt;
       if (auto *L = dyn_cast<LoadInst>(I)) {
@@ -162,6 +167,31 @@ narrowAccessesOnly(Instruction *N) {
           return std::nullopt;
         if (D.insert(G).second)
           Work.push_back(G);
+      } else if (auto *C = dyn_cast<CallBase>(I);
+                 C && C->getCalledFunction() &&
+                 C->getCalledFunction()->getName().starts_with("llvm.mem.claim") &&
+                 C->getArgOperand(0) == V &&
+                 llvm::count(C->args(), V) == 1) {
+        // [LLM-generated] R11 (D76): a rustc claim fact returns its pointer
+        // argument unchanged; follow it like a GEP.
+        if (D.insert(C).second)
+          Work.push_back(C);
+      } else if (auto *C = dyn_cast<CallBase>(I);
+                 C && C->getCalledFunction() &&
+                 C->getCalledFunction()->getIntrinsicID() == Intrinsic::trap &&
+                 llvm::count(C->args(), V) == 0) {
+        // [LLM-generated] R12 (D78/D76b): V only appears in an operand bundle
+        // (the "mem.check" record of a bounds trap): a fact, not an access.
+        continue;
+      } else if (auto *Sel = dyn_cast<SelectInst>(I);
+                 Sel && Sel->getCondition() != V) {
+        // [LLM-generated] R12 (D78/D76b): a select between N-derived values
+        // and values with the same underlying base as N's input; the other
+        // arm is checked below (like a PHI incoming).
+        if (D.insert(Sel).second) {
+          Sels.push_back(Sel);
+          Work.push_back(Sel);
+        }
       } else if (auto *P = dyn_cast<PHINode>(I)) {
         if (D.insert(P).second) {
           Phis.push_back(P);
@@ -176,6 +206,30 @@ narrowAccessesOnly(Instruction *N) {
     for (Value *In : P->incoming_values())
       if (!D.count(In))
         return std::nullopt;
+  auto Base = [](Value *X) {
+    for (;;) {
+      X = X->stripPointerCasts();
+      if (auto *G = dyn_cast<GetElementPtrInst>(X))
+        X = G->getPointerOperand();
+      else if (auto *C = dyn_cast<CallBase>(X);
+               C && C->getCalledFunction() &&
+               (C->getCalledFunction()->getName().starts_with("llvm.mem.claim") ||
+                C->getCalledFunction()->getIntrinsicID() ==
+                    Intrinsic::cheri_cap_bounds_set_exact ||
+                C->getCalledFunction()->getIntrinsicID() ==
+                    Intrinsic::cheri_cap_bounds_set))
+        X = C->getArgOperand(0);
+      else
+        return X;
+    }
+  };
+  Value *NB = Base(N->getOperand(0));
+  for (SelectInst *Sel : Sels)
+    for (Value *In : {Sel->getTrueValue(), Sel->getFalseValue()})
+      if (!D.count(In) && Base(In) != NB) {
+        NarrowEsc = Sel;
+        return std::nullopt;
+      }
   return Acc;
 }
 static unsigned NarrowTagChecks = 0;
@@ -269,6 +323,10 @@ static void runNarrowTagCheck(Module &M) {
               A->setMetadata(LLVMContext::MD_pcsections, MD);
           ++NarrowTagMapped;
           continue;
+        } else if (NarrowTagDebug) {
+          errs() << "narrow-tag-escape: " << N->getFunction()->getName() << ": ";
+          if (NarrowEsc) NarrowEsc->print(errs());
+          errs() << "\n";
         }
       Instruction *After = N->getNextNode();
       IRBuilder<> B(After);
