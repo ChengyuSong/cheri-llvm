@@ -174,12 +174,21 @@ static cl::opt<bool> MemLastUseFanout(
 
 static void anchorLastUse(Instruction &InsertBefore, MDNode *LU);
 
+// Erase hooks re-enter if an anchor insertion or a CFG walk deletes another
+// carrier. Nested transfers see a half-updated block and must not run.
+static bool InLastUseTransfer = false;
+
 static void transferLastUse(Instruction &I) {
-  if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
+  if (InLastUseTransfer || !MemLastUseTransfer ||
+      !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
     return;
   MDNode *LU = I.getMetadata(memannot::LastUseMD);
   if (!LU)
     return;
+  struct Reset {
+    Reset() { InLastUseTransfer = true; }
+    ~Reset() { InLastUseTransfer = false; }
+  } R;
   const Value *P = nullptr;
   if (auto *LI = dyn_cast<LoadInst>(&I))
     P = LI->getPointerOperand();
@@ -220,7 +229,7 @@ static void transferLastUse(Instruction &I) {
         GiveUp();
         return;
       }
-      Start = BB->getTerminator();
+      Start = BB->getTerminatorOrNull();
       if (!Start) {
         GiveUp();
         return;
@@ -361,10 +370,34 @@ static bool forwardLastUseWalk(BasicBlock *BB, Instruction *From, MDNode *LU) {
 // \p InsertBefore. The call writes only inaccessible memory, so ordinary
 // load/store opts still see it as not touching their objects. It is not a
 // capability clear; CheriInvalidate reads the bundle.
+//
+// The block must still end in a terminator after \p InsertBefore is deleted.
+// Invoke lowering inserts the replacement branch first, then erases the
+// invoke. An anchor between that branch and the invoke becomes the end of
+// the block and removeUnreachableBlocks asserts in getTerminator(). When the
+// only terminator is \p InsertBefore itself, the anchor is dropped: there is
+// no well-formed slot for it.
 static void anchorLastUse(Instruction &InsertBefore, MDNode *LU) {
   if (!LU || !InsertBefore.getParent() || !InsertBefore.getFunction())
     return;
-  LLVMContext &Ctx = InsertBefore.getContext();
+  Instruction *IP = &InsertBefore;
+  Instruction *SurvivingTerm = nullptr;
+  for (Instruction *I = IP; I; I = I->getPrevNode()) {
+    if (!I->isTerminator()) {
+      if (SurvivingTerm)
+        break;
+      continue;
+    }
+    SurvivingTerm = I;
+  }
+  if (SurvivingTerm) {
+    if (SurvivingTerm == IP)
+      return;
+    IP = SurvivingTerm;
+  } else if (!InsertBefore.getParent()->hasTerminator()) {
+    return;
+  }
+  LLVMContext &Ctx = IP->getContext();
   Type *I64 = Type::getInt64Ty(Ctx);
   SmallVector<Value *, 4> Ids;
   for (const MDOperand &Op : LU->operands()) {
@@ -375,11 +408,11 @@ static void anchorLastUse(Instruction &InsertBefore, MDNode *LU) {
   }
   if (Ids.empty())
     return;
-  Module *M = InsertBefore.getModule();
+  Module *M = IP->getModule();
   Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
   OperandBundleDef OB(memannot::LastUseMD.str(),
                       std::vector<Value *>(Ids.begin(), Ids.end()));
-  CallInst::Create(Fact, {}, {OB}, "", InsertBefore.getIterator());
+  CallInst::Create(Fact, {}, {OB}, "", IP->getIterator());
 }
 
 void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
