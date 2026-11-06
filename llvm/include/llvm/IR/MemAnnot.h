@@ -27,7 +27,10 @@
 //                                   fail-safe. Inliner copy keys that do not fit
 //                                   in bits 42..62 become !{i64 orig, i64 disambiguator}.
 //   !mem.loan !{i64 Loan, ...}      on the store of a borrowed reference.
-//                                   An extended copy is !{!{i64 orig, i64 disambiguator}}.
+//                                   A list of i64s is that many packed loans.
+//                                   An extended copy is one operand
+//                                   !{!"mem.loan.ext", i64 orig, i64 disambiguator},
+//                                   never a bare !{i64, i64}.
 //   Storage-dead of a slot is llvm.lifetime.end.
 //
 // Fail-safe directions: losing !mem.guard, "mem.alloc_inbounds" or
@@ -80,10 +83,14 @@ inline constexpr StringRef LastUseExt = "mem.last_use.ext";
 inline constexpr StringRef LoanMD = "mem.loan";
 /// R5: the LLVM inliner re-keys a cloned body's loan ids in bits 42..62; the
 /// low bits keep the original id (census key). R16: if every non-zero high
-/// value is already used for that census key, the copy is an extended id
-/// !{i64 orig, i64 disambiguator} instead of being dropped.
+/// value is already used for that census key, the copy is an extended operand
+/// !{!"mem.loan.ext", i64 orig, i64 disambiguator}. A bare !{i64, i64} stays
+/// two packed loans. If no packed key and no disambiguator is free, the
+/// inliner stops compilation instead of reusing an id.
 inline constexpr uint64_t LoanKeyMask = (uint64_t(1) << 42) - 1;
 inline constexpr unsigned LoanHighBits = 21;
+/// First operand of an extended loan-copy metadata node.
+inline constexpr StringRef LoanExtTag = "mem.loan.ext";
 
 /// One loan copy. Packed ids use \c Packed (high bits non-zero once rekeyed).
 /// Extended ids use \c Orig and a non-zero \c Disambig; \c Packed is then 0.
@@ -102,13 +109,17 @@ struct LoanRef {
 /// Next copy of a loan. \p Orig is the census key, \p OldHigh the previous
 /// copy field (0 for a rustc id). \p HighBits is 1..21 (21 in production).
 /// \p PackedTaken / \p DisambigTaken are ids already live in the caller or
-/// assigned earlier in this remap. Always returns a copy that those predicates
-/// reject.
+/// assigned earlier in this remap. \p DisambigLimit is the largest
+/// disambiguator that may be used; 0 means the full 64-bit space. Does not
+/// return. Stops compilation if every allowed id is taken.
 LLVM_ABI LoanRef allocateLoanCopy(uint64_t Orig, uint64_t OldHigh, uint64_t Salt,
                                   function_ref<bool(uint64_t)> PackedTaken,
                                   function_ref<bool(uint64_t)> DisambigTaken,
-                                  unsigned HighBits = LoanHighBits);
-/// Operands of !mem.loan / !mem.last_use: a packed i64, or !{i64 orig, i64 disambiguator}.
+                                  unsigned HighBits = LoanHighBits,
+                                  uint64_t DisambigLimit = 0);
+/// Operands of !mem.loan / !mem.last_use: a packed i64, or
+/// !{!"mem.loan.ext", i64 orig, i64 disambiguator}. A !{i64, i64} node is not
+/// an operand of this form.
 LLVM_ABI void appendLoanRefs(const MDNode *N, SmallVectorImpl<LoanRef> &Out);
 /// One operand. False if \p M is not a loan id (the caller keeps it).
 LLVM_ABI bool decodeLoanRef(const Metadata *M, LoanRef &R);

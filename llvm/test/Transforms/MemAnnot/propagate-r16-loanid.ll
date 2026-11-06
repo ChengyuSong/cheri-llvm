@@ -133,16 +133,16 @@ define void @ext_no(ptr addrspace(200) %p) addrspace(200) {
 
 ; EX-DAG: [[P]] = !{i64 4398046511107}
 ; EX-DAG: [[E]] = !{[[EP:![0-9]+]]}
-; EX-DAG: [[EP]] = !{i64 3, i64 1}
+; EX-DAG: [[EP]] = !{!"mem.loan.ext", i64 3, i64 1}
 ; EX-DAG: [[OLD]] = !{[[OP:![0-9]+]]}
-; EX-DAG: [[OP]] = !{i64 3, i64 4}
+; EX-DAG: [[OP]] = !{!"mem.loan.ext", i64 3, i64 4}
 ; EX-DAG: [[YES]] = !{[[YP:![0-9]+]]}
-; EX-DAG: [[YP]] = !{i64 5, i64 9}
+; EX-DAG: [[YP]] = !{!"mem.loan.ext", i64 5, i64 9}
 ; EX-DAG: [[NO]] = !{[[NP:![0-9]+]]}
-; EX-DAG: [[NP]] = !{i64 5, i64 1}
+; EX-DAG: [[NP]] = !{!"mem.loan.ext", i64 5, i64 1}
 
 !0 = !{i64 3}
 !1 = !{i64 4398046511107}
-!2 = !{!{i64 3, i64 4}}
-!3 = !{!{i64 5, i64 9}}
-!4 = !{!{i64 5, i64 1}}
+!2 = !{!{!"mem.loan.ext", i64 3, i64 4}}
+!3 = !{!{!"mem.loan.ext", i64 5, i64 9}}
+!4 = !{!{!"mem.loan.ext", i64 5, i64 1}}

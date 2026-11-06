@@ -14,6 +14,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
@@ -102,10 +103,12 @@ bool memannot::isTriviallyAllocInbounds(const Value *V, const DataLayout &DL) {
 // [LLM-generated] M5r R16: one loan copy. A packed id uses bits 42..62.
 // Those bits are never 0 after a remap (0 would alias an unrekeyed rustc id).
 // If every non-zero value is already live, the copy is (orig, disambiguator).
+// If that space is exhausted too, compilation stops. Reusing disambiguator 1
+// would clear a different copy.
 memannot::LoanRef memannot::allocateLoanCopy(uint64_t Orig, uint64_t OldHigh, uint64_t Salt,
                                   function_ref<bool(uint64_t)> PackedTaken,
                                   function_ref<bool(uint64_t)> DisambigTaken,
-                                  unsigned HighBits) {
+                                  unsigned HighBits, uint64_t DisambigLimit) {
   unsigned Bits = HighBits;
   if (Bits == 0 || Bits > LoanHighBits)
     Bits = LoanHighBits;
@@ -130,14 +133,21 @@ memannot::LoanRef memannot::allocateLoanCopy(uint64_t Orig, uint64_t OldHigh, ui
     if (TryH(H, R))
       return R;
   }
+  auto GiveUp = [&]() -> LoanRef {
+    reportFatalUsageError("mem-inline-loan: no free copy id for census key " +
+                          Twine(Low));
+  };
+  if (DisambigLimit != 0) {
+    for (uint64_t D = 1; D <= DisambigLimit; ++D)
+      if (!DisambigTaken(D))
+        return LoanRef{Low, 0, D};
+    return GiveUp();
+  }
   uint64_t D = 1;
   while (D && DisambigTaken(D))
     ++D;
-  // Every packed copy key and all 2^64-1 disambiguators are live. A further
-  // distinct id does not fit in this encoding. Emitting disambiguator 1 can
-  // alias; that state is not reached by the inliner tests.
   if (D == 0)
-    D = 1;
+    return GiveUp();
   return LoanRef{Low, 0, D};
 }
 
@@ -155,12 +165,17 @@ bool memannot::decodeLoanRef(const Metadata *M, LoanRef &R) {
     R = LoanRef{V & LoanKeyMask, V, 0};
     return true;
   }
+  // A !{i64, i64} node is a multi-loan list, not one extended copy. The
+  // extended operand is tagged so the two shapes cannot be swapped.
   auto *N = dyn_cast<MDNode>(M);
-  if (!N || N->getNumOperands() != 2)
+  if (!N || N->getNumOperands() != 3)
+    return false;
+  auto *Tag = dyn_cast<MDString>(N->getOperand(0));
+  if (!Tag || Tag->getString() != LoanExtTag)
     return false;
   uint64_t Orig = 0, D = 0;
-  if (!constInt64(N->getOperand(0).get(), Orig) ||
-      !constInt64(N->getOperand(1).get(), D) || D == 0)
+  if (!constInt64(N->getOperand(1).get(), Orig) ||
+      !constInt64(N->getOperand(2).get(), D) || D == 0)
     return false;
   R = LoanRef{Orig & LoanKeyMask, 0, D};
   return true;
@@ -204,7 +219,8 @@ Metadata *memannot::encodeLoanRef(LLVMContext &Ctx, const LoanRef &R) {
   Type *I64 = Type::getInt64Ty(Ctx);
   if (R.extended())
     return MDNode::get(
-        Ctx, {ConstantAsMetadata::get(ConstantInt::get(I64, R.Orig)),
+        Ctx, {MDString::get(Ctx, LoanExtTag),
+              ConstantAsMetadata::get(ConstantInt::get(I64, R.Orig)),
               ConstantAsMetadata::get(ConstantInt::get(I64, R.Disambig))});
   return ConstantAsMetadata::get(ConstantInt::get(I64, R.Packed));
 }

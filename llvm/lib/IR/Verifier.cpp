@@ -5763,15 +5763,19 @@ void Verifier::visitMemCacheHintMetadata(Instruction &I, MDNode *MD) {
 }
 
 // [LLM-generated] M5r R16: a loan operand is a packed i64, or one extended
-// copy !{i64 orig, i64 disambiguator}. The pair is one loan, not two ids.
+// copy !{!"mem.loan.ext", i64 orig, i64 disambiguator}. A !{i64, i64} list is
+// two packed loans, not one extended copy.
 static bool loanOperandOK(const MDOperand &Op) {
   if (mdconst::dyn_extract_or_null<ConstantInt>(Op))
     return true;
   auto *N = dyn_cast<MDNode>(Op);
-  if (!N || N->getNumOperands() != 2)
+  if (!N || N->getNumOperands() != 3)
     return false;
-  auto *A = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(0));
-  auto *B = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1));
+  auto *Tag = dyn_cast<MDString>(N->getOperand(0));
+  if (!Tag || Tag->getString() != memannot::LoanExtTag)
+    return false;
+  auto *A = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1));
+  auto *B = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(2));
   return A && B && A->getBitWidth() == 64 && B->getBitWidth() == 64 &&
          B->getZExtValue() != 0;
 }
@@ -5800,8 +5804,8 @@ void Verifier::visitInstruction(Instruction &I) {
     bool OK = LU->getNumOperands() > 0;
     for (const MDOperand &Op : LU->operands())
       OK &= loanOperandOK(Op);
-    Check(OK, "!mem.last_use must be a non-empty list of i64 loan ids or "
-              "!{i64 orig, i64 disambiguator} copies",
+    Check(OK, "!mem.last_use must be a non-empty list of packed i64 loan ids "
+              "or !{!\"mem.loan.ext\", i64 orig, i64 disambiguator} copies",
           &I);
   }
   // [LLM-generated] M5r R5 (D35): !mem.loan !{i64 loan, ...} on the store of
@@ -5811,8 +5815,8 @@ void Verifier::visitInstruction(Instruction &I) {
     bool OK = LN->getNumOperands() > 0;
     for (const MDOperand &Op : LN->operands())
       OK &= loanOperandOK(Op);
-    Check(OK, "!mem.loan must be a non-empty list of i64 loan ids or "
-              "!{i64 orig, i64 disambiguator} copies",
+    Check(OK, "!mem.loan must be a non-empty list of packed i64 loan ids or "
+              "!{!\"mem.loan.ext\", i64 orig, i64 disambiguator} copies",
           &I);
   }
 

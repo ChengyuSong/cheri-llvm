@@ -2036,6 +2036,13 @@ static cl::opt<unsigned> InlineLoanHighBits(
     "mem-inline-loan-high-bits", cl::init(memannot::LoanHighBits), cl::Hidden,
     cl::desc("Width of the packed inlined-loan copy field (1..21)."));
 
+// [LLM-generated] M5r R16: 0 is the full 64-bit disambiguator space. A test
+// sets a small N so exhaustion can be reached. Exhaustion stops compilation.
+static cl::opt<uint64_t> InlineLoanDisambigMax(
+    "mem-inline-loan-disambig-max", cl::init(0), cl::Hidden,
+    cl::desc("If non-zero, inlined loan copies may only use disambiguators "
+             "1..N. 0 uses the full 64-bit space."));
+
 static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
   static std::atomic<uint64_t> Salt{0};
   LLVMContext &Ctx = Caller->getContext();
@@ -2112,7 +2119,7 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
         Old.Orig, OldHigh, S,
         [&](uint64_t P) { return UsedPacked.count(P); },
         [&](uint64_t D) { return UsedDisambig.count(D); },
-        InlineLoanHighBits);
+        InlineLoanHighBits, InlineLoanDisambigMax);
     note(New);
     Map[K] = New;
   };
