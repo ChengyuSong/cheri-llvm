@@ -68,6 +68,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
@@ -1696,6 +1697,10 @@ static void hoist(Instruction &I, const DominatorTree *DT, const Loop *CurLoop,
                   BasicBlock *Dest, ICFLoopSafetyInfo *SafetyInfo,
                   MemorySSAUpdater &MSSAU, ScalarEvolution *SE,
                   OptimizationRemarkEmitter *ORE) {
+  // [LLM-generated] M5r R15: the preheader is before every in-loop carrier that
+  // used to precede I. Leave the loan end on the next carrier in the loop.
+  memannot::detachLastUseBeforeEarlierMove(I);
+
   LLVM_DEBUG(dbgs() << "LICM hoisting to " << Dest->getNameOrAsOperand() << ": "
                     << I << "\n");
   ORE->emit([&]() {

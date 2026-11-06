@@ -2,7 +2,8 @@
 ; D59: the erased last use of a promoted slot sits at the top of a block that
 ; branches; each successor with no other predecessor takes the ids on the first
 ; carrier of its path (%l). A join successor (%j, also entered from %y) gets
-; nothing. OLD (-mem-last-use-fanout=false) loses the end.
+; nothing. With fanout off, the erased load leaves an anchor in %x, so the
+; clear stays on that path and is not lost.
 ; RUN: opt -S -passes='function(sroa),cheri-bounds-lowering' < %s | FileCheck %s
 ; RUN: opt -S -passes='function(sroa),cheri-bounds-lowering' -mem-last-use-fanout=false < %s | FileCheck %s --check-prefix=OLD
 ; D60: an inlined callee whose return is reached through a join, one arm
@@ -44,8 +45,13 @@ j:
 ; CHECK-NEXT: call addrspace(200) void @f()
 ; CHECK-NEXT: ret void
 ; OLD-LABEL: define void @fan(
-; OLD-NOT: store volatile ptr addrspace(200) null
-; OLD: ret void
+; OLD: x:
+; OLD-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %b
+; OLD: y:
+; OLD-NEXT: br label %j
+; OLD: j:
+; OLD-NEXT: call addrspace(200) void @f()
+; OLD-NEXT: ret void
 
 define internal void @callee(i1 %c) {
 entry:

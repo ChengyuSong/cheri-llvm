@@ -3802,15 +3802,21 @@ private:
         IRB.CreateAlignedLoad(NewAllocaTy, &NewAI, NewAI.getAlign(), "load");
 
     Load->copyMetadata(LI, {LLVMContext::MD_mem_parallel_loop_access,
-                            LLVMContext::MD_access_group});
+                            LLVMContext::MD_access_group,
+                            LI.getContext().getMDKindID(memannot::LastUseMD),
+                            LI.getContext().getMDKindID(memannot::GuardMD)});
     return extractVector(IRB, Load, BeginIndex, EndIndex, "vec");
   }
 
   Value *rewriteIntegerLoad(LoadInst &LI) {
     assert(IntTy && "We cannot insert an integer to the alloca");
     assert(!LI.isVolatile());
-    Value *V =
+    LoadInst *Load =
         IRB.CreateAlignedLoad(NewAllocaTy, &NewAI, NewAI.getAlign(), "load");
+    // [LLM-generated] M5r R15: the integer reload is the same access.
+    Load->copyMetadata(LI, {LI.getContext().getMDKindID(memannot::LastUseMD),
+                            LI.getContext().getMDKindID(memannot::GuardMD)});
+    Value *V = Load;
     V = IRB.CreateBitPreservingCastChain(DL, V, IntTy);
     assert(NewBeginOffset >= NewAllocaBeginOffset && "Out of bounds offset");
     uint64_t Offset = NewBeginOffset - NewAllocaBeginOffset;
@@ -3898,8 +3904,11 @@ private:
 
       if (LI.isVolatile())
         NewLI->setAtomic(LI.getOrdering(), LI.getSyncScopeID());
+      // [LLM-generated] M5r R15: the rewritten load is the same access.
       NewLI->copyMetadata(LI, {LLVMContext::MD_mem_parallel_loop_access,
-                               LLVMContext::MD_access_group});
+                               LLVMContext::MD_access_group,
+                               LI.getContext().getMDKindID(memannot::LastUseMD),
+                               LI.getContext().getMDKindID(memannot::GuardMD)});
 
       V = NewLI;
       IsPtrAdjusted = true;
@@ -4058,9 +4067,11 @@ private:
           IRB.CreateAlignedStore(V, NewPtr, getSliceAlign(), SI.isVolatile());
     }
     NewSI->copyMetadata(SI, {LLVMContext::MD_mem_parallel_loop_access,
-                             LLVMContext::MD_access_group});
+                             LLVMContext::MD_access_group,
+                             SI.getContext().getMDKindID(memannot::LastUseMD)});
     // [LLM-generated] M5r R5 (D35): the rewritten store of a reference into
-    // the new (smaller) slot keeps its loan slot fact.
+    // the new (smaller) slot keeps its loan slot fact. A non-pointer slice
+    // does not: the loan names the stored reference, not the bytes around it.
     if (MDNode *Loan = SI.getMetadata(memannot::LoanMD))
       if (NewSI->getValueOperand()->getType()->isPointerTy())
         NewSI->setMetadata(memannot::LoanMD, Loan);

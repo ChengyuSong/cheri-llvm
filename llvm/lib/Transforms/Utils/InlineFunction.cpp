@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -2022,41 +2023,172 @@ static bool isLastUseCarrier(const Instruction &I) {
 // and !mem.loan ids of the cloned body with a per-inline salt, so that a
 // loan-end of one copy never names the slots of another copy. Runs before
 // the call site's own ids (caller loans) are moved into the body.
+// [LLM-generated] M5r R15: tests pin the salt to hit a high-bits-zero mix and a
+// collision with an id already live in the caller. 0 keeps the counter.
+static cl::opt<uint64_t> InlineLoanSalt(
+    "mem-inline-loan-salt", cl::init(0), cl::Hidden,
+    cl::desc("If non-zero, every inlined loan rekey uses this salt. "
+             "0 uses the per-inline counter."));
+
 static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
   static std::atomic<uint64_t> Salt{0};
   LLVMContext &Ctx = Caller->getContext();
   unsigned Kinds[2] = {Ctx.getMDKindID(memannot::LastUseMD),
                        Ctx.getMDKindID(memannot::LoanMD)};
-  uint64_t S = 0;
-  DenseMap<MDNode *, MDNode *> Done;
+  SmallPtrSet<BasicBlock *, 32> NewBBs;
   for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
-    for (Instruction &I : *BI)
+    NewBBs.insert(&*BI);
+  if (NewBBs.empty())
+    return;
+
+  auto mdIds = [](const MDNode *N, SmallVectorImpl<uint64_t> &Out) {
+    if (!N)
+      return;
+    for (const MDOperand &Op : N->operands())
+      if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op))
+        Out.push_back(C->getZExtValue());
+  };
+  DenseSet<uint64_t> Existing;
+  for (BasicBlock &BB : *Caller) {
+    if (NewBBs.count(&BB))
+      continue;
+    for (Instruction &I : BB)
+      for (unsigned K : Kinds) {
+        SmallVector<uint64_t, 4> Ids;
+        mdIds(I.getMetadata(K), Ids);
+        Existing.insert(Ids.begin(), Ids.end());
+      }
+  }
+
+  uint64_t S = 0;
+  auto freshSalt = [&]() {
+    if (S)
+      return;
+    if (uint64_t Fixed = InlineLoanSalt & 0x1fffff) {
+      S = Fixed;
+      return;
+    }
+    while (!(S = ++Salt & 0x1fffff))
+      ;
+  };
+  // [LLM-generated] M5r R15: mix the previous high bits with this inline's
+  // salt. Masking them off made two copies that had already been rekeyed
+  // (an inlined callee of the callee) collapse onto one id, so one copy's
+  // last-use cleared the other copy's slot. A result that would be 0 in the
+  // high bits, or equal to an id already live in the caller, is dropped.
+  DenseMap<uint64_t, uint64_t> OldToNew;
+  DenseSet<uint64_t> Drop;
+  auto classify = [&](uint64_t Old) {
+    if (OldToNew.count(Old) || Drop.count(Old))
+      return;
+    freshSalt();
+    uint64_t Low = Old & memannot::LoanKeyMask;
+    uint64_t OldHigh = (Old >> 42) & 0x1fffffull;
+    uint64_t NewHigh = (OldHigh ^ S) & 0x1fffffull;
+    uint64_t New = Low | (NewHigh << 42);
+    if (NewHigh == 0 || Existing.count(New)) {
+      Drop.insert(Old);
+      return;
+    }
+    for (const auto &KV : OldToNew)
+      if (KV.second == New) {
+        Drop.insert(Old);
+        Drop.insert(KV.first);
+        return;
+      }
+    OldToNew[Old] = New;
+  };
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB) {
+      for (unsigned K : Kinds) {
+        SmallVector<uint64_t, 4> Ids;
+        mdIds(I.getMetadata(K), Ids);
+        for (uint64_t Id : Ids)
+          classify(Id);
+      }
+      // Anchors created before this inline carry the same loan ids in a bundle.
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB))
+          if (auto OB = CB->getOperandBundle(memannot::LastUseMD))
+            for (Value *V : OB->Inputs)
+              if (auto *C = dyn_cast<ConstantInt>(V))
+                classify(C->getZExtValue());
+    }
+
+  DenseMap<MDNode *, MDNode *> Done;
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB)
       for (unsigned K : Kinds) {
         MDNode *N = I.getMetadata(K);
         if (!N)
           continue;
-        if (!S)
-          while (!(S = ++Salt & 0x1fffff))
-            ;
         MDNode *&New = Done[N];
         if (!New) {
           SmallVector<Metadata *, 4> Ids;
+          bool Any = false;
           for (const MDOperand &Op : N->operands()) {
             auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
             if (!C) {
               Ids.push_back(Op.get());
+              Any = true;
               continue;
             }
-            // Low 42 bits: the original id (the census keys on them);
-            // bits 42..62: the inline salt.
-            uint64_t V = (C->getZExtValue() & memannot::LoanKeyMask) |
-                         ((S & 0x1fffff) << 42);
-            Ids.push_back(ConstantAsMetadata::get(ConstantInt::get(C->getType(), V)));
+            uint64_t Old = C->getZExtValue();
+            if (Drop.count(Old))
+              continue;
+            auto It = OldToNew.find(Old);
+            if (It == OldToNew.end())
+              continue;
+            Ids.push_back(ConstantAsMetadata::get(
+                ConstantInt::get(C->getType(), It->second)));
+            Any = true;
           }
-          New = MDNode::get(Ctx, Ids);
+          New = Any ? MDNode::get(Ctx, Ids) : nullptr;
         }
         I.setMetadata(K, New);
       }
+  // Rewrite anchors with the same map. A dropped id is not left on the old
+  // value: that value can alias the caller's loan.
+  SmallVector<CallBase *, 4> Anchors;
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB) && CB->getOperandBundle(memannot::LastUseMD))
+          Anchors.push_back(CB);
+  for (CallBase *CB : Anchors) {
+    auto OB = CB->getOperandBundle(memannot::LastUseMD);
+    SmallVector<Value *, 4> Kept;
+    for (Value *V : OB->Inputs) {
+      auto *C = dyn_cast<ConstantInt>(V);
+      if (!C)
+        continue;
+      uint64_t Old = C->getZExtValue();
+      if (Drop.count(Old))
+        continue;
+      auto It = OldToNew.find(Old);
+      if (It == OldToNew.end())
+        continue;
+      Kept.push_back(ConstantInt::get(C->getType(), It->second));
+    }
+    if (Kept.empty()) {
+      CB->eraseFromParent();
+      continue;
+    }
+    OperandBundleDef NB(memannot::LastUseMD.str(),
+                        std::vector<Value *>(Kept.begin(), Kept.end()));
+    SmallVector<OperandBundleDef, 2> OBs;
+    for (unsigned I = 0, E = CB->getNumOperandBundles(); I != E; ++I) {
+      OperandBundleUse U = CB->getOperandBundleAt(I);
+      if (U.getTagName() == memannot::LastUseMD)
+        OBs.push_back(NB);
+      else
+        OBs.emplace_back(U);
+    }
+    CallBase *NewC = CallBase::Create(CB, OBs, CB->getIterator());
+    NewC->copyMetadata(*CB);
+    CB->replaceAllUsesWith(NewC);
+    CB->eraseFromParent();
+  }
 }
 
 static cl::opt<bool> InlineLastUseForward(

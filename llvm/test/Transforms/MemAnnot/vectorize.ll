@@ -266,8 +266,9 @@ exit:
   ret void
 }
 
-; SLP vectorizes through the claim (the pair load uses the claim of %a);
-; !mem.last_use on one of the scalar loads is dropped (fail-safe).
+; SLP vectorizes through the claim (the pair load uses the claim of %a).
+; The lane's !mem.last_use stays on the widened memory op (the vector load
+; or the vector store), not on an earlier lane.
 define void @slp(ptr %a, ptr %b) {
 ; LV-LABEL: define void @slp(
 ; LV-SAME: ptr [[A:%.*]], ptr [[B:%.*]]) {

@@ -17,18 +17,29 @@
 //                                                  the bounds check whose
 //                                                  failure edge this call is
 //   !mem.guard !{i64 Site}   on the guarded GEP/load/store (droppable hint)
-//   !mem.last_use !{i64 Loan, ...}  last use of the loans (droppable hint;
-//                                   kept on merge only if identical)
+//   !mem.last_use !{i64 Loan, ...}  last use of the loans (program point) on a
+//                                   carrier, or the same tag as a bundle on
+//                                   llvm.mem.fact when no carrier can hold it.
+//                                   The fact is an architecture-neutral anchor:
+//                                   it is not a CHERI clear. Dropping a sound
+//                                   anchor loses the invalidation. Moving it
+//                                   earlier than a remaining slot reload is not
+//                                   fail-safe. A loan id that would collide
+//                                   with a different loan is dropped on purpose.
+//   !mem.loan !{i64 Loan, ...}      on the store of a borrowed reference.
 //   Storage-dead of a slot is llvm.lifetime.end.
 //
 // Fail-safe directions: losing !mem.guard, !mem.last_use, "mem.alloc_inbounds"
 // or "mem.inbounds" only loses optimization. A claim must not be folded into
 // its operand and "mem.free" must not be dropped. A "mem.check" bundle
-// disappears only with its call.
+// disappears only with its call. A loan id must not be reused for a different
+// loan in the same function (nested inlining mixes the per-copy salt into the
+// previous high bits, and drops an id that would collide).
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_IR_MEMANNOT_H
 #define LLVM_IR_MEMANNOT_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Compiler.h"
 #include <cstdint>
@@ -52,7 +63,8 @@ inline constexpr StringRef TagFree = "mem.free";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
-/// !mem.last_use !{i64 loan, ...}: last use of each loan on this path (R1).
+/// !mem.last_use !{i64 loan, ...} on a carrier, and the "mem.last_use"(i64, ...)
+/// bundle on llvm.mem.fact when the program point has no carrier (R15 anchor).
 inline constexpr StringRef LastUseMD = "mem.last_use";
 /// [LLM-generated] M5r R5 (D35): rustc slot fact on a store: the stored value
 /// is the reference of borrowck loan(s) !{i64 L, ...} (Track B loan-end).
@@ -127,6 +139,19 @@ LLVM_ABI void mergeLastUse(Instruction &To, MDNode *LU);
 /// [LLM-generated] M5r R6 (D44): put loan ids that ended at the start of BB on
 /// the next carrier on BB's unique forward path (fail-safe: lost if none).
 LLVM_ABI void forwardLastUse(BasicBlock &BB, MDNode *LU);
+/// [LLM-generated] M5r R15: same walk, starting at \p Start (inclusive).
+LLVM_ABI void forwardLastUseFrom(Instruction &Start, MDNode *LU);
+/// [LLM-generated] M5r R15: \p I is about to move to an earlier program point.
+/// Take !mem.last_use off it and forward those ids from the next instruction,
+/// so the clear does not pass a slot reload that used to be before I.
+/// If no later carrier exists, leave an llvm.mem.fact ["mem.last_use"] anchor
+/// at the old point.
+LLVM_ABI void detachLastUseBeforeEarlierMove(Instruction &I);
+/// [LLM-generated] M5r R15: a widened load/store replaces \p Scalars. Put each
+/// lane's last-use on \p Vec only when \p Vec is after that lane. A lane that
+/// \p Vec does not follow keeps an anchor at the lane, so the widened op does
+/// not clear earlier than that lane.
+LLVM_ABI void preserveWidenedLastUse(Instruction &Vec, ArrayRef<Value *> Scalars);
 } // namespace memannot
 } // namespace llvm
 #endif

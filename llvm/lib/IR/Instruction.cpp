@@ -172,12 +172,23 @@ static cl::opt<bool> MemLastUseFanout(
              "ids on the first carrier of every successor that has no other "
              "predecessor"));
 
+static void anchorLastUse(Instruction &InsertBefore, MDNode *LU);
+
+// Erase hooks re-enter if an anchor insertion or a CFG walk deletes another
+// carrier. Nested transfers see a half-updated block and must not run.
+static bool InLastUseTransfer = false;
+
 static void transferLastUse(Instruction &I) {
-  if (!MemLastUseTransfer || !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
+  if (InLastUseTransfer || !MemLastUseTransfer ||
+      !I.hasMetadataOtherThanDebugLoc() || !I.getParent())
     return;
   MDNode *LU = I.getMetadata(memannot::LastUseMD);
   if (!LU)
     return;
+  struct Reset {
+    Reset() { InLastUseTransfer = true; }
+    ~Reset() { InLastUseTransfer = false; }
+  } R;
   const Value *P = nullptr;
   if (auto *LI = dyn_cast<LoadInst>(&I))
     P = LI->getPointerOperand();
@@ -204,6 +215,7 @@ static void transferLastUse(Instruction &I) {
   // predecessors of a join (each ending in a carrier and branching only here)
   // take the ids. Otherwise forward: the next carrier on the unique path (a
   // later end is never too early; the window grows by no memory access).
+  auto GiveUp = [&]() { anchorLastUse(I, LU); };
   if (!MemLastUseTransferStrict) {
     Instruction *Start = &I;
     for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
@@ -213,16 +225,21 @@ static void transferLastUse(Instruction &I) {
           return;
         }
       BB = BB->getSinglePredecessor();
-      if (!BB)
+      if (!BB) {
+        GiveUp();
         return;
-      Start = BB->getTerminator();
-      if (!Start)
+      }
+      Start = BB->getTerminatorOrNull();
+      if (!Start) {
+        GiveUp();
         return;
+      }
       if (Start != &I && memannot::isLastUseCarrier(*Start)) { // invoke
         memannot::mergeLastUse(*Start, LU);
         return;
       }
     }
+    GiveUp();
     return;
   }
   // Passes erase while blocks are being rewritten: never assert on a block
@@ -320,26 +337,141 @@ static void transferLastUse(Instruction &I) {
     return false;
   };
   unsigned Budget = 8;
-  Fwd(I.getParent(), &I, 0, Budget);
+  if (!Fwd(I.getParent(), &I, 0, Budget))
+    anchorLastUse(I, LU);
+}
+
+// [LLM-generated] M5r R15: forward from \p From (inclusive) when set, else from
+// the start of \p BB. A later carrier is not an earlier invalidation.
+// Returns true if a carrier took the ids.
+static bool forwardLastUseWalk(BasicBlock *BB, Instruction *From, MDNode *LU) {
+  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
+    for (auto It = From ? From->getIterator() : BB->begin(), E = BB->end();
+         It != E; ++It)
+      if (memannot::isLastUseCarrier(*It)) {
+        memannot::mergeLastUse(*It, LU);
+        return true;
+      }
+    if (BB->empty() || !BB->back().isTerminator())
+      return false;
+    Instruction *T = &BB->back();
+    if (T->getNumSuccessors() != 1)
+      return false;
+    BasicBlock *S = T->getSuccessor(0);
+    if (S == BB || !S->hasNPredecessors(1))
+      return false;
+    BB = S;
+    From = nullptr;
+  }
+  return false;
+}
+
+// [LLM-generated] M5r R15: llvm.mem.fact ["mem.last_use"(i64, ...)] at
+// \p InsertBefore. The call writes only inaccessible memory, so ordinary
+// load/store opts still see it as not touching their objects. It is not a
+// capability clear; CheriInvalidate reads the bundle.
+//
+// The block must still end in a terminator after \p InsertBefore is deleted.
+// Invoke lowering inserts the replacement branch first, then erases the
+// invoke. An anchor between that branch and the invoke becomes the end of
+// the block and removeUnreachableBlocks asserts in getTerminator(). When the
+// only terminator is \p InsertBefore itself, the anchor is dropped: there is
+// no well-formed slot for it.
+static void anchorLastUse(Instruction &InsertBefore, MDNode *LU) {
+  if (!LU || !InsertBefore.getParent() || !InsertBefore.getFunction())
+    return;
+  Instruction *IP = &InsertBefore;
+  Instruction *SurvivingTerm = nullptr;
+  for (Instruction *I = IP; I; I = I->getPrevNode()) {
+    if (!I->isTerminator()) {
+      if (SurvivingTerm)
+        break;
+      continue;
+    }
+    SurvivingTerm = I;
+  }
+  if (SurvivingTerm) {
+    if (SurvivingTerm == IP)
+      return;
+    IP = SurvivingTerm;
+  } else if (!InsertBefore.getParent()->hasTerminator()) {
+    return;
+  }
+  LLVMContext &Ctx = IP->getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  SmallVector<Value *, 4> Ids;
+  for (const MDOperand &Op : LU->operands()) {
+    auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
+    if (!C)
+      continue;
+    Ids.push_back(ConstantInt::get(I64, C->getZExtValue()));
+  }
+  if (Ids.empty())
+    return;
+  Module *M = IP->getModule();
+  Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
+  OperandBundleDef OB(memannot::LastUseMD.str(),
+                      std::vector<Value *>(Ids.begin(), Ids.end()));
+  CallInst::Create(Fact, {}, {OB}, "", IP->getIterator());
 }
 
 void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
-  BasicBlock *BB = &Start;
-  for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
-    for (Instruction &I : *BB)
-      if (memannot::isLastUseCarrier(I)) {
-        memannot::mergeLastUse(I, LU);
-        return;
-      }
-    if (BB->empty() || !BB->back().isTerminator())
-      return;
-    Instruction *T = &BB->back();
-    if (T->getNumSuccessors() != 1)
-      return;
-    BasicBlock *S = T->getSuccessor(0);
-    if (S == BB || !S->hasNPredecessors(1))
-      return;
-    BB = S;
+  if (Start.empty())
+    return;
+  forwardLastUseWalk(&Start, &Start.front(), LU);
+}
+
+void llvm::memannot::forwardLastUseFrom(Instruction &Start, MDNode *LU) {
+  if (!Start.getParent())
+    return;
+  forwardLastUseWalk(Start.getParent(), &Start, LU);
+}
+
+void llvm::memannot::detachLastUseBeforeEarlierMove(Instruction &I) {
+  MDNode *LU = I.getMetadata(LastUseMD);
+  if (!LU || !I.getParent())
+    return;
+  Instruction *Next = I.getNextNode();
+  I.setMetadata(LastUseMD, nullptr);
+  bool Placed = false;
+  if (Next)
+    Placed = forwardLastUseWalk(Next->getParent(), Next, LU);
+  else if (I.getNumSuccessors() == 1) {
+    BasicBlock *S = I.getSuccessor(0);
+    if (S != I.getParent() && S->getSinglePredecessor() == I.getParent() &&
+        !S->empty())
+      Placed = forwardLastUseWalk(S, &S->front(), LU);
+  }
+  // No later carrier: keep the program point. Next is still after I, so the
+  // anchor inserted before Next stays when I is moved to an earlier block.
+  if (!Placed && Next)
+    anchorLastUse(*Next, LU);
+}
+
+void llvm::memannot::preserveWidenedLastUse(Instruction &Vec,
+                                           ArrayRef<Value *> Scalars) {
+  SmallVector<Instruction *, 8> Marked;
+  for (Value *S : Scalars) {
+    auto *I = dyn_cast<Instruction>(S);
+    if (!I || !I->getParent() || !I->getMetadata(LastUseMD))
+      continue;
+    Marked.push_back(I);
+  }
+  if (Marked.empty() || !Vec.getParent())
+    return;
+  bool CanHold = isa<LoadInst>(Vec) || isa<StoreInst>(Vec) ||
+                 isa<AtomicRMWInst>(Vec) || isa<AtomicCmpXchgInst>(Vec) ||
+                 isa<CallBase>(Vec);
+  for (Instruction *I : Marked) {
+    MDNode *LU = I->getMetadata(LastUseMD);
+    // Vec after this lane: the widened op is not an earlier clear.
+    bool VecAfter = CanHold && I->getParent() == Vec.getParent() &&
+                    I->comesBefore(&Vec);
+    if (VecAfter)
+      mergeLastUse(Vec, LU);
+    else
+      anchorLastUse(*I, LU);
+    I->setMetadata(LastUseMD, nullptr);
   }
 }
 
