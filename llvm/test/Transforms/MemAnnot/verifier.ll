@@ -64,9 +64,9 @@ define void @bad(ptr %p, i64 %n, i64 %i) {
   %g = getelementptr i8, ptr %p, i64 %i, !mem.guard !1
 ; CHECK: !mem.last_use only on load, store, atomic or call instructions
   %b = add i64 %i, 2, !mem.last_use !0
-; CHECK: !mem.last_use must be a non-empty list of i64 loan ids
+; CHECK: !mem.last_use must be a non-empty list of packed i64 loan ids or !{!"mem.loan.ext", i64 orig, i64 disambiguator} copies
   %v = load i8, ptr %p, !mem.last_use !1
-; CHECK: !mem.last_use must be a non-empty list of i64 loan ids
+; CHECK: !mem.last_use must be a non-empty list of packed i64 loan ids or !{!"mem.loan.ext", i64 orig, i64 disambiguator} copies
   %w = load i8, ptr %p, !mem.last_use !2
   ret void
 }
