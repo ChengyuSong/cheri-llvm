@@ -3211,6 +3211,15 @@ void llvm::copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source) {
       if (NewType->getScalarType() == Source.getType()->getScalarType())
         Dest.setMetadata(ID, N);
       break;
+    default: {
+      // [LLM-generated] M5r R15: a same-access load rewritten to a new type
+      // keeps its program-point facts. The new load replaces the old one.
+      LLVMContext &Ctx = Dest.getContext();
+      if (ID == Ctx.getMDKindID(memannot::LastUseMD) ||
+          ID == Ctx.getMDKindID(memannot::GuardMD))
+        Dest.setMetadata(ID, N);
+      break;
+    }
     }
   }
 }

@@ -55,6 +55,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1107,6 +1108,9 @@ std::pair<unsigned, unsigned> GVNHoist::hoist(HoistingPointList &HPL) {
       // Move the instruction at the end of HoistPt.
       Instruction *Last = DestBB->getTerminator();
       MD->removeInstruction(Repl);
+      // [LLM-generated] M5r R15: HoistPt is before carriers that stayed in
+      // Repl's block. Do not take the loan end with the moved instruction.
+      memannot::detachLastUseBeforeEarlierMove(*Repl);
       Repl->moveBefore(Last->getIterator());
 
       DFSNumber[Repl] = DFSNumber[Last]++;

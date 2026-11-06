@@ -17,14 +17,19 @@
 //                                                  the bounds check whose
 //                                                  failure edge this call is
 //   !mem.guard !{i64 Site}   on the guarded GEP/load/store (droppable hint)
-//   !mem.last_use !{i64 Loan, ...}  last use of the loans (droppable hint;
-//                                   kept on merge only if identical)
+//   !mem.last_use !{i64 Loan, ...}  last use of the loans (program point).
+//                                   Dropping it only loses the clear.
+//                                   Moving it earlier than a remaining slot
+//                                   reload is not fail-safe.
+//   !mem.loan !{i64 Loan, ...}      on the store of a borrowed reference.
 //   Storage-dead of a slot is llvm.lifetime.end.
 //
 // Fail-safe directions: losing !mem.guard, !mem.last_use, "mem.alloc_inbounds"
 // or "mem.inbounds" only loses optimization. A claim must not be folded into
 // its operand and "mem.free" must not be dropped. A "mem.check" bundle
-// disappears only with its call.
+// disappears only with its call. A loan id must not be reused for a different
+// loan in the same function (nested inlining mixes the per-copy salt into the
+// previous high bits, and drops an id that would collide).
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_IR_MEMANNOT_H
 #define LLVM_IR_MEMANNOT_H
@@ -127,6 +132,12 @@ LLVM_ABI void mergeLastUse(Instruction &To, MDNode *LU);
 /// [LLM-generated] M5r R6 (D44): put loan ids that ended at the start of BB on
 /// the next carrier on BB's unique forward path (fail-safe: lost if none).
 LLVM_ABI void forwardLastUse(BasicBlock &BB, MDNode *LU);
+/// [LLM-generated] M5r R15: same walk, starting at \p Start (inclusive).
+LLVM_ABI void forwardLastUseFrom(Instruction &Start, MDNode *LU);
+/// [LLM-generated] M5r R15: \p I is about to move to an earlier program point.
+/// Take !mem.last_use off it and forward those ids from the next instruction,
+/// so the clear does not pass a slot reload that used to be before I.
+LLVM_ABI void detachLastUseBeforeEarlierMove(Instruction &I);
 } // namespace memannot
 } // namespace llvm
 #endif

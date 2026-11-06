@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -2027,33 +2028,102 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
   LLVMContext &Ctx = Caller->getContext();
   unsigned Kinds[2] = {Ctx.getMDKindID(memannot::LastUseMD),
                        Ctx.getMDKindID(memannot::LoanMD)};
-  uint64_t S = 0;
-  DenseMap<MDNode *, MDNode *> Done;
+  SmallPtrSet<BasicBlock *, 32> NewBBs;
   for (auto BI = FirstNewBlock; BI != Caller->end(); ++BI)
-    for (Instruction &I : *BI)
+    NewBBs.insert(&*BI);
+  if (NewBBs.empty())
+    return;
+
+  auto mdIds = [](const MDNode *N, SmallVectorImpl<uint64_t> &Out) {
+    if (!N)
+      return;
+    for (const MDOperand &Op : N->operands())
+      if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op))
+        Out.push_back(C->getZExtValue());
+  };
+  DenseSet<uint64_t> Existing;
+  for (BasicBlock &BB : *Caller) {
+    if (NewBBs.count(&BB))
+      continue;
+    for (Instruction &I : BB)
+      for (unsigned K : Kinds) {
+        SmallVector<uint64_t, 4> Ids;
+        mdIds(I.getMetadata(K), Ids);
+        Existing.insert(Ids.begin(), Ids.end());
+      }
+  }
+
+  uint64_t S = 0;
+  auto freshSalt = [&]() {
+    if (!S)
+      while (!(S = ++Salt & 0x1fffff))
+        ;
+  };
+  // [LLM-generated] M5r R15: mix the previous high bits with this inline's
+  // salt. Masking them off made two copies that had already been rekeyed
+  // (an inlined callee of the callee) collapse onto one id, so one copy's
+  // last-use cleared the other copy's slot. A result that would be 0 in the
+  // high bits, or equal to an id already live in the caller, is dropped.
+  DenseMap<uint64_t, uint64_t> OldToNew;
+  DenseSet<uint64_t> Drop;
+  auto classify = [&](uint64_t Old) {
+    if (OldToNew.count(Old) || Drop.count(Old))
+      return;
+    freshSalt();
+    uint64_t Low = Old & memannot::LoanKeyMask;
+    uint64_t OldHigh = (Old >> 42) & 0x1fffffull;
+    uint64_t NewHigh = (OldHigh ^ S) & 0x1fffffull;
+    uint64_t New = Low | (NewHigh << 42);
+    if (NewHigh == 0 || Existing.count(New)) {
+      Drop.insert(Old);
+      return;
+    }
+    for (const auto &KV : OldToNew)
+      if (KV.second == New) {
+        Drop.insert(Old);
+        Drop.insert(KV.first);
+        return;
+      }
+    OldToNew[Old] = New;
+  };
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB)
+      for (unsigned K : Kinds) {
+        SmallVector<uint64_t, 4> Ids;
+        mdIds(I.getMetadata(K), Ids);
+        for (uint64_t Id : Ids)
+          classify(Id);
+      }
+
+  DenseMap<MDNode *, MDNode *> Done;
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB)
       for (unsigned K : Kinds) {
         MDNode *N = I.getMetadata(K);
         if (!N)
           continue;
-        if (!S)
-          while (!(S = ++Salt & 0x1fffff))
-            ;
         MDNode *&New = Done[N];
         if (!New) {
           SmallVector<Metadata *, 4> Ids;
+          bool Any = false;
           for (const MDOperand &Op : N->operands()) {
             auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
             if (!C) {
               Ids.push_back(Op.get());
+              Any = true;
               continue;
             }
-            // Low 42 bits: the original id (the census keys on them);
-            // bits 42..62: the inline salt.
-            uint64_t V = (C->getZExtValue() & memannot::LoanKeyMask) |
-                         ((S & 0x1fffff) << 42);
-            Ids.push_back(ConstantAsMetadata::get(ConstantInt::get(C->getType(), V)));
+            uint64_t Old = C->getZExtValue();
+            if (Drop.count(Old))
+              continue;
+            auto It = OldToNew.find(Old);
+            if (It == OldToNew.end())
+              continue;
+            Ids.push_back(ConstantAsMetadata::get(
+                ConstantInt::get(C->getType(), It->second)));
+            Any = true;
           }
-          New = MDNode::get(Ctx, Ids);
+          New = Any ? MDNode::get(Ctx, Ids) : nullptr;
         }
         I.setMetadata(K, New);
       }

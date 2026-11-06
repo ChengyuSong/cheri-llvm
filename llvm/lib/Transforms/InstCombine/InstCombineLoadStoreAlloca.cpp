@@ -19,6 +19,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Transforms/InstCombine/InstCombiner.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -646,6 +647,15 @@ static StoreInst *combineStoreToNewValue(InstCombinerImpl &IC, StoreInst &SI,
       // All of these directly apply.
       NewStore->setMetadata(ID, N);
       break;
+    default: {
+      // [LLM-generated] M5r R15: a same-access store rewritten to a new type
+      // keeps the loan link and the last-use program point.
+      LLVMContext &Ctx = NewStore->getContext();
+      if (ID == Ctx.getMDKindID(memannot::LastUseMD) ||
+          ID == Ctx.getMDKindID(memannot::LoanMD))
+        NewStore->setMetadata(ID, N);
+      break;
+    }
     case LLVMContext::MD_invariant_load:
     case LLVMContext::MD_nonnull:
     case LLVMContext::MD_noundef:

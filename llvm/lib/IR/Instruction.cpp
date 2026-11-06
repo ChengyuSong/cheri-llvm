@@ -323,12 +323,14 @@ static void transferLastUse(Instruction &I) {
   Fwd(I.getParent(), &I, 0, Budget);
 }
 
-void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
-  BasicBlock *BB = &Start;
+// [LLM-generated] M5r R15: forward from \p From (inclusive) when set, else from
+// the start of \p BB. A later carrier is not an earlier invalidation.
+static void forwardLastUseWalk(BasicBlock *BB, Instruction *From, MDNode *LU) {
   for (unsigned Steps = 0; BB && Steps < 4; ++Steps) {
-    for (Instruction &I : *BB)
-      if (memannot::isLastUseCarrier(I)) {
-        memannot::mergeLastUse(I, LU);
+    for (auto It = From ? From->getIterator() : BB->begin(), E = BB->end();
+         It != E; ++It)
+      if (memannot::isLastUseCarrier(*It)) {
+        memannot::mergeLastUse(*It, LU);
         return;
       }
     if (BB->empty() || !BB->back().isTerminator())
@@ -340,7 +342,40 @@ void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
     if (S == BB || !S->hasNPredecessors(1))
       return;
     BB = S;
+    From = nullptr;
   }
+}
+
+void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {
+  if (Start.empty())
+    return;
+  forwardLastUseWalk(&Start, &Start.front(), LU);
+}
+
+void llvm::memannot::forwardLastUseFrom(Instruction &Start, MDNode *LU) {
+  if (!Start.getParent())
+    return;
+  forwardLastUseWalk(Start.getParent(), &Start, LU);
+}
+
+void llvm::memannot::detachLastUseBeforeEarlierMove(Instruction &I) {
+  MDNode *LU = I.getMetadata(LastUseMD);
+  if (!LU || !I.getParent())
+    return;
+  Instruction *Next = I.getNextNode();
+  I.setMetadata(LastUseMD, nullptr);
+  if (Next) {
+    forwardLastUseFrom(*Next, LU);
+    return;
+  }
+  // Terminator: the normal single successor is not earlier than I.
+  if (I.getNumSuccessors() != 1)
+    return;
+  BasicBlock *S = I.getSuccessor(0);
+  if (S == I.getParent() || S->getSinglePredecessor() != I.getParent() ||
+      S->empty())
+    return;
+  forwardLastUseFrom(S->front(), LU);
 }
 
 BasicBlock::iterator Instruction::eraseFromParent() {
