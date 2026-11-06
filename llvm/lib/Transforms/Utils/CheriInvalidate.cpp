@@ -39,10 +39,12 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("loan+free+slite"), cl::Hidden,
+    "cheri-invalidate", cl::init("loan+free+slite+aflog"), cl::Hidden,
     cl::desc("M5r Track B: none, scope, slite (scope range checks without "
              "own-slot nulls, R10 D73), free, loan, flog (R10 D72 free log, "
-             "opt-in), loan+free+slite (default, owner-approved R10; R9 D69: "
+             "opt-in), aflog (R12 D80 argument free log), loan+free+slite+aflog "
+             "(default since R14 D83, owner OK 2026-11-05; R10-R13: "
+             "loan+free+slite, which disables aflog; R9 D69: "
              "loan+free; R8 D57: loan), all, or a "
              "'+'-list (scope+free = R4 all)"));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
