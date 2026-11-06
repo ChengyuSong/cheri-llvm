@@ -6,9 +6,9 @@
 ;   llvm.mem.claim, "mem.check", "mem.free", llvm.mem.fact bundles,
 ;   !mem.guard, !mem.last_use, !mem.loan, llvm.lifetime.end.
 ;
-; RUN: opt -S -passes='default<O1>' < %s | FileCheck %s --check-prefix=PIPE
-; RUN: opt -S -passes='default<O2>' < %s | FileCheck %s --check-prefix=PIPE
-; RUN: opt -S -passes='default<O3>' < %s | FileCheck %s --check-prefix=PIPE
+; RUN: opt -S -passes='default<O1>' -verify-each < %s | FileCheck %s --check-prefix=PIPE
+; RUN: opt -S -passes='default<O2>' -verify-each < %s | FileCheck %s --check-prefix=PIPE
+; RUN: opt -S -passes='default<O3>' -verify-each < %s | FileCheck %s --check-prefix=PIPE
 ; RUN: opt -disable-output -mem-annot-census -mem-annot-census-strict \
 ; RUN:   -passes='mem-annot-census-start,default<O2>,mem-annot-census-late' < %s
 ; RUN: opt -S -passes='loop-mssa(licm)' < %s | FileCheck %s --check-prefix=LICM

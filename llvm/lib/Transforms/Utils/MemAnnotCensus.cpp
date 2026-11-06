@@ -143,11 +143,21 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
 // R5: loan ids are counted by their original id (the LLVM inliner re-keys a
 // cloned body's ids in the high bits, D35).
 static Metadata *loanKey(Metadata *M) {
-  if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(M))
-    if (C->getBitWidth() == 64)
-      return ConstantAsMetadata::get(
-          ConstantInt::get(C->getType(), C->getZExtValue() & memannot::LoanKeyMask));
-  return M;
+  // Packed and extended copies share the census key: the low 42 bits.
+  // Which copy a last-use clears is the full id, not this key.
+  // decodeLoanRef rejects a bare !{i64, i64}, so a multi-loan list is not
+  // folded into the first integer.
+  memannot::LoanRef R;
+  if (!memannot::decodeLoanRef(M, R))
+    return M;
+  const ConstantInt *TySrc = mdconst::dyn_extract_or_null<ConstantInt>(M);
+  if (!TySrc)
+    if (auto *N = dyn_cast<MDNode>(M))
+      TySrc = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1));
+  if (!TySrc)
+    return M;
+  return ConstantAsMetadata::get(
+      ConstantInt::get(TySrc->getType(), R.Orig & memannot::LoanKeyMask));
 }
 
 struct LUWatch final : CallbackVH {
