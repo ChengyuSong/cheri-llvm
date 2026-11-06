@@ -2023,6 +2023,13 @@ static bool isLastUseCarrier(const Instruction &I) {
 // and !mem.loan ids of the cloned body with a per-inline salt, so that a
 // loan-end of one copy never names the slots of another copy. Runs before
 // the call site's own ids (caller loans) are moved into the body.
+// [LLM-generated] M5r R15: tests pin the salt to hit a high-bits-zero mix and a
+// collision with an id already live in the caller. 0 keeps the counter.
+static cl::opt<uint64_t> InlineLoanSalt(
+    "mem-inline-loan-salt", cl::init(0), cl::Hidden,
+    cl::desc("If non-zero, every inlined loan rekey uses this salt. "
+             "0 uses the per-inline counter."));
+
 static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
   static std::atomic<uint64_t> Salt{0};
   LLVMContext &Ctx = Caller->getContext();
@@ -2055,9 +2062,14 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
 
   uint64_t S = 0;
   auto freshSalt = [&]() {
-    if (!S)
-      while (!(S = ++Salt & 0x1fffff))
-        ;
+    if (S)
+      return;
+    if (uint64_t Fixed = InlineLoanSalt & 0x1fffff) {
+      S = Fixed;
+      return;
+    }
+    while (!(S = ++Salt & 0x1fffff))
+      ;
   };
   // [LLM-generated] M5r R15: mix the previous high bits with this inline's
   // salt. Masking them off made two copies that had already been rekeyed
@@ -2087,13 +2099,21 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
     OldToNew[Old] = New;
   };
   for (BasicBlock *BB : NewBBs)
-    for (Instruction &I : *BB)
+    for (Instruction &I : *BB) {
       for (unsigned K : Kinds) {
         SmallVector<uint64_t, 4> Ids;
         mdIds(I.getMetadata(K), Ids);
         for (uint64_t Id : Ids)
           classify(Id);
       }
+      // Anchors created before this inline carry the same loan ids in a bundle.
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB))
+          if (auto OB = CB->getOperandBundle(memannot::LastUseMD))
+            for (Value *V : OB->Inputs)
+              if (auto *C = dyn_cast<ConstantInt>(V))
+                classify(C->getZExtValue());
+    }
 
   DenseMap<MDNode *, MDNode *> Done;
   for (BasicBlock *BB : NewBBs)
@@ -2127,6 +2147,48 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
         }
         I.setMetadata(K, New);
       }
+  // Rewrite anchors with the same map. A dropped id is not left on the old
+  // value: that value can alias the caller's loan.
+  SmallVector<CallBase *, 4> Anchors;
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB) && CB->getOperandBundle(memannot::LastUseMD))
+          Anchors.push_back(CB);
+  for (CallBase *CB : Anchors) {
+    auto OB = CB->getOperandBundle(memannot::LastUseMD);
+    SmallVector<Value *, 4> Kept;
+    for (Value *V : OB->Inputs) {
+      auto *C = dyn_cast<ConstantInt>(V);
+      if (!C)
+        continue;
+      uint64_t Old = C->getZExtValue();
+      if (Drop.count(Old))
+        continue;
+      auto It = OldToNew.find(Old);
+      if (It == OldToNew.end())
+        continue;
+      Kept.push_back(ConstantInt::get(C->getType(), It->second));
+    }
+    if (Kept.empty()) {
+      CB->eraseFromParent();
+      continue;
+    }
+    OperandBundleDef NB(memannot::LastUseMD.str(),
+                        std::vector<Value *>(Kept.begin(), Kept.end()));
+    SmallVector<OperandBundleDef, 2> OBs;
+    for (unsigned I = 0, E = CB->getNumOperandBundles(); I != E; ++I) {
+      OperandBundleUse U = CB->getOperandBundleAt(I);
+      if (U.getTagName() == memannot::LastUseMD)
+        OBs.push_back(NB);
+      else
+        OBs.emplace_back(U);
+    }
+    CallBase *NewC = CallBase::Create(CB, OBs, CB->getIterator());
+    NewC->copyMetadata(*CB);
+    CB->replaceAllUsesWith(NewC);
+    CB->eraseFromParent();
+  }
 }
 
 static cl::opt<bool> InlineLastUseForward(

@@ -4161,6 +4161,16 @@ void Verifier::visitCallBase(CallBase &Call) {
               "\"mem.free\" bundle must be (ptr base)", Call);
         continue;
       }
+      if (T == memannot::LastUseMD) {
+        // R15: anchor when a last-use program point has no carrier left.
+        bool Ids = !In.empty();
+        for (Value *V : In)
+          Ids &= V->getType()->isIntegerTy(64);
+        Check(IsFact && Ids, "\"mem.last_use\" bundle must be one or more i64 "
+                             "loan ids on llvm.mem.fact",
+              Call);
+        continue;
+      }
       Check(IsFact, "\"mem.\" fact bundles may only appear on llvm.mem.fact",
             Call);
       if (T == memannot::TagClaim)

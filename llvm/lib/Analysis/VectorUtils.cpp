@@ -22,6 +22,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/MemoryModelRelaxationAnnotations.h"
 #include "llvm/IR/PatternMatch.h"
@@ -1076,6 +1077,12 @@ void llvm::getMetadataToPropagate(
       Metadata.pop_back();
     }
   }
+  // [LLM-generated] M5r R15: a widened copy of this one instruction keeps its
+  // last-use. Combining several lanes is handled separately so a later lane
+  // is not cleared at an earlier widened op.
+  if (MDNode *LU = Inst->getMetadata(memannot::LastUseMD))
+    Metadata.emplace_back(Inst->getContext().getMDKindID(memannot::LastUseMD),
+                          LU);
 }
 
 /// \returns \p I after propagating metadata from \p VL.
@@ -1085,6 +1092,7 @@ Instruction *llvm::propagateMetadata(Instruction *Inst, ArrayRef<Value *> VL) {
   SmallVector<std::pair<unsigned, MDNode *>> Metadata;
   getMetadataToPropagate(cast<Instruction>(VL[0]), Metadata);
 
+  unsigned LUKind = Inst->getContext().getMDKindID(memannot::LastUseMD);
   for (auto &[Kind, MD] : Metadata) {
     // Skip MMRA metadata if the instruction cannot have it.
     if (Kind == LLVMContext::MD_mmra && !canInstructionHaveMMRAs(*Inst))
@@ -1093,6 +1101,14 @@ Instruction *llvm::propagateMetadata(Instruction *Inst, ArrayRef<Value *> VL) {
     for (int J = 1, E = VL.size(); MD && J != E; ++J) {
       const Instruction *IJ = cast<Instruction>(VL[J]);
       MDNode *IMD = IJ->getMetadata(Kind);
+
+      // Same node on every lane only. A different or missing node stays on
+      // that lane (see preserveWidenedLastUse) instead of moving earlier.
+      if (Kind == LUKind) {
+        if (MD != IMD)
+          MD = nullptr;
+        continue;
+      }
 
       switch (Kind) {
       case LLVMContext::MD_mmra: {

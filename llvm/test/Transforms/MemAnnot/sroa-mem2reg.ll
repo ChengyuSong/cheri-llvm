@@ -19,7 +19,10 @@ define i32 @sroa(i64 %i) {
 ; CHECK-SAME: i64 [[I:%.*]]) {
 ; CHECK-NEXT:    [[C:%.*]] = icmp ult i64 [[I]], 4
 ; CHECK-NEXT:    br i1 [[C]], label %[[OK:.*]], label %[[FAIL:.*]]
+; The promoted load's last-use is not obsolete: the loan id may name another
+; slot. SROA leaves an anchor at the load.
 ; CHECK:       [[OK]]:
+; CHECK-NEXT:    call void @llvm.mem.fact() [ "mem.last_use"(i64 1) ]
 ; CHECK-NEXT:    ret i32 1
 ; CHECK:       [[FAIL]]:
 ; CHECK-NEXT:    call void @panic(i64 [[I]], i64 4) [ "mem.check"(ptr poison, i64 4, i64 4, i64 1, i64 0) ]

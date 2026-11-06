@@ -480,14 +480,30 @@ struct Inv {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
     SmallVector<Instruction *, 16> Carriers;
-    for (Instruction &I : instructions(F))
-      if (I.getMetadata(LUKind))
+    auto bundleIds = [](Instruction &I, SmallVectorImpl<uint64_t> &Out) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || !memannot::isMemFact(CB))
+        return;
+      auto OB = CB->getOperandBundle(memannot::LastUseMD);
+      if (!OB)
+        return;
+      for (Value *V : OB->Inputs)
+        if (auto *C = dyn_cast<ConstantInt>(V))
+          Out.push_back(C->getZExtValue());
+    };
+    for (Instruction &I : instructions(F)) {
+      bool Meta = I.getMetadata(LUKind);
+      SmallVector<uint64_t, 2> Bundle;
+      bundleIds(I, Bundle);
+      if (Meta || !Bundle.empty())
         Carriers.push_back(&I);
+    }
     IRBuilder<> B(M.getContext());
     for (Instruction *C : Carriers) {
       if (C->isTerminator())
         continue; // invoke: the normal edge may be shared
       SmallVector<uint64_t, 4> Ids = mdIds(C->getMetadata(LUKind));
+      bundleIds(*C, Ids);
       for (auto &[K, L] : LS) {
         if (!L.OK || none_of(L.Ids, [&](uint64_t X) { return is_contained(Ids, X); }))
           continue;

@@ -38,7 +38,9 @@ define void @dse_free(ptr %p) {
 ; Storage-dead is lifetime.end: the store to the dead slot goes.
 define void @dse_local() {
 ; CHECK-LABEL: define void @dse_local() {
+; The dead store's last-use stays, as an anchor, before lifetime.end.
 ; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4
+; CHECK-NEXT:    call void @llvm.mem.fact() [ "mem.last_use"(i64 1) ]
 ; CHECK-NEXT:    call void @llvm.lifetime.end.p0(ptr [[A]])
 ; CHECK-NEXT:    ret void
 ;

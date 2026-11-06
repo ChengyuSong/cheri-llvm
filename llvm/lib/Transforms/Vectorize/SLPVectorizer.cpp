@@ -62,6 +62,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
@@ -24188,6 +24189,11 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
       Value *V = E->State == TreeEntry::CompressVectorize
                      ? NewLI
                      : PropagateIRFlags(NewLI);
+      // [LLM-generated] M5r R15: keep each lane's last-use. The widened load
+      // takes an id only when it is after that lane. Runs after flag/metadata
+      // propagation so an intersect does not wipe the union.
+      if (isa<LoadInst, CallBase>(NewLI))
+        memannot::preserveWidenedLastUse(*NewLI, E->Scalars);
 
       if (StridedLoadTy != VecTy)
         V = Builder.CreateBitOrPointerCast(V, VecTy);
@@ -24271,6 +24277,8 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
       }
 
       Value *V = PropagateIRFlags(ST);
+      // [LLM-generated] M5r R15: same rule as widened loads.
+      memannot::preserveWidenedLastUse(*ST, E->Scalars);
 
       E->VectorizedValue = V;
       ++NumVectorInstructions;
