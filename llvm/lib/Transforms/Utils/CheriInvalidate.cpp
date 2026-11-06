@@ -372,19 +372,19 @@ struct Inv {
   // reference any more (borrowck), so the slot is nulled right after it.
   struct LoanSlot {
     SmallVector<StoreInst *, 2> Stores;
-    SmallVector<uint64_t, 2> Ids; // common to every store
+    SmallVector<memannot::LoanRef, 2> Ids; // common to every store
     SmallVector<Instruction *, 2> Clears;
     bool OK = true;
   };
   MapVector<std::pair<AllocaInst *, int64_t>, LoanSlot> LS;
 
-  static SmallVector<uint64_t, 2> mdIds(const MDNode *N) {
-    SmallVector<uint64_t, 2> R;
-    if (N)
-      for (const MDOperand &Op : N->operands())
-        if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op))
-          R.push_back(C->getZExtValue());
-    return R;
+  static bool refsOverlap(ArrayRef<memannot::LoanRef> A,
+                          ArrayRef<memannot::LoanRef> B) {
+    for (const memannot::LoanRef &X : A)
+      for (const memannot::LoanRef &Y : B)
+        if (X.sameCopy(Y))
+          return true;
+    return false;
   }
 
   void collectLoanSlots(Function &F) {
@@ -409,13 +409,18 @@ struct Inv {
           ++LoanFacts;
         if (DL.isFatPointer(SI->getValueOperand()->getType()) && Off >= 0 && Off % 16 == 0) {
           LoanSlot &L = LS[{A, Off}];
-          SmallVector<uint64_t, 2> Ids = mdIds(N);
+          SmallVector<memannot::LoanRef, 2> Ids;
+          memannot::appendLoanRefs(N, Ids);
           if (Ids.empty())
             L.OK = false;
           else if (L.Stores.empty())
             L.Ids = Ids;
           else
-            erase_if(L.Ids, [&](uint64_t X) { return !is_contained(Ids, X); });
+            erase_if(L.Ids, [&](const memannot::LoanRef &X) {
+              return !any_of(Ids, [&](const memannot::LoanRef &Y) {
+                return X.sameCopy(Y);
+              });
+            });
           L.Stores.push_back(SI);
           continue;
         }
@@ -480,20 +485,15 @@ struct Inv {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
     SmallVector<Instruction *, 16> Carriers;
-    auto bundleIds = [](Instruction &I, SmallVectorImpl<uint64_t> &Out) {
+    auto bundleIds = [](Instruction &I, SmallVectorImpl<memannot::LoanRef> &Out) {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB || !memannot::isMemFact(CB))
         return;
-      auto OB = CB->getOperandBundle(memannot::LastUseMD);
-      if (!OB)
-        return;
-      for (Value *V : OB->Inputs)
-        if (auto *C = dyn_cast<ConstantInt>(V))
-          Out.push_back(C->getZExtValue());
+      memannot::appendBundleLoanRefs(*CB, Out);
     };
     for (Instruction &I : instructions(F)) {
       bool Meta = I.getMetadata(LUKind);
-      SmallVector<uint64_t, 2> Bundle;
+      SmallVector<memannot::LoanRef, 2> Bundle;
       bundleIds(I, Bundle);
       if (Meta || !Bundle.empty())
         Carriers.push_back(&I);
@@ -502,10 +502,11 @@ struct Inv {
     for (Instruction *C : Carriers) {
       if (C->isTerminator())
         continue; // invoke: the normal edge may be shared
-      SmallVector<uint64_t, 4> Ids = mdIds(C->getMetadata(LUKind));
+      SmallVector<memannot::LoanRef, 4> Ids;
+      memannot::appendLoanRefs(C->getMetadata(LUKind), Ids);
       bundleIds(*C, Ids);
       for (auto &[K, L] : LS) {
-        if (!L.OK || none_of(L.Ids, [&](uint64_t X) { return is_contained(Ids, X); }))
+        if (!L.OK || !refsOverlap(L.Ids, Ids))
           continue;
         Instruction *At = C->getNextNode();
         if (!liveAt(K.first, At, DT))
@@ -524,8 +525,10 @@ struct Inv {
       for (auto &[K, L] : LS)
         if (L.OK && L.Clears.empty()) {
           bool Any = any_of(Carriers, [&](Instruction *C) {
-            SmallVector<uint64_t, 4> Ids = mdIds(C->getMetadata(LUKind));
-            return any_of(L.Ids, [&](uint64_t X) { return is_contained(Ids, X); });
+            SmallVector<memannot::LoanRef, 4> Ids;
+            memannot::appendLoanRefs(C->getMetadata(LUKind), Ids);
+            bundleIds(*C, Ids);
+            return refsOverlap(L.Ids, Ids);
           });
           errs() << "loan-noclear " << F.getName() << " " << K.first->getName()
                  << ": " << (Any ? "carrier-not-live-or-terminator" : "no-carrier") << "\n";

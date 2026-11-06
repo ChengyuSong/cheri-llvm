@@ -397,22 +397,9 @@ static void anchorLastUse(Instruction &InsertBefore, MDNode *LU) {
   } else if (!InsertBefore.getParent()->hasTerminator()) {
     return;
   }
-  LLVMContext &Ctx = IP->getContext();
-  Type *I64 = Type::getInt64Ty(Ctx);
-  SmallVector<Value *, 4> Ids;
-  for (const MDOperand &Op : LU->operands()) {
-    auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
-    if (!C)
-      continue;
-    Ids.push_back(ConstantInt::get(I64, C->getZExtValue()));
-  }
-  if (Ids.empty())
-    return;
-  Module *M = IP->getModule();
-  Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
-  OperandBundleDef OB(memannot::LastUseMD.str(),
-                      std::vector<Value *>(Ids.begin(), Ids.end()));
-  CallInst::Create(Fact, {}, {OB}, "", IP->getIterator());
+  // Packed ids stay on "mem.last_use". An extended copy (orig, disambiguator)
+  // does not fit in one i64, so it is a "mem.last_use.ext" fact.
+  memannot::insertLastUseAnchors(*IP, LU);
 }
 
 void llvm::memannot::forwardLastUse(BasicBlock &Start, MDNode *LU) {

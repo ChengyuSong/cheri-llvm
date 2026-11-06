@@ -2,16 +2,17 @@
 ; carrier becomes llvm.mem.fact ["mem.last_use"(i64, ...)]. That call is an
 ; architecture-neutral program point, not a CHERI clear. A widened memory op
 ; takes a lane's ids only when the widened op is after that lane. A rekey that
-; would alias another loan drops the copy instead of clearing the wrong slot.
+; would alias another loan, or whose high bits would be 0, takes another copy
+; key. The loan and its last-use stay, and they do not name the other copy.
 ;
-; RUN: opt -S -passes=dce < %s | FileCheck %s --check-prefix=DCE
-; RUN: opt -S -passes='default<O2>' < %s | FileCheck %s --check-prefix=O2
-; RUN: opt -S -passes='loop-mssa(licm)' < %s | FileCheck %s --check-prefix=LICM
-; RUN: opt -S -passes=slp-vectorizer < %s | FileCheck %s --check-prefix=SLP
-; RUN: opt -S -passes=loop-vectorize -force-vector-width=4 < %s | FileCheck %s --check-prefix=LV
-; RUN: opt -S -passes=inline -mem-inline-loan-salt=5 < %s | FileCheck %s --check-prefix=ZERO
-; RUN: opt -S -passes=inline -mem-inline-loan-salt=7 < %s | FileCheck %s --check-prefix=COLLIDE
-; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s --check-prefix=INV
+; RUN: opt -S -passes=dce -verify-each < %s | FileCheck %s --check-prefix=DCE
+; RUN: opt -S -passes='default<O2>' -verify-each < %s | FileCheck %s --check-prefix=O2
+; RUN: opt -S -passes='loop-mssa(licm)' -verify-each < %s | FileCheck %s --check-prefix=LICM
+; RUN: opt -S -passes=slp-vectorizer -verify-each < %s | FileCheck %s --check-prefix=SLP
+; RUN: opt -S -passes=loop-vectorize -force-vector-width=4 -verify-each < %s | FileCheck %s --check-prefix=LV
+; RUN: opt -S -passes=inline -mem-inline-loan-salt=5 -verify-each < %s | FileCheck %s --check-prefix=ZERO
+; RUN: opt -S -passes=inline -mem-inline-loan-salt=7 -verify-each < %s | FileCheck %s --check-prefix=COLLIDE
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -verify-each < %s | FileCheck %s --check-prefix=INV
 
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 target triple = "x86_64-unknown-linux-gnu"
@@ -103,8 +104,8 @@ exit:
 
 ; Salt 5, applied twice (inner into mid, mid into @zero). The second mix
 ; xors the high bits with themselves and would be 0, which aliases rustc's
-; unrekeyed ids. That copy is dropped. This is an unsound id, not a missed
-; clear of a distinct loan.
+; unrekeyed ids. The copy is kept under the next free high (1). The loan
+; store and the last-use name that same copy.
 define internal void @inner_zero(ptr %slot, ptr %cap) alwaysinline {
   store ptr %cap, ptr %slot, align 8, !mem.loan !2
   %v = load i32, ptr %cap, align 4, !mem.last_use !2
@@ -118,16 +119,17 @@ define internal void @mid_zero(ptr %slot, ptr %cap) alwaysinline {
 
 define void @zero(ptr %slot, ptr %cap) {
 ; ZERO-LABEL: define void @zero(
-; ZERO-NOT: !mem.loan
-; ZERO-NOT: !mem.last_use
-; ZERO: ret void
+; ZERO: store ptr %cap, ptr %slot{{.*}}!mem.loan [[Z:![0-9]+]]
+; ZERO: load i32, ptr %cap{{.*}}!mem.last_use [[Z]]
+; ZERO: [[Z]] = !{i64 4398046511107}
 ;
   call void @mid_zero(ptr %slot, ptr %cap)
   ret void
 }
 
-; 3 | (7 << 42). Salt 7 rekeys a fresh loan 3 onto this id. The caller's loan
-; already uses it, so the inlined copy is dropped and the caller's id remains.
+; 3 | (7 << 42). Salt 7 would rekey a fresh loan 3 onto this id. The caller's
+; loan already uses it, so the inlined copy takes the next free high (1).
+; Each last-use names its own store.
 define internal void @inner_hit(ptr %slot, ptr %cap) alwaysinline {
   store ptr %cap, ptr %slot, align 8, !mem.loan !2
   %v = load i32, ptr %cap, align 4, !mem.last_use !2
@@ -137,9 +139,10 @@ define internal void @inner_hit(ptr %slot, ptr %cap) alwaysinline {
 define void @collide(ptr %slot, ptr %cap, ptr %other, ptr %ocap) {
 ; COLLIDE-LABEL: define void @collide(
 ; COLLIDE: store ptr %cap, ptr %slot{{.*}}!mem.loan [[KEEP:![0-9]+]]
-; COLLIDE-NOT: !mem.loan
-; COLLIDE: ret void
-; COLLIDE: [[KEEP]] = !{i64 30786325577731}
+; COLLIDE: store ptr %ocap, ptr %other{{.*}}!mem.loan [[COPY:![0-9]+]]
+; COLLIDE: load i32, ptr %ocap{{.*}}!mem.last_use [[COPY]]
+; COLLIDE-DAG: [[KEEP]] = !{i64 30786325577731}
+; COLLIDE-DAG: [[COPY]] = !{i64 4398046511107}
 ;
   store ptr %cap, ptr %slot, align 8, !mem.loan !3
   call void @inner_hit(ptr %other, ptr %ocap)

@@ -2030,6 +2030,12 @@ static cl::opt<uint64_t> InlineLoanSalt(
     cl::desc("If non-zero, every inlined loan rekey uses this salt. "
              "0 uses the per-inline counter."));
 
+// [LLM-generated] M5r R16: production width is 21. A smaller width is how a
+// test fills the packed field without inventing 2^21 caller ids. 0 means 21.
+static cl::opt<unsigned> InlineLoanHighBits(
+    "mem-inline-loan-high-bits", cl::init(memannot::LoanHighBits), cl::Hidden,
+    cl::desc("Width of the packed inlined-loan copy field (1..21)."));
+
 static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
   static std::atomic<uint64_t> Salt{0};
   LLVMContext &Ctx = Caller->getContext();
@@ -2041,23 +2047,34 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
   if (NewBBs.empty())
     return;
 
-  auto mdIds = [](const MDNode *N, SmallVectorImpl<uint64_t> &Out) {
-    if (!N)
-      return;
-    for (const MDOperand &Op : N->operands())
-      if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op))
-        Out.push_back(C->getZExtValue());
+  // Ids already live in the caller. A new copy must not use one of them.
+  DenseSet<uint64_t> UsedPacked, UsedDisambig;
+  auto note = [&](const memannot::LoanRef &R) {
+    if (R.extended())
+      UsedDisambig.insert(R.Disambig);
+    else
+      UsedPacked.insert(R.Packed);
   };
-  DenseSet<uint64_t> Existing;
+  auto noteInst = [&](Instruction &I) {
+    for (unsigned K : Kinds) {
+      SmallVector<memannot::LoanRef, 4> Refs;
+      memannot::appendLoanRefs(I.getMetadata(K), Refs);
+      for (const memannot::LoanRef &R : Refs)
+        note(R);
+    }
+    if (auto *CB = dyn_cast<CallBase>(&I))
+      if (memannot::isMemFact(CB)) {
+        SmallVector<memannot::LoanRef, 4> Refs;
+        memannot::appendBundleLoanRefs(*CB, Refs);
+        for (const memannot::LoanRef &R : Refs)
+          note(R);
+      }
+  };
   for (BasicBlock &BB : *Caller) {
     if (NewBBs.count(&BB))
       continue;
     for (Instruction &I : BB)
-      for (unsigned K : Kinds) {
-        SmallVector<uint64_t, 4> Ids;
-        mdIds(I.getMetadata(K), Ids);
-        Existing.insert(Ids.begin(), Ids.end());
-      }
+      noteInst(I);
   }
 
   uint64_t S = 0;
@@ -2071,48 +2088,53 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
     while (!(S = ++Salt & 0x1fffff))
       ;
   };
-  // [LLM-generated] M5r R15: mix the previous high bits with this inline's
-  // salt. Masking them off made two copies that had already been rekeyed
-  // (an inlined callee of the callee) collapse onto one id, so one copy's
-  // last-use cleared the other copy's slot. A result that would be 0 in the
-  // high bits, or equal to an id already live in the caller, is dropped.
-  DenseMap<uint64_t, uint64_t> OldToNew;
-  DenseSet<uint64_t> Drop;
-  auto classify = [&](uint64_t Old) {
-    if (OldToNew.count(Old) || Drop.count(Old))
+  // [LLM-generated] M5r R15/R16: mix the previous high bits with this inline's
+  // salt so two already-rekeyed copies do not collapse. High 0 aliases an
+  // unrekeyed rustc id, and a packed id already live names a different copy.
+  // Either case takes another free high. If none remain, the copy is
+  // !{i64 orig, i64 disambiguator} / "mem.last_use.ext". It is not deleted:
+  // deleting it drops the invalidation, and leaving the old id would clear
+  // the other copy.
+  using Key = std::pair<uint64_t, uint64_t>;
+  DenseMap<Key, memannot::LoanRef> Map;
+  auto keyOf = [](const memannot::LoanRef &R) -> Key {
+    if (R.extended())
+      return {R.Orig, R.Disambig};
+    return {R.Packed, 0};
+  };
+  auto classify = [&](const memannot::LoanRef &Old) {
+    Key K = keyOf(Old);
+    if (Map.count(K))
       return;
     freshSalt();
-    uint64_t Low = Old & memannot::LoanKeyMask;
-    uint64_t OldHigh = (Old >> 42) & 0x1fffffull;
-    uint64_t NewHigh = (OldHigh ^ S) & 0x1fffffull;
-    uint64_t New = Low | (NewHigh << 42);
-    if (NewHigh == 0 || Existing.count(New)) {
-      Drop.insert(Old);
-      return;
-    }
-    for (const auto &KV : OldToNew)
-      if (KV.second == New) {
-        Drop.insert(Old);
-        Drop.insert(KV.first);
-        return;
-      }
-    OldToNew[Old] = New;
+    uint64_t OldHigh = Old.extended() ? 0 : ((Old.Packed >> 42) & 0x1fffffull);
+    memannot::LoanRef New = memannot::allocateLoanCopy(
+        Old.Orig, OldHigh, S,
+        [&](uint64_t P) { return UsedPacked.count(P); },
+        [&](uint64_t D) { return UsedDisambig.count(D); },
+        InlineLoanHighBits);
+    note(New);
+    Map[K] = New;
+  };
+  auto mapped = [&](const memannot::LoanRef &Old) {
+    auto It = Map.find(keyOf(Old));
+    return It == Map.end() ? Old : It->second;
   };
   for (BasicBlock *BB : NewBBs)
     for (Instruction &I : *BB) {
       for (unsigned K : Kinds) {
-        SmallVector<uint64_t, 4> Ids;
-        mdIds(I.getMetadata(K), Ids);
-        for (uint64_t Id : Ids)
-          classify(Id);
+        SmallVector<memannot::LoanRef, 4> Refs;
+        memannot::appendLoanRefs(I.getMetadata(K), Refs);
+        for (const memannot::LoanRef &R : Refs)
+          classify(R);
       }
-      // Anchors created before this inline carry the same loan ids in a bundle.
       if (auto *CB = dyn_cast<CallBase>(&I))
-        if (memannot::isMemFact(CB))
-          if (auto OB = CB->getOperandBundle(memannot::LastUseMD))
-            for (Value *V : OB->Inputs)
-              if (auto *C = dyn_cast<ConstantInt>(V))
-                classify(C->getZExtValue());
+        if (memannot::isMemFact(CB)) {
+          SmallVector<memannot::LoanRef, 4> Refs;
+          memannot::appendBundleLoanRefs(*CB, Refs);
+          for (const memannot::LoanRef &R : Refs)
+            classify(R);
+        }
     }
 
   DenseMap<MDNode *, MDNode *> Done;
@@ -2127,66 +2149,68 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
           SmallVector<Metadata *, 4> Ids;
           bool Any = false;
           for (const MDOperand &Op : N->operands()) {
-            auto *C = mdconst::dyn_extract_or_null<ConstantInt>(Op);
-            if (!C) {
+            memannot::LoanRef Old;
+            if (!memannot::decodeLoanRef(Op.get(), Old)) {
               Ids.push_back(Op.get());
               Any = true;
               continue;
             }
-            uint64_t Old = C->getZExtValue();
-            if (Drop.count(Old))
-              continue;
-            auto It = OldToNew.find(Old);
-            if (It == OldToNew.end())
-              continue;
-            Ids.push_back(ConstantAsMetadata::get(
-                ConstantInt::get(C->getType(), It->second)));
+            Ids.push_back(memannot::encodeLoanRef(Ctx, mapped(Old)));
             Any = true;
           }
-          New = Any ? MDNode::get(Ctx, Ids) : nullptr;
+          New = Any ? MDNode::get(Ctx, Ids) : N;
         }
         I.setMetadata(K, New);
       }
-  // Rewrite anchors with the same map. A dropped id is not left on the old
-  // value: that value can alias the caller's loan.
   SmallVector<CallBase *, 4> Anchors;
   for (BasicBlock *BB : NewBBs)
     for (Instruction &I : *BB)
       if (auto *CB = dyn_cast<CallBase>(&I))
-        if (memannot::isMemFact(CB) && CB->getOperandBundle(memannot::LastUseMD))
+        if (memannot::isMemFact(CB) &&
+            (CB->getOperandBundle(memannot::LastUseMD) ||
+             CB->getOperandBundle(memannot::LastUseExt)))
           Anchors.push_back(CB);
+  Type *I64 = Type::getInt64Ty(Ctx);
   for (CallBase *CB : Anchors) {
-    auto OB = CB->getOperandBundle(memannot::LastUseMD);
-    SmallVector<Value *, 4> Kept;
-    for (Value *V : OB->Inputs) {
-      auto *C = dyn_cast<ConstantInt>(V);
-      if (!C)
-        continue;
-      uint64_t Old = C->getZExtValue();
-      if (Drop.count(Old))
-        continue;
-      auto It = OldToNew.find(Old);
-      if (It == OldToNew.end())
-        continue;
-      Kept.push_back(ConstantInt::get(C->getType(), It->second));
+    SmallVector<memannot::LoanRef, 4> Refs;
+    memannot::appendBundleLoanRefs(*CB, Refs);
+    for (const memannot::LoanRef &R : Refs)
+      classify(R);
+    SmallVector<Value *, 4> Packed, Ext;
+    for (const memannot::LoanRef &R : Refs) {
+      memannot::LoanRef N = mapped(R);
+      if (N.extended()) {
+        Ext.push_back(ConstantInt::get(I64, N.Orig));
+        Ext.push_back(ConstantInt::get(I64, N.Disambig));
+      } else
+        Packed.push_back(ConstantInt::get(I64, N.Packed));
     }
-    if (Kept.empty()) {
-      CB->eraseFromParent();
+    // No decoded id: leave the call. Deleting it would drop the fact.
+    if (Packed.empty() && Ext.empty())
       continue;
-    }
-    OperandBundleDef NB(memannot::LastUseMD.str(),
-                        std::vector<Value *>(Kept.begin(), Kept.end()));
-    SmallVector<OperandBundleDef, 2> OBs;
-    for (unsigned I = 0, E = CB->getNumOperandBundles(); I != E; ++I) {
-      OperandBundleUse U = CB->getOperandBundleAt(I);
-      if (U.getTagName() == memannot::LastUseMD)
-        OBs.push_back(NB);
-      else
-        OBs.emplace_back(U);
-    }
-    CallBase *NewC = CallBase::Create(CB, OBs, CB->getIterator());
-    NewC->copyMetadata(*CB);
-    CB->replaceAllUsesWith(NewC);
+    CallBase *Primary = nullptr;
+    auto emit = [&](StringRef Tag, ArrayRef<Value *> Ids, bool WithOther) {
+      SmallVector<OperandBundleDef, 2> OBs;
+      if (WithOther)
+        for (unsigned I = 0, E = CB->getNumOperandBundles(); I != E; ++I) {
+          OperandBundleUse U = CB->getOperandBundleAt(I);
+          if (U.getTagName() == memannot::LastUseMD ||
+              U.getTagName() == memannot::LastUseExt)
+            continue;
+          OBs.emplace_back(U);
+        }
+      OBs.emplace_back(Tag.str(), std::vector<Value *>(Ids.begin(), Ids.end()));
+      CallBase *NewC = CallBase::Create(CB, OBs, CB->getIterator());
+      NewC->copyMetadata(*CB);
+      if (!Primary)
+        Primary = NewC;
+    };
+    if (!Packed.empty())
+      emit(memannot::LastUseMD, Packed, true);
+    if (!Ext.empty())
+      emit(memannot::LastUseExt, Ext, Packed.empty());
+    if (Primary)
+      CB->replaceAllUsesWith(Primary);
     CB->eraseFromParent();
   }
 }

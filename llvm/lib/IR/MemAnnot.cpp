@@ -1,13 +1,19 @@
 //===- MemAnnot.cpp - Memory-safety annotation vocabulary (M5r) -----------===//
 // [LLM-generated]
 #include "llvm/IR/MemAnnot.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -91,4 +97,141 @@ bool memannot::isTriviallyAllocInbounds(const Value *V, const DataLayout &DL) {
       Size = DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
   }
   return Size && !Off.isNegative() && Off.ule(*Size);
+}
+
+// [LLM-generated] M5r R16: one loan copy. A packed id uses bits 42..62.
+// Those bits are never 0 after a remap (0 would alias an unrekeyed rustc id).
+// If every non-zero value is already live, the copy is (orig, disambiguator).
+memannot::LoanRef memannot::allocateLoanCopy(uint64_t Orig, uint64_t OldHigh, uint64_t Salt,
+                                  function_ref<bool(uint64_t)> PackedTaken,
+                                  function_ref<bool(uint64_t)> DisambigTaken,
+                                  unsigned HighBits) {
+  unsigned Bits = HighBits;
+  if (Bits == 0 || Bits > LoanHighBits)
+    Bits = LoanHighBits;
+  uint64_t HighMask = (uint64_t(1) << Bits) - 1;
+  uint64_t Low = Orig & LoanKeyMask;
+  uint64_t Prefer = (OldHigh ^ (Salt & HighMask)) & HighMask;
+  auto TryH = [&](uint64_t H, LoanRef &Out) {
+    if (H == 0 || H > HighMask)
+      return false;
+    uint64_t Packed = Low | (H << 42);
+    if (PackedTaken(Packed))
+      return false;
+    Out = LoanRef{Low, Packed, 0};
+    return true;
+  };
+  LoanRef R;
+  if (TryH(Prefer, R))
+    return R;
+  for (uint64_t H = 1; H <= HighMask; ++H) {
+    if (H == Prefer)
+      continue;
+    if (TryH(H, R))
+      return R;
+  }
+  uint64_t D = 1;
+  while (D && DisambigTaken(D))
+    ++D;
+  // Every packed copy key and all 2^64-1 disambiguators are live. A further
+  // distinct id does not fit in this encoding. Emitting disambiguator 1 can
+  // alias; that state is not reached by the inliner tests.
+  if (D == 0)
+    D = 1;
+  return LoanRef{Low, 0, D};
+}
+
+static bool constInt64(const Metadata *M, uint64_t &Out) {
+  auto *C = mdconst::dyn_extract_or_null<ConstantInt>(M);
+  if (!C || C->getBitWidth() != 64)
+    return false;
+  Out = C->getZExtValue();
+  return true;
+}
+
+bool memannot::decodeLoanRef(const Metadata *M, LoanRef &R) {
+  uint64_t V = 0;
+  if (constInt64(M, V)) {
+    R = LoanRef{V & LoanKeyMask, V, 0};
+    return true;
+  }
+  auto *N = dyn_cast<MDNode>(M);
+  if (!N || N->getNumOperands() != 2)
+    return false;
+  uint64_t Orig = 0, D = 0;
+  if (!constInt64(N->getOperand(0).get(), Orig) ||
+      !constInt64(N->getOperand(1).get(), D) || D == 0)
+    return false;
+  R = LoanRef{Orig & LoanKeyMask, 0, D};
+  return true;
+}
+
+void memannot::appendLoanRefs(const MDNode *N, SmallVectorImpl<LoanRef> &Out) {
+  if (!N)
+    return;
+  for (const MDOperand &Op : N->operands()) {
+    LoanRef R;
+    if (decodeLoanRef(Op.get(), R))
+      Out.push_back(R);
+  }
+}
+
+void memannot::appendBundleLoanRefs(const CallBase &CB,
+                                    SmallVectorImpl<LoanRef> &Out) {
+  if (auto OB = CB.getOperandBundle(LastUseMD))
+    for (Value *V : OB->Inputs)
+      if (auto *C = dyn_cast<ConstantInt>(V))
+        if (C->getBitWidth() == 64) {
+          uint64_t Id = C->getZExtValue();
+          Out.push_back(LoanRef{Id & LoanKeyMask, Id, 0});
+        }
+  if (auto OB = CB.getOperandBundle(LastUseExt)) {
+    auto In = OB->Inputs;
+    for (unsigned I = 0; I + 1 < In.size(); I += 2) {
+      auto *A = dyn_cast<ConstantInt>(In[I]);
+      auto *B = dyn_cast<ConstantInt>(In[I + 1]);
+      if (!A || !B || A->getBitWidth() != 64 || B->getBitWidth() != 64)
+        continue;
+      uint64_t D = B->getZExtValue();
+      if (!D)
+        continue;
+      Out.push_back(LoanRef{A->getZExtValue() & LoanKeyMask, 0, D});
+    }
+  }
+}
+
+Metadata *memannot::encodeLoanRef(LLVMContext &Ctx, const LoanRef &R) {
+  Type *I64 = Type::getInt64Ty(Ctx);
+  if (R.extended())
+    return MDNode::get(
+        Ctx, {ConstantAsMetadata::get(ConstantInt::get(I64, R.Orig)),
+              ConstantAsMetadata::get(ConstantInt::get(I64, R.Disambig))});
+  return ConstantAsMetadata::get(ConstantInt::get(I64, R.Packed));
+}
+
+void memannot::insertLastUseAnchors(Instruction &InsertBefore, const MDNode *LU) {
+  SmallVector<LoanRef, 4> Refs;
+  appendLoanRefs(LU, Refs);
+  Module *M = InsertBefore.getModule();
+  if (Refs.empty() || !M)
+    return;
+  LLVMContext &Ctx = InsertBefore.getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  SmallVector<Value *, 4> Packed, Ext;
+  for (const LoanRef &R : Refs) {
+    if (R.extended()) {
+      Ext.push_back(ConstantInt::get(I64, R.Orig));
+      Ext.push_back(ConstantInt::get(I64, R.Disambig));
+    } else
+      Packed.push_back(ConstantInt::get(I64, R.Packed));
+  }
+  Function *Fact = Intrinsic::getOrInsertDeclaration(M, Intrinsic::mem_fact);
+  auto Emit = [&](StringRef Tag, ArrayRef<Value *> Ids) {
+    if (Ids.empty())
+      return;
+    OperandBundleDef OB(Tag.str(), std::vector<Value *>(Ids.begin(), Ids.end()));
+    CallInst::Create(Fact, {}, {OB}, "", InsertBefore.getIterator());
+  };
+  Emit(LastUseMD, Packed);
+  Emit(LastUseExt, Ext);
 }

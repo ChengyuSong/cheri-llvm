@@ -143,10 +143,18 @@ std::optional<uint64_t> constSite(const CallBase &CB) {
 // R5: loan ids are counted by their original id (the LLVM inliner re-keys a
 // cloned body's ids in the high bits, D35).
 static Metadata *loanKey(Metadata *M) {
+  // Packed and extended copies share the census key: the low 42 bits.
+  // Which copy a last-use clears is the full id, not this key.
   if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(M))
     if (C->getBitWidth() == 64)
       return ConstantAsMetadata::get(
           ConstantInt::get(C->getType(), C->getZExtValue() & memannot::LoanKeyMask));
+  if (auto *N = dyn_cast<MDNode>(M))
+    if (N->getNumOperands() == 2)
+      if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(0)))
+        if (C->getBitWidth() == 64)
+          return ConstantAsMetadata::get(ConstantInt::get(
+              C->getType(), C->getZExtValue() & memannot::LoanKeyMask));
   return M;
 }
 

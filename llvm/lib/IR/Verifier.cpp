@@ -4171,6 +4171,21 @@ void Verifier::visitCallBase(CallBase &Call) {
               Call);
         continue;
       }
+      if (T == memannot::LastUseExt) {
+        // R16: extended loan copies, one pair per copy. Not two packed ids.
+        bool Ids = In.size() >= 2 && (In.size() % 2) == 0;
+        for (unsigned k = 0; Ids && k + 1 < In.size(); k += 2) {
+          auto *A = dyn_cast<ConstantInt>(In[k]);
+          auto *B = dyn_cast<ConstantInt>(In[k + 1]);
+          Ids = A && B && A->getBitWidth() == 64 && B->getBitWidth() == 64 &&
+                B->getZExtValue() != 0;
+        }
+        Check(IsFact && Ids,
+              "\"mem.last_use.ext\" bundle must be pairs of i64 "
+              "(orig, disambiguator) on llvm.mem.fact",
+              Call);
+        continue;
+      }
       Check(IsFact, "\"mem.\" fact bundles may only appear on llvm.mem.fact",
             Call);
       if (T == memannot::TagClaim)
@@ -5747,6 +5762,20 @@ void Verifier::visitMemCacheHintMetadata(Instruction &I, MDNode *MD) {
   }
 }
 
+// [LLM-generated] M5r R16: a loan operand is a packed i64, or one extended
+// copy !{i64 orig, i64 disambiguator}. The pair is one loan, not two ids.
+static bool loanOperandOK(const MDOperand &Op) {
+  if (mdconst::dyn_extract_or_null<ConstantInt>(Op))
+    return true;
+  auto *N = dyn_cast<MDNode>(Op);
+  if (!N || N->getNumOperands() != 2)
+    return false;
+  auto *A = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(0));
+  auto *B = mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1));
+  return A && B && A->getBitWidth() == 64 && B->getBitWidth() == 64 &&
+         B->getZExtValue() != 0;
+}
+
 /// verifyInstruction - Verify that an instruction is well formed.
 ///
 void Verifier::visitInstruction(Instruction &I) {
@@ -5770,8 +5799,10 @@ void Verifier::visitInstruction(Instruction &I) {
           "!mem.last_use only on load, store, atomic or call instructions", &I);
     bool OK = LU->getNumOperands() > 0;
     for (const MDOperand &Op : LU->operands())
-      OK &= mdconst::dyn_extract_or_null<ConstantInt>(Op) != nullptr;
-    Check(OK, "!mem.last_use must be a non-empty list of i64 loan ids", &I);
+      OK &= loanOperandOK(Op);
+    Check(OK, "!mem.last_use must be a non-empty list of i64 loan ids or "
+              "!{i64 orig, i64 disambiguator} copies",
+          &I);
   }
   // [LLM-generated] M5r R5 (D35): !mem.loan !{i64 loan, ...} on the store of
   // a reference into memory.
@@ -5779,8 +5810,10 @@ void Verifier::visitInstruction(Instruction &I) {
     Check(isa<StoreInst>(I), "!mem.loan only on store instructions", &I);
     bool OK = LN->getNumOperands() > 0;
     for (const MDOperand &Op : LN->operands())
-      OK &= mdconst::dyn_extract_or_null<ConstantInt>(Op) != nullptr;
-    Check(OK, "!mem.loan must be a non-empty list of i64 loan ids", &I);
+      OK &= loanOperandOK(Op);
+    Check(OK, "!mem.loan must be a non-empty list of i64 loan ids or "
+              "!{i64 orig, i64 disambiguator} copies",
+          &I);
   }
 
   if (!isa<PHINode>(I)) {   // Check that non-phi nodes are not self referential
