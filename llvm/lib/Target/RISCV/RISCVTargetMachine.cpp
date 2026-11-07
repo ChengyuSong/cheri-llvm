@@ -143,6 +143,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVGatherScatterLoweringPass(*PR);
   initializeRISCVCodeGenPrepareLegacyPassPass(*PR);
   initializeRISCVCheriBoundsLoweringPass(*PR);
+  initializeRISCVCheriCapInvalidatePass(*PR);
+  initializeRISCVCheriCapInvalidateExpandPass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
   initializeRISCVMergeBaseOffsetOptPass(*PR);
   initializeRISCVOptWInstrsPass(*PR);
@@ -625,6 +627,9 @@ void RISCVPassConfig::addPreEmitPass2() {
   }
   addPass(
       createRISCVExpandPseudoPass(getTM<RISCVTargetMachine>().ImportedObjects));
+  // After pre-emit copy-prop, so clearing a callee-saved register is not
+  // dropped as a dead move before a later call.
+  addPass(createRISCVCheriCapInvalidateExpandPass());
 
   // Add QC Relaxation Markers as late as possible, and only for RV32
   if (TM->getOptLevel() != CodeGenOptLevel::None &&
@@ -687,6 +692,8 @@ void RISCVPassConfig::addFastRegAlloc() {
 
 
 void RISCVPassConfig::addPostRegAlloc() {
+  // D87: after spills exist, before PEI creates callee-saved save slots.
+  addPass(createRISCVCheriCapInvalidatePass());
   if (TM->getOptLevel() != CodeGenOptLevel::None &&
       EnableRedundantCopyElimination)
     addPass(createRISCVRedundantCopyEliminationPass());

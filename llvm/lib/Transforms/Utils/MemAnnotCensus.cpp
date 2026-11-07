@@ -693,6 +693,9 @@ bool memannot::stripAnnotations(Module &M) {
   // Operands kept alive only by annotations (e.g. a GEP feeding a claim or a
   // select of merged check sites) are deleted afterwards, so ISel sees the
   // same IR as an unannotated build.
+  // D87: llvm.cheri.cap.invalidate is not a mem fact and is not stripped.
+  // D89: nothing here copies a loan id onto a MachineMemOperand. The clear
+  // reaches the backend as !pcsections plus that intrinsic.
   SmallVector<WeakTrackingVH, 32> MaybeDead;
   auto NoteOps = [&](CallBase *CB, bool AllOps) {
     for (unsigned B = 0, E = CB->getNumOperandBundles(); B != E; ++B) {

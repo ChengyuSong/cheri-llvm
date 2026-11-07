@@ -30,6 +30,7 @@ define void @loan(ptr addrspace(200) %p) {
 ; LOAN-LABEL: define void @loan(
 ; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
 ; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r, align 16
+; LOAN-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(
 ; LOAN-NEXT: call addrspace(200) void @g()
 ; SF-LABEL: define void @loan(
 ; SF-NOT: store {{(volatile )?}}ptr addrspace(200) null
@@ -62,6 +63,7 @@ define void @escaped(ptr addrspace(200) %p) {
 ; LOAN-LABEL: define void @escaped(
 ; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r, align 16
 ; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r, align 16, !pcsections [[PCL:![0-9]+]]
+; LOAN-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(
 ; NOESC-LABEL: define void @escaped(
 ; NOESC-NOT: store {{(volatile )?}}ptr addrspace(200) null
 ; NOESC: ret void
@@ -76,6 +78,7 @@ define void @blackbox(ptr addrspace(200) %p) {
 ; LOAN-LABEL: define void @blackbox(
 ; LOAN: load volatile ptr addrspace(200), ptr addrspace(200) %r
 ; LOAN-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r
+; LOAN-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(
 ; ASMESC-LABEL: define void @blackbox(
 ; ASMESC-NOT: store {{(volatile )?}}ptr addrspace(200) null
 ; ASMESC: ret void
@@ -97,6 +100,7 @@ define void @skip() {
 ; ALL-LABEL: define void @skip(
 ; ALL: %v = load volatile
 ; ALL-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %r
+; ALL-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(
 ; ALL-NOT: cheri.inv.cap
 ; ALL: ret void
 ; NOSKIP-LABEL: define void @skip(

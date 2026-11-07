@@ -1,0 +1,59 @@
+# [LLM-generated] M6.0 D87. Post-RA spill-slot nulling, and a loan that is in a
+# callee-saved register. The save slot of that register is not nulled.
+# D89: the inserted store's memory operand has no loan id.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -run-pass=riscv-cheri-cap-invalidate -o - %s | FileCheck %s
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @spill() addrspace(200) { ret void }
+  define void @csr() addrspace(200) { ret void }
+...
+---
+name:            spill
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCheriCapInvalidate $x10_y
+    $x11_y = CLC_128 %stack.0, 0
+    PseudoCRET implicit $x11_y
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: spill
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NEXT: CSC_128 $x0_y, %stack.0, 0
+# CHECK-NEXT: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NEXT: $x11_y = CLC_128 %stack.0, 0
+# CHECK-NOT: mem.loan
+---
+name:            csr
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x20_y = CLC_128 %stack.0, 0
+    PseudoCheriCapInvalidate $x20_y
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '$x20_y', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: csr
+# CHECK: $x20_y = CLC_128 %stack.0, 0
+# CHECK-NEXT: $x20_y = PseudoCheriCapClear $x20_y
+# CHECK-NOT: CSC_128 $x0_y

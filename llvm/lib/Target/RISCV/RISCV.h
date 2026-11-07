@@ -244,6 +244,11 @@ void initializeRISCVZacasABIFixPass(PassRegistry &);
 FunctionPass *createRISCVCheriCleanupOptPass();
 void initializeRISCVCheriCleanupOptPass(PassRegistry &);
 
+FunctionPass *createRISCVCheriCapInvalidatePass();
+void initializeRISCVCheriCapInvalidatePass(PassRegistry &);
+FunctionPass *createRISCVCheriCapInvalidateExpandPass();
+void initializeRISCVCheriCapInvalidateExpandPass(PassRegistry &);
+
 InstructionSelector *
 createRISCVInstructionSelector(const RISCVTargetMachine &,
                                const RISCVSubtarget &,
