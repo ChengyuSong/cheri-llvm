@@ -214,6 +214,7 @@ LLVM_ABI void preserveWidenedLastUse(Instruction &Vec, ArrayRef<Value *> Scalars
 /// -cheri-invalidate-stats-out from the machine pass.
 LLVM_ABI void noteSpillSearchAbort();
 LLVM_ABI void noteSpillNull();
+LLVM_ABI void noteCapRegSkippedLive();
 LLVM_ABI void flushSpillInvalidateStats();
 } // namespace memannot
 } // namespace llvm

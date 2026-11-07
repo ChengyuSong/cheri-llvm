@@ -129,8 +129,10 @@ static cl::opt<std::string> InvStatsOut(
 // D96. The machine pass increments these; flushSpillInvalidateStats appends.
 static unsigned SpillSearchAborts = 0;
 static unsigned SpillNulls = 0;
+static unsigned CapRegSkippedLive = 0;
 void llvm::memannot::noteSpillSearchAbort() { ++SpillSearchAborts; }
 void llvm::memannot::noteSpillNull() { ++SpillNulls; }
+void llvm::memannot::noteCapRegSkippedLive() { ++CapRegSkippedLive; }
 void llvm::memannot::flushSpillInvalidateStats() {
   if (InvStatsOut.empty())
     return;
@@ -138,9 +140,11 @@ void llvm::memannot::flushSpillInvalidateStats() {
   raw_fd_ostream OS(InvStatsOut, EC, sys::fs::OF_Append | sys::fs::OF_Text);
   if (!EC)
     OS << "cheri-invalidate-spill: aborts=" << SpillSearchAborts
-       << " nulls=" << SpillNulls << "\n";
+       << " nulls=" << SpillNulls
+       << " capreg_skipped_live=" << CapRegSkippedLive << "\n";
   SpillSearchAborts = 0;
   SpillNulls = 0;
+  CapRegSkippedLive = 0;
 }
 
 namespace {
@@ -630,26 +634,6 @@ struct Inv {
       }
     }
   }
-  // D95. The clear is inserted before At. A use at At or reachable from At
-  // still needs the value (realloc's old pointer, a cap used after
-  // lifetime.end). CountAt is false when At is the lifetime.end that names
-  // the object: that marker is the event, not a later use.
-  bool usedAfter(const Value *V, Instruction *At, DominatorTree &DT,
-                 bool CountAt) const {
-    for (const User *U : V->users()) {
-      const auto *I = dyn_cast<Instruction>(U);
-      if (!I)
-        continue;
-      if (I == At) {
-        if (CountAt)
-          return true;
-        continue;
-      }
-      if (isPotentiallyReachable(At, I, nullptr, &DT))
-        return true;
-    }
-    return false;
-  }
   static bool realCall(const Instruction &I) {
     const auto *CB = dyn_cast<CallBase>(&I);
     return CB && !CB->isInlineAsm() &&
@@ -688,15 +672,15 @@ struct Inv {
         return true;
     return false;
   }
+  // D97 decides at the physical register whether this use is a kill. The IR
+  // clear is emitted even if a later instruction still names the value.
   void emitCapRegs(IRBuilder<> &B, Value *Root, Instruction *At,
-                   DominatorTree &DT, unsigned &Counter, bool CountAt) {
+                   DominatorTree &DT, unsigned &Counter) {
     if (!InvCapReg)
       return;
     SmallVector<Value *, 8> Vs;
     capCopies(Root, At, DT, Vs);
     for (Value *V : Vs) {
-      if (usedAfter(V, At, DT, CountAt))
-        continue;
       B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {V});
       ++Counter;
     }
@@ -1106,12 +1090,11 @@ struct Inv {
             }
           }
         }
-        // D92/D94/D95: slite still clears registers, but only for values that
-        // are dead here and only when a real call follows. A dead address
-        // with no later call is overwritten by the epilogue.
+        // D94: only when a real call follows. D97 drops the clear if the
+        // physical register is still live (stack-coloring reuse, a loop-carried
+        // bounded cap). D98 clears that bounded cap where it actually dies.
         if (RegScope && callAfter(E))
-          emitCapRegs(B, A ? static_cast<Value *>(A) : Op, E, DT, CapRegScope,
-                      /*CountAt=*/false);
+          emitCapRegs(B, A ? static_cast<Value *>(A) : Op, E, DT, CapRegScope);
       }
     auto clearFreedReg = [&](CallBase *C, Instruction *At) {
       if (!At)
@@ -1123,7 +1106,7 @@ struct Inv {
       // D91: the pointer passed to dealloc and dominating copies. Aflog
       // records base/length before the call; this clear is after it, and
       // after any frame-slot range check inserted at the same point.
-      emitCapRegs(B, P, At, DT, CapRegFree, /*CountAt=*/true);
+      emitCapRegs(B, P, At, DT, CapRegFree);
     };
     if (Free)
       for (CallBase *C : Frees) {

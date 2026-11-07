@@ -20,6 +20,15 @@
 //
 // D89: loan ids are not attached to MachineMemOperands. The carriers are
 // !pcsections on the IR slot clear and this pseudo on the register.
+//
+// D97: the clear is a new def. Emit it only when the register is not read
+// again before a later def, on any path. A live register (stack-colored
+// address, pointer compared after free, hoisted cap used on the next
+// iteration) keeps its pseudo dropped. A spill slot is nulled only when no
+// later reload of that slot happens before a store.
+// D98: a csetbounds of that frame address is the capability the program
+// dereferences. Clear that register where it dies, splitting the exit edge
+// when a loop keeps it live across iterations.
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
@@ -260,6 +269,239 @@ struct SpillSearch {
   }
 };
 
+static bool definesOverlap(const MachineInstr &MI, Register R,
+                           const TargetRegisterInfo &TRI);
+
+// A real read of R. The invalidate pseudo is the marker we are placing, not a
+// later use of the value. Debug uses do not keep the capability alive.
+static bool readsReg(const MachineInstr &MI, Register R,
+                     const TargetRegisterInfo &TRI) {
+  if (MI.isDebugInstr() || MI.getOpcode() == RISCV::PseudoCheriCapInvalidate)
+    return false;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isReg() && MO.isUse() && MO.getReg() &&
+        TRI.regsOverlap(MO.getReg(), R))
+      return true;
+  return false;
+}
+
+static bool readFromBegin(MachineBasicBlock &MBB, Register R,
+                          const TargetRegisterInfo &TRI,
+                          SmallPtrSetImpl<MachineBasicBlock *> &Seen,
+                          unsigned &Budget);
+
+// True if any path from It reads R before a def. A search that runs out of
+// budget reports a read, so the register is left alone.
+static bool readRange(MachineBasicBlock &MBB, MachineBasicBlock::iterator It,
+                      Register R, const TargetRegisterInfo &TRI,
+                      SmallPtrSetImpl<MachineBasicBlock *> &Seen,
+                      unsigned &Budget) {
+  for (; It != MBB.end(); ++It) {
+    if (Budget-- == 0)
+      return true;
+    if (It->isDebugInstr())
+      continue;
+    if (readsReg(*It, R, TRI))
+      return true;
+    if (definesOverlap(*It, R, TRI))
+      return false;
+  }
+  for (MachineBasicBlock *S : MBB.successors())
+    if (readFromBegin(*S, R, TRI, Seen, Budget))
+      return true;
+  return false;
+}
+
+static bool readFromBegin(MachineBasicBlock &MBB, Register R,
+                          const TargetRegisterInfo &TRI,
+                          SmallPtrSetImpl<MachineBasicBlock *> &Seen,
+                          unsigned &Budget) {
+  if (!Seen.insert(&MBB).second)
+    return false;
+  return readRange(MBB, MBB.begin(), R, TRI, Seen, Budget);
+}
+
+// D97. True when no path reads R after MI before a later def. This follows
+// real uses, so a stale live-in that exists only because of the pseudo itself
+// does not keep the register alive. Callee-saved restores are inserted by PEI
+// after this pass and are not reads of this value.
+static bool deadAfter(MachineInstr &MI, Register R,
+                      const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 256;
+  return !readRange(*MI.getParent(), std::next(MI.getIterator()), R, TRI, Seen,
+                    Budget);
+}
+
+// True when some successor reads R before redefining it.
+static bool liveAtEnd(MachineBasicBlock &MBB, Register R,
+                      const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 256;
+  for (MachineBasicBlock *S : MBB.successors())
+    if (readFromBegin(*S, R, TRI, Seen, Budget))
+      return true;
+  return false;
+}
+
+static bool blockReads(MachineBasicBlock &MBB, Register R,
+                       const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 256;
+  return readFromBegin(MBB, R, TRI, Seen, Budget);
+}
+
+static bool isBoundsOpc(unsigned Opc) {
+  return Opc == RISCV::CSetBounds || Opc == RISCV::CSetBoundsExact ||
+         Opc == RISCV::CSetBoundsImm || Opc == RISCV::CSetBoundsRoundDown;
+}
+
+static bool definesOverlap(const MachineInstr &MI, Register R,
+                           const TargetRegisterInfo &TRI) {
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isReg() && MO.isDef() && MO.getReg() &&
+        TRI.regsOverlap(MO.getReg(), R))
+      return true;
+  return false;
+}
+
+// Found: every reaching def is this frame index. Cycle: this path only
+// carries a value already being resolved. Unknown: not a frame address.
+enum class FrameReach { Unknown, Cycle, Found };
+struct FrameRes {
+  FrameReach Kind = FrameReach::Unknown;
+  int FI = -1;
+  static FrameRes unknown() { return {}; }
+  static FrameRes cycle() { return {FrameReach::Cycle, -1}; }
+  static FrameRes found(int FI) { return {FrameReach::Found, FI}; }
+};
+
+static FrameRes
+frameAddrAt(Register Want, MachineBasicBlock &MBB,
+            MachineBasicBlock::iterator End, bool Inclusive,
+            const TargetRegisterInfo &TRI,
+            SmallPtrSetImpl<MachineBasicBlock *> &Walking, unsigned Depth);
+
+// Follow a copy, a bounds op, or a register cincoffset to the frame index.
+static FrameRes frameAddrFromDef(MachineInstr &Def, Register Want,
+                                 const TargetRegisterInfo &TRI,
+                                 unsigned Depth) {
+  auto Chase = [&](Register Next) -> FrameRes {
+    SmallPtrSet<MachineBasicBlock *, 8> Walking;
+    return frameAddrAt(Next, *Def.getParent(), Def.getIterator(), false, TRI,
+                       Walking, Depth + 1);
+  };
+  unsigned Opc = Def.getOpcode();
+  if (Opc == RISCV::CIncOffsetImm || Opc == RISCV::CIncOffset) {
+    if (std::optional<int> FI = frameIndexOf(Def))
+      return FrameRes::found(*FI);
+    if (Def.getNumOperands() > 1 && Def.getOperand(1).isReg())
+      return Chase(Def.getOperand(1).getReg());
+    return FrameRes::unknown();
+  }
+  if (Def.isCopy() && Def.getOperand(0).isReg() && Def.getOperand(1).isReg() &&
+      TRI.regsOverlap(Def.getOperand(0).getReg(), Want))
+    return Chase(Def.getOperand(1).getReg());
+  if (isBoundsOpc(Opc) && Def.getOperand(1).isReg())
+    return Chase(Def.getOperand(1).getReg());
+  return FrameRes::unknown();
+}
+
+static bool blockDefines(MachineBasicBlock &MBB, Register Want,
+                         const TargetRegisterInfo &TRI) {
+  for (MachineInstr &I : MBB)
+    if (definesOverlap(I, Want, TRI))
+      return true;
+  return false;
+}
+
+// Frame index of the address in Want at End. End is exclusive unless
+// Inclusive. A predecessor that only carries Want (a loop backedge, or a
+// side path into that backedge) is the same value as the definition outside
+// the loop; it does not veto the frame index.
+static FrameRes
+frameAddrAt(Register Want, MachineBasicBlock &MBB,
+            MachineBasicBlock::iterator End, bool Inclusive,
+            const TargetRegisterInfo &TRI,
+            SmallPtrSetImpl<MachineBasicBlock *> &Walking, unsigned Depth) {
+  if (Depth > 12 || !Want)
+    return FrameRes::unknown();
+  MachineInstr *Def = nullptr;
+  for (auto It = MBB.begin(); It != End; ++It)
+    if (definesOverlap(*It, Want, TRI))
+      Def = &*It;
+  if (Inclusive && End != MBB.end() && definesOverlap(*End, Want, TRI))
+    Def = &*End;
+  if (Def)
+    return frameAddrFromDef(*Def, Want, TRI, Depth);
+  if (!Walking.insert(&MBB).second)
+    return FrameRes::cycle();
+  FrameRes Common = FrameRes::cycle();
+  for (MachineBasicBlock *P : MBB.predecessors()) {
+    if (P->empty())
+      return FrameRes::unknown();
+    if (Walking.count(P) && !blockDefines(*P, Want, TRI))
+      continue;
+    FrameRes FI =
+        frameAddrAt(Want, *P, std::prev(P->end()), true, TRI, Walking, Depth + 1);
+    if (FI.Kind == FrameReach::Unknown)
+      return FI;
+    if (FI.Kind == FrameReach::Cycle)
+      continue;
+    if (Common.Kind == FrameReach::Cycle)
+      Common = FI;
+    else if (Common.FI != FI.FI)
+      return FrameRes::unknown();
+  }
+  return Common;
+}
+
+static std::optional<int> frameAddrFI(Register R, MachineInstr &At,
+                                      const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 8> Walking;
+  FrameRes Rch = frameAddrAt(R, *At.getParent(), At.getIterator(), false, TRI,
+                            Walking, 0);
+  if (Rch.Kind != FrameReach::Found)
+    return std::nullopt;
+  return Rch.FI;
+}
+
+// D97 spill rule. True if any path reloads FI after Start before storing it.
+// An aborted search is treated as a reload so the slot is left alone.
+static bool reloadBeforeStoreRec(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator It, int FI,
+                                 SmallPtrSetImpl<MachineBasicBlock *> &Stack,
+                                 unsigned &Budget, unsigned &Blocks) {
+  if (!Stack.insert(&MBB).second || ++Blocks > 16) {
+    memannot::noteSpillSearchAbort();
+    return true;
+  }
+  auto Leave = make_scope_exit([&] { Stack.erase(&MBB); });
+  for (; It != MBB.end(); ++It) {
+    if (Budget-- == 0) {
+      memannot::noteSpillSearchAbort();
+      return true;
+    }
+    std::optional<int> Got = frameIndexOf(*It);
+    if (!Got || *Got != FI)
+      continue;
+    if (It->mayLoad())
+      return true;
+    if (It->mayStore())
+      return false;
+  }
+  for (MachineBasicBlock *S : MBB.successors())
+    if (reloadBeforeStoreRec(*S, S->begin(), FI, Stack, Budget, Blocks))
+      return true;
+  return false;
+}
+static bool reloadBeforeStore(MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator Start, int FI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Stack;
+  unsigned Budget = 128, Blocks = 0;
+  return reloadBeforeStoreRec(MBB, Start, FI, Stack, Budget, Blocks);
+}
+
 static bool isCalleeSavedSlot(const MachineFrameInfo &MFI, int FI) {
   for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo())
     if (CS.getFrameIdx() == FI)
@@ -297,30 +539,50 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
           return true;
     return false;
   };
+  SmallVector<MachineInstr *, 8> Drop;
+  SmallSet<int, 8> ScopeFIs;
+  auto keepNull = [&](MachineBasicBlock *MBB, MachineInstr *Before, int FI,
+                      unsigned StoreOpc) {
+    if (!usable(FI) || !StoreOpc)
+      return;
+    MachineBasicBlock::iterator Start =
+        Before ? std::next(Before->getIterator()) : MBB->begin();
+    if (Before && reloadBeforeStore(*MBB, Start, FI))
+      return;
+    if (!Before && reloadBeforeStore(*MBB, MBB->getFirstTerminator(), FI))
+      return;
+    Nulls.push_back({MBB, Before, FI, StoreOpc});
+  };
   for (MachineInstr *MI : Work) {
     Register Rs = MI->getOperand(0).getReg();
-    if (Rs.isVirtual()) {
-      // Post-RA this pass sees physical registers. A virtual def is not a
-      // spill slot we can name.
-    } else {
-      SpillSearch Search(TRI);
-      SmallSet<int, 4> Holds;
-      SmallSet<int, 4> Killed;
-      DenseMap<int, unsigned> Opc;
-      SmallVector<Register, 4> Regs{Rs};
-      if (Search.walk(MI->getParent(), MI->getIterator(), Regs, Holds, Killed,
-                      Opc)) {
-        for (int FI : Holds)
-          if (unsigned StoreOpc = Opc.lookup(FI); usable(FI) && StoreOpc)
-            Nulls.push_back({MI->getParent(), MI, FI, StoreOpc});
-        for (auto &Path : Search.OnPath) {
-          for (auto [FI, StoreOpc] : Path.second) {
-            if (!StoreOpc || !usable(FI) || blockUses(MI->getParent(), MI, FI))
-              continue;
-            Nulls.push_back({Path.first, nullptr, FI, StoreOpc});
-          }
+    if (Rs.isVirtual() || !deadAfter(*MI, Rs, TRI)) {
+      // D97: a live register still holds a cap for a later read (colored
+      // frame address, pointer compared after free). Drop the pseudo.
+      Drop.push_back(MI);
+      memannot::noteCapRegSkippedLive();
+      if (!Rs.isVirtual())
+        if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
+          ScopeFIs.insert(*FI);
+      continue;
+    }
+    if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
+      ScopeFIs.insert(*FI);
+    SpillSearch Search(TRI);
+    SmallSet<int, 4> Holds;
+    SmallSet<int, 4> Killed;
+    DenseMap<int, unsigned> Opc;
+    SmallVector<Register, 4> Regs{Rs};
+    if (Search.walk(MI->getParent(), MI->getIterator(), Regs, Holds, Killed,
+                    Opc)) {
+      for (int FI : Holds)
+        if (unsigned StoreOpc = Opc.lookup(FI))
+          keepNull(MI->getParent(), MI, FI, StoreOpc);
+      for (auto &Path : Search.OnPath)
+        for (auto [FI, StoreOpc] : Path.second) {
+          if (blockUses(MI->getParent(), MI, FI))
+            continue;
+          keepNull(Path.first, nullptr, FI, StoreOpc);
         }
-      }
     }
   }
   for (const NullAt &N : Nulls) {
@@ -347,11 +609,139 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
     memannot::noteSpillNull();
     Changed = true;
   }
+  // D98. A csetbounds of a frame address we tried to invalidate is the
+  // capability later code dereferences. Clear that register only where it
+  // is dead: after its last use, or on an edge into a block that does not
+  // want it (the loop exit of a hoisted bounded cap).
+  SmallSet<Register, 8> Bounded;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB) {
+      if (!isBoundsOpc(MI.getOpcode()) || !MI.getOperand(0).isReg() ||
+          !MI.getOperand(1).isReg())
+        continue;
+      std::optional<int> FI = frameAddrFI(MI.getOperand(1).getReg(), MI, TRI);
+      if (!FI || !ScopeFIs.count(*FI))
+        continue;
+      bool FeedsClear = false;
+      for (MachineInstr *P : Work) {
+        std::optional<int> PFI = frameAddrFI(P->getOperand(0).getReg(), *P, TRI);
+        if (!PFI || *PFI != *FI)
+          continue;
+        if (MI.getParent() == P->getParent()) {
+          for (auto It = MI.getParent()->begin(); It != P->getIterator(); ++It)
+            if (&*It == &MI)
+              FeedsClear = true;
+        } else {
+          SmallPtrSet<MachineBasicBlock *, 8> Seen;
+          SmallVector<MachineBasicBlock *, 4> Q(MI.getParent()->succ_begin(),
+                                                MI.getParent()->succ_end());
+          while (!Q.empty()) {
+            MachineBasicBlock *BB = Q.pop_back_val();
+            if (BB == P->getParent()) {
+              FeedsClear = true;
+              break;
+            }
+            if (!Seen.insert(BB).second)
+              continue;
+            Q.append(BB->succ_begin(), BB->succ_end());
+          }
+        }
+        if (FeedsClear)
+          break;
+      }
+      if (!FeedsClear)
+        continue;
+      Bounded.insert(MI.getOperand(0).getReg());
+    }
+  struct ClearAt {
+    MachineBasicBlock *MBB;
+    MachineInstr *Before; // null: at block end
+    Register Reg;
+  };
+  struct EdgeClear {
+    MachineBasicBlock *From;
+    MachineBasicBlock *To;
+    Register Reg;
+  };
+  SmallVector<ClearAt, 8> Extra;
+  SmallVector<EdgeClear, 8> Edges;
+  for (Register B : Bounded) {
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : MBB) {
+        if (!readsReg(MI, B, TRI) || !deadAfter(MI, B, TRI))
+          continue;
+        // A terminator reads the old value. Clearing after it in this block
+        // is not valid MIR; the value is already dead on every outgoing edge.
+        // A return has no successors, so a returned capability is kept.
+        if (MI.isTerminator()) {
+          for (MachineBasicBlock *S : MBB.successors())
+            Edges.push_back({&MBB, S, B});
+        } else
+          Extra.push_back({&MBB, MI.getNextNode(), B});
+      }
+      if (!liveAtEnd(MBB, B, TRI))
+        continue;
+      for (MachineBasicBlock *S : MBB.successors()) {
+        if (S == &MBB || blockReads(*S, B, TRI))
+          continue;
+        // Dead only on this edge (the loop keeps the cap live on the
+        // backedge). Split so the other predecessors of S are untouched.
+        Edges.push_back({&MBB, S, B});
+      }
+    }
+  }
+  SmallSet<std::pair<MachineBasicBlock *, Register>, 8> SeenClear;
+  for (const ClearAt &C : Extra) {
+    if (!SeenClear.insert({C.MBB, C.Reg}).second)
+      continue;
+    MachineBasicBlock::iterator At =
+        C.Before ? C.Before->getIterator() : C.MBB->end();
+    DebugLoc DL;
+    if (At != C.MBB->end())
+      DL = At->getDebugLoc();
+    else if (!C.MBB->empty())
+      DL = C.MBB->back().getDebugLoc();
+    BuildMI(*C.MBB, At, DL, TII.get(RISCV::PseudoCheriCapClear), C.Reg)
+        .addReg(C.Reg);
+    Changed = true;
+  }
+  DenseMap<std::pair<MachineBasicBlock *, MachineBasicBlock *>,
+           SmallVector<Register, 2>>
+      ByEdge;
+  for (const EdgeClear &E : Edges) {
+    SmallVector<Register, 2> &Regs = ByEdge[{E.From, E.To}];
+    if (!is_contained(Regs, E.Reg))
+      Regs.push_back(E.Reg);
+  }
+  for (auto &KV : ByEdge) {
+    MachineBasicBlock *From = KV.first.first;
+    MachineBasicBlock *To = KV.first.second;
+    MachineBasicBlock::SplitCriticalEdgeAnalyses None{nullptr, nullptr,
+                                                      nullptr, nullptr};
+    MachineBasicBlock *EB =
+        From->SplitCriticalEdge(To, None, nullptr, nullptr);
+    if (!EB)
+      continue;
+    for (Register B : KV.second) {
+      EB->addLiveIn(B);
+      EB->sortUniqueLiveIns();
+      BuildMI(*EB, EB->begin(), DebugLoc(),
+              TII.get(RISCV::PseudoCheriCapClear), B)
+          .addReg(B);
+      Changed = true;
+    }
+  }
   for (MachineInstr *MI : Work) {
+    if (is_contained(Drop, MI))
+      continue;
     Register Rs = MI->getOperand(0).getReg();
     BuildMI(*MI->getParent(), MI, MI->getDebugLoc(),
             TII.get(RISCV::PseudoCheriCapClear), Rs)
         .addReg(Rs);
+    MI->eraseFromParent();
+    Changed = true;
+  }
+  for (MachineInstr *MI : Drop) {
     MI->eraseFromParent();
     Changed = true;
   }
