@@ -63,21 +63,21 @@ define dso_local cheriot_compartmentcalleecc i32 @test8(i32 addrspace(200)* noca
 ; CHECK-NEXT:    ct.cgetbase t2, t0
 ; CHECK-NEXT:    bne t0, t2, .LBB2_6
 ; CHECK-NEXT:    blt t0, sp, .LBB2_6
-; CHECK-NEXT:    # %bb.1:
+; CHECK-NEXT:  # %bb.1: # %entry
 ; CHECK-NEXT:    ct.cgetlen t1, t0
 ; CHECK-NEXT:    li t2, 16
 ; CHECK-NEXT:    blt t1, t2, .LBB2_6
-; CHECK-NEXT:    # %bb.2:
+; CHECK-NEXT:  # %bb.2: # %entry
 ; CHECK-NEXT:    ct.cgetperm t1, t0
 ; CHECK-NEXT:    li t2, 126
 ; CHECK-NEXT:    bne t1, t2, .LBB2_6
-; CHECK-NEXT:    # %bb.3:
-; CHECK-NEXT:    ct.cgettag      t1, t0
-; CHECK-NEXT:    beqz    t1, .LBB2_6
-; CHECK-NEXT:    # %bb.4:
-; CHECK-NEXT:    ct.cgettype     t1, t0
-; CHECK-NEXT:    bnez    t1, .LBB2_6
-; CHECK-NEXT:    # %bb.5:
+; CHECK-NEXT:  # %bb.3: # %entry
+; CHECK-NEXT:    ct.cgettag t1, t0
+; CHECK-NEXT:    beqz t1, .LBB2_6
+; CHECK-NEXT:  # %bb.4: # %entry
+; CHECK-NEXT:    ct.cgettype t1, t0
+; CHECK-NEXT:    bnez t1, .LBB2_6
+; CHECK-NEXT:  # %bb.5: # %entry
 ; CHECK-NEXT:    ct.clc t1, 8(t0)
 ; CHECK-NEXT:    ct.clc t0, 0(t0)
 ; CHECK-NEXT:    ct.clw a0, 0(a0)
@@ -133,24 +133,27 @@ declare void @llvm.lifetime.end.p200i8(i64 immarg, i8 addrspace(200)* nocapture)
 define dso_local i32 @testcall8() local_unnamed_addr addrspace(200) #2 {
 ; CHECK-LABEL: testcall8:
 ; CHECK:       # %bb.0: # %entry
-; CHECK-NEXT:    ct.cincoffset sp, sp, -64
-; CHECK-NEXT:    ct.csc ra, 56(sp) # 8-byte Folded Spill
+; CHECK-NEXT:    ct.cincoffset sp, sp, -80
+; CHECK-NEXT:    ct.csc ra, 72(sp) # 8-byte Folded Spill
+; CHECK-NEXT:    ct.csc s0, 64(sp) # 8-byte Folded Spill
+; CHECK-NEXT:    ct.csc s1, 56(sp) # 8-byte Folded Spill
 ; CHECK-NEXT:    ct.cincoffset a0, sp, 24
-; CHECK-NEXT:    ct.csetbounds a0, a0, 32
-; CHECK-NEXT:    ct.cincoffset a1, a0, 4
-; CHECK-NEXT:    ct.cincoffset a2, a0, 8
-; CHECK-NEXT:    ct.cincoffset a3, a0, 12
-; CHECK-NEXT:    ct.cincoffset a4, a0, 16
-; CHECK-NEXT:    ct.cincoffset a5, a0, 20
-; CHECK-NEXT:    ct.cincoffset t1, a0, 24
+; CHECK-NEXT:    ct.csetbounds s0, a0, 32
+; CHECK-NEXT:    ct.cincoffset a1, s0, 4
+; CHECK-NEXT:    ct.cincoffset a2, s0, 8
+; CHECK-NEXT:    ct.cincoffset a3, s0, 12
+; CHECK-NEXT:    ct.cincoffset a4, s0, 16
+; CHECK-NEXT:    ct.cincoffset a5, s0, 20
+; CHECK-NEXT:    ct.cincoffset s1, s0, 24
 ; CHECK-NEXT:  .LBB3_1: # %entry
 ; CHECK-NEXT:    # Label of block must be emitted
-; CHECK-NEXT:    ct.auipcc.data t0, %cheriot_compartment_data_hi(testcall8.stack_arg)
-; CHECK-NEXT:    ct.cincoffset t0, t0, %cheriot_compartment_lo_i(.LBB3_1)
-; CHECK-NEXT:    ct.csetbounds t0, t0, %cheriot_compartment_size(testcall8.stack_arg)
-; CHECK-NEXT:    ct.csc t0, 8(sp)
+; CHECK-NEXT:    ct.auipcc.data a0, %cheriot_compartment_data_hi(testcall8.stack_arg)
+; CHECK-NEXT:    ct.cincoffset a0, a0, %cheriot_compartment_lo_i(.LBB3_1)
+; CHECK-NEXT:    ct.csetbounds a0, a0, %cheriot_compartment_size(testcall8.stack_arg)
 ; CHECK-NEXT:    ct.csetbounds t0, sp, 16
-; CHECK-NEXT:    ct.csc t1, 0(sp)
+; CHECK-NEXT:    ct.csc a0, 8(sp)
+; CHECK-NEXT:    ct.csc s1, 0(sp)
+; CHECK-NEXT:    ct.cmove a0, s0
 ; CHECK-NEXT:  .LBB3_3: # %entry
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t1, %cheriot_compartment_code_hi(__import_other_test8callee)
@@ -160,8 +163,24 @@ define dso_local i32 @testcall8() local_unnamed_addr addrspace(200) #2 {
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(.compartment_switcher)
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB3_2)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
-; CHECK-NEXT:    ct.clc ra, 56(sp) # 8-byte Folded Reload
-; CHECK-NEXT:    ct.cincoffset sp, sp, 64
+; CHECK-NEXT:    ct.cincoffset a1, sp, 24
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cmove s1, zero
+; CHECK-NEXT:    ct.cincoffset a1, s0, 20
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cincoffset a1, s0, 16
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cincoffset a1, s0, 12
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cincoffset a1, s0, 8
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cincoffset a1, s0, 4
+; CHECK-NEXT:    ct.cmove a1, zero
+; CHECK-NEXT:    ct.cmove s0, zero
+; CHECK-NEXT:    ct.clc ra, 72(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.clc s0, 64(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.clc s1, 56(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.cincoffset sp, sp, 80
 ; CHECK-NEXT:    ct.cret
 entry:
   ; Check that we have the right relocations and stack layout.
