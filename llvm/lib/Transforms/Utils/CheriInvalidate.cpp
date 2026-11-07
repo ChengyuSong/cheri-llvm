@@ -14,6 +14,7 @@
 // (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
 // or a '+'-list (e.g. scope+free, the R4 "all").
 //===----------------------------------------------------------------------===//
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/MapVector.h"
@@ -125,6 +126,22 @@ static cl::opt<bool> InvFilter(
 static cl::opt<std::string> InvStatsOut(
     "cheri-invalidate-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module invalidation counts"));
+// D96. The machine pass increments these; flushSpillInvalidateStats appends.
+static unsigned SpillSearchAborts = 0;
+static unsigned SpillNulls = 0;
+void llvm::memannot::noteSpillSearchAbort() { ++SpillSearchAborts; }
+void llvm::memannot::noteSpillNull() { ++SpillNulls; }
+void llvm::memannot::flushSpillInvalidateStats() {
+  if (InvStatsOut.empty())
+    return;
+  std::error_code EC;
+  raw_fd_ostream OS(InvStatsOut, EC, sys::fs::OF_Append | sys::fs::OF_Text);
+  if (!EC)
+    OS << "cheri-invalidate-spill: aborts=" << SpillSearchAborts
+       << " nulls=" << SpillNulls << "\n";
+  SpillSearchAborts = 0;
+  SpillNulls = 0;
+}
 
 namespace {
 struct Slot {
@@ -613,13 +630,73 @@ struct Inv {
       }
     }
   }
+  // D95. The clear is inserted before At. A use at At or reachable from At
+  // still needs the value (realloc's old pointer, a cap used after
+  // lifetime.end). CountAt is false when At is the lifetime.end that names
+  // the object: that marker is the event, not a later use.
+  bool usedAfter(const Value *V, Instruction *At, DominatorTree &DT,
+                 bool CountAt) const {
+    for (const User *U : V->users()) {
+      const auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        continue;
+      if (I == At) {
+        if (CountAt)
+          return true;
+        continue;
+      }
+      if (isPotentiallyReachable(At, I, nullptr, &DT))
+        return true;
+    }
+    return false;
+  }
+  static bool realCall(const Instruction &I) {
+    const auto *CB = dyn_cast<CallBase>(&I);
+    return CB && !CB->isInlineAsm() &&
+           CB->getIntrinsicID() == Intrinsic::not_intrinsic;
+  }
+  // Blocks that contain a real call, or can reach one. Built per function.
+  DenseSet<BasicBlock *> CallReach;
+  void buildCallReach(Function &F) {
+    CallReach.clear();
+    SmallVector<BasicBlock *, 16> Work;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (realCall(I)) {
+          Work.push_back(&BB);
+          break;
+        }
+    while (!Work.empty()) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (!CallReach.insert(BB).second)
+        continue;
+      for (BasicBlock *P : predecessors(BB))
+        Work.push_back(P);
+    }
+  }
+  // D94. A callee after this point can save a callee-saved register that
+  // still holds the cap. With no later call, the epilogue restores the
+  // incoming register before any other function runs, so a dead address
+  // does not need a clear (and adding one forces a save).
+  bool callAfter(Instruction *E) const {
+    BasicBlock *BB = E->getParent();
+    for (auto It = std::next(E->getIterator()); It != BB->end(); ++It)
+      if (realCall(*It))
+        return true;
+    for (BasicBlock *S : successors(BB))
+      if (CallReach.count(S))
+        return true;
+    return false;
+  }
   void emitCapRegs(IRBuilder<> &B, Value *Root, Instruction *At,
-                   DominatorTree &DT, unsigned &Counter) {
+                   DominatorTree &DT, unsigned &Counter, bool CountAt) {
     if (!InvCapReg)
       return;
     SmallVector<Value *, 8> Vs;
     capCopies(Root, At, DT, Vs);
     for (Value *V : Vs) {
+      if (usedAfter(V, At, DT, CountAt))
+        continue;
       B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {V});
       ++Counter;
     }
@@ -981,6 +1058,7 @@ struct Inv {
     if (CapSlots.empty() && !RegFree && !RegScope)
       return;
     DominatorTree DT(F);
+    buildCallReach(F);
     if (!CapSlots.empty()) {
       collectLoanSlots(F);
       if (Loan)
@@ -1028,11 +1106,12 @@ struct Inv {
             }
           }
         }
-        // D92: after the slot clears, which still read the address. Slite
-        // (no own-slot null) still clears the register. Root is the alloca
-        // so derived GEPs and empty-asm copies are included.
-        if (RegScope)
-          emitCapRegs(B, A ? static_cast<Value *>(A) : Op, E, DT, CapRegScope);
+        // D92/D94/D95: slite still clears registers, but only for values that
+        // are dead here and only when a real call follows. A dead address
+        // with no later call is overwritten by the epilogue.
+        if (RegScope && callAfter(E))
+          emitCapRegs(B, A ? static_cast<Value *>(A) : Op, E, DT, CapRegScope,
+                      /*CountAt=*/false);
       }
     auto clearFreedReg = [&](CallBase *C, Instruction *At) {
       if (!At)
@@ -1044,7 +1123,7 @@ struct Inv {
       // D91: the pointer passed to dealloc and dominating copies. Aflog
       // records base/length before the call; this clear is after it, and
       // after any frame-slot range check inserted at the same point.
-      emitCapRegs(B, P, At, DT, CapRegFree);
+      emitCapRegs(B, P, At, DT, CapRegFree, /*CountAt=*/true);
     };
     if (Free)
       for (CallBase *C : Frees) {

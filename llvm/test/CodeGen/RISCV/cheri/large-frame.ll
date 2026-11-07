@@ -27,22 +27,15 @@ define dso_local void @bar() addrspace(200) nounwind {
 ; RV64IXCHERI-L64PC128:       # %bb.0: # %entry
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, -2032
 ; RV64IXCHERI-L64PC128-NEXT:    csc ra, 2016(sp) # 16-byte Folded Spill
-; RV64IXCHERI-L64PC128-NEXT:    csc s0, 2000(sp) # 16-byte Folded Spill
-; RV64IXCHERI-L64PC128-NEXT:    csc s1, 1984(sp) # 16-byte Folded Spill
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, -2048
-; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, -80
+; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, -48
 ; RV64IXCHERI-L64PC128-NEXT:    lui a0, 1
-; RV64IXCHERI-L64PC128-NEXT:    cincoffset s1, sp, 16
-; RV64IXCHERI-L64PC128-NEXT:    csetbounds s0, s1, a0
-; RV64IXCHERI-L64PC128-NEXT:    cmove a0, s0
+; RV64IXCHERI-L64PC128-NEXT:    cincoffset a1, sp, 16
+; RV64IXCHERI-L64PC128-NEXT:    csetbounds a0, a1, a0
 ; RV64IXCHERI-L64PC128-NEXT:    ccall foo
-; RV64IXCHERI-L64PC128-NEXT:    cmove s1, zero
-; RV64IXCHERI-L64PC128-NEXT:    cmove s0, zero
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 2032
-; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 96
+; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 64
 ; RV64IXCHERI-L64PC128-NEXT:    clc ra, 2016(sp) # 16-byte Folded Reload
-; RV64IXCHERI-L64PC128-NEXT:    clc s0, 2000(sp) # 16-byte Folded Reload
-; RV64IXCHERI-L64PC128-NEXT:    clc s1, 1984(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 2032
 ; RV64IXCHERI-L64PC128-NEXT:    cret
 entry:

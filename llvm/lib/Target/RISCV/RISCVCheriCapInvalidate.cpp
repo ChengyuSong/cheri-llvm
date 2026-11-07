@@ -25,6 +25,7 @@
 #include "RISCV.h"
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -48,6 +49,7 @@ public:
     initializeRISCVCheriCapInvalidatePass(*PassRegistry::getPassRegistry());
   }
   bool runOnMachineFunction(MachineFunction &MF) override;
+  bool doFinalization(Module &) override;
   StringRef getPassName() const override {
     return "RISC-V CHERI capability invalidate";
   }
@@ -75,6 +77,10 @@ INITIALIZE_PASS(RISCVCheriCapInvalidate, "riscv-cheri-cap-invalidate",
                 "RISC-V CHERI capability invalidate", false, false)
 INITIALIZE_PASS(RISCVCheriCapInvalidateExpand, "riscv-cheri-cap-invalidate-expand",
                 "RISC-V CHERI capability invalidate expand", false, false)
+
+static bool regsExact(ArrayRef<Register> Regs, Register R) {
+  return is_contained(Regs, R);
+}
 
 static bool regsHold(ArrayRef<Register> Regs, Register R,
                      const TargetRegisterInfo &TRI) {
@@ -157,19 +163,25 @@ struct SpillSearch {
   bool walk(MachineBasicBlock *MBB, MachineBasicBlock::iterator Stop,
             SmallVector<Register, 4> Regs, SmallSet<int, 4> &Holds,
             SmallSet<int, 4> &Killed, DenseMap<int, unsigned> &Opc) {
-    if (!Active.insert(MBB).second || BlocksLeft-- == 0)
+    if (!Active.insert(MBB).second || BlocksLeft-- == 0) {
+      memannot::noteSpillSearchAbort();
       return false;
+    }
     auto Leave = make_scope_exit([&] { Active.erase(MBB); });
     for (auto It = Stop; It != MBB->begin();) {
-      if (InstLeft-- == 0)
+      if (InstLeft-- == 0) {
+        memannot::noteSpillSearchAbort();
         return false;
+      }
       --It;
       MachineInstr &I = *It;
       std::optional<int> FI = frameIndexOf(I);
       if (FI && isSpillStore(I.getOpcode()) && I.getOperand(0).isReg()) {
         if (!Holds.count(*FI) && !Killed.count(*FI)) {
           Register Src = I.getOperand(0).getReg();
-          if (regsHold(Regs, Src, TRI))
+          // Exact register only. An overlapping integer view (x10 vs x10_y)
+          // is a different value; nulling that slot zeros a live integer.
+          if (regsExact(Regs, Src))
             note(Holds, Killed, Opc, *FI, I.getOpcode());
           else
             Killed.insert(*FI);
@@ -182,10 +194,12 @@ struct SpillSearch {
           Defs.push_back(MO.getReg());
       if (Defs.empty())
         continue;
-      if (Defs.size() == 1 && I.isCopy() && I.getOperand(1).isReg()) {
+      if (Defs.size() == 1 && regsExact(Regs, Defs[0]) && I.isCopy() &&
+          I.getOperand(1).isReg()) {
         regsRemove(Regs, Defs[0], TRI);
         regsAdd(Regs, I.getOperand(1).getReg(), TRI);
-      } else if (Defs.size() == 1 && FI && isSpillReload(I.getOpcode())) {
+      } else if (Defs.size() == 1 && regsExact(Regs, Defs[0]) && FI &&
+                 isSpillReload(I.getOpcode())) {
         regsRemove(Regs, Defs[0], TRI);
         note(Holds, Killed, Opc, *FI, storeOpcForReload(I.getOpcode()));
       } else {
@@ -197,8 +211,10 @@ struct SpillSearch {
     }
     if (Regs.empty() || MBB->pred_empty())
       return true;
-    if (MBB->pred_size() > MaxPreds)
+    if (MBB->pred_size() > MaxPreds) {
+      memannot::noteSpillSearchAbort();
       return false;
+    }
     if (MBB->pred_size() == 1) {
       MachineBasicBlock *P = *MBB->pred_begin();
       return walk(P, P->end(), Regs, Holds, Killed, Opc);
@@ -328,6 +344,7 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
         .addFrameIndex(N.FI)
         .addImm(0)
         .addMemOperand(MMO);
+    memannot::noteSpillNull();
     Changed = true;
   }
   for (MachineInstr *MI : Work) {
@@ -339,6 +356,11 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
     Changed = true;
   }
   return Changed;
+}
+
+bool RISCVCheriCapInvalidate::doFinalization(Module &) {
+  memannot::flushSpillInvalidateStats();
+  return false;
 }
 
 bool RISCVCheriCapInvalidateExpand::runOnMachineFunction(MachineFunction &MF) {
