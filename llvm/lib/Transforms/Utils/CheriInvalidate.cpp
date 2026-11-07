@@ -86,6 +86,16 @@ static unsigned FLogNoFree = 0;
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
+// [LLM-generated] M6.0 D87. Off leaves only the slot store. On also emits
+// llvm.cheri.cap.invalidate on the capability value so a loan held in a
+// callee-saved register is cleared there; a later call cannot save it.
+// Spill-slot nulling is the post-RA pass. Callee-saved save slots (the
+// incoming register) are not nulled. D89: this does not put loan ids on MMOs.
+static cl::opt<bool> InvCapReg(
+    "cheri-invalidate-cap-reg", cl::init(true), cl::Hidden,
+    cl::desc("M6.0 D87: at a loan last-use, clear the capability register "
+             "(including a callee-saved one) and, after RA, a spill slot "
+             "reloaded into it"));
 // [LLM-generated] R6 (D41): a loan slot may have its address passed to a
 // call or stored (fmt's `&&T` arguments). Every Rust pointer to the slot is a
 // borrow of it whose region is inside the slot's type region, which is inside
@@ -182,6 +192,7 @@ struct Inv {
         case Intrinsic::cheri_cap_base_get:
         case Intrinsic::cheri_cap_length_get:
         case Intrinsic::cheri_cap_tag_get:
+        case Intrinsic::cheri_cap_invalidate:
           return ContinueIgnoringReturn;
         default:
           break;
@@ -481,6 +492,50 @@ struct Inv {
   }
   DenseMap<AllocaInst *, std::string> BadWhy;
 
+  // Capability value to clear at this last-use. Prefer the pointer the
+  // carrier actually uses: that is the copy which may sit in a callee-saved
+  // register or have been spilled. Otherwise the value stored into the slot.
+  Value *loanCapValue(LoanSlot &L, Instruction *C, Instruction *At,
+                      DominatorTree &DT) {
+    const Value *Slot = nullptr;
+    if (!L.Stores.empty())
+      Slot = getUnderlyingObject(L.Stores.front()->getPointerOperand());
+    auto Usable = [&](Value *V) {
+      if (!V || !V->getType()->isPointerTy() || isa<Constant>(V))
+        return false;
+      if (Slot && getUnderlyingObject(V) == Slot)
+        return false;
+      if (auto *I = dyn_cast<Instruction>(V))
+        return DT.dominates(I, At);
+      return isa<Argument>(V);
+    };
+    if (auto *LI = dyn_cast<LoadInst>(C))
+      if (LI->getType()->isPointerTy() && Slot &&
+          getUnderlyingObject(LI->getPointerOperand()) == Slot &&
+          DT.dominates(LI, At))
+        return LI;
+    if (Value *P = getLoadStorePointerOperand(C))
+      if (Usable(P))
+        return P;
+    if (auto *CB = dyn_cast<CallBase>(C))
+      for (Value *A : CB->args())
+        if (Usable(A))
+          return A;
+    Value *Best = nullptr;
+    const Instruction *BestAt = nullptr;
+    for (StoreInst *S : L.Stores) {
+      Value *V = S->getValueOperand();
+      if (!Usable(V))
+        continue;
+      const Instruction *Where = dyn_cast<Instruction>(V);
+      if (!Best || (Where && (!BestAt || DT.dominates(BestAt, Where)))) {
+        Best = V;
+        BestAt = Where;
+      }
+    }
+    return Best;
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -518,6 +573,11 @@ struct Inv {
                                                     cast<PointerType>(CapTy)),
                                                 P, Align(16), InvVolatile));
         markClear(L.Clears.back(), "cheri_inv_loan");
+        // D89: the clear's identity for the rest of codegen is this
+        // !pcsections tag, not a loan id on the store's MachineMemOperand.
+        if (InvCapReg)
+          if (Value *Cap = loanCapValue(L, C, At, DT))
+            B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {Cap});
         ++LoanClears;
       }
     }

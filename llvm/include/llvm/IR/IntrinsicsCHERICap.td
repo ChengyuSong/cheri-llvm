@@ -87,6 +87,14 @@ def int_cheri_cap_tag_clear  :
             [llvm_cap_ty],
             [IntrNoMem, IntrWillReturn]>;
 
+// [LLM-generated] M6.0 D87. Uses the capability so the register (including a
+// callee-saved one) stays live until this point, then is cleared. Not a mem
+// fact: stripAnnotations leaves it for isel. Loan ids are not put on MMOs.
+def int_cheri_cap_invalidate :
+  Intrinsic<[],
+            [llvm_cap_ty],
+            [IntrInaccessibleMemOnly, IntrWillReturn]>;
+
 def int_cheri_cap_untagged_from_int  :
   Intrinsic<[llvm_cap_ty],
             [llvm_anyint_ty],

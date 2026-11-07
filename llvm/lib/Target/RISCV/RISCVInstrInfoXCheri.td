@@ -1557,6 +1557,23 @@ def : PatYGPRGpr<riscv_cap_bounds_set, CSetBounds>;
 def : PatYGPRUimm12<riscv_cap_bounds_set, CSetBoundsImm>;
 def : PatYGPRUimm12<int_cheri_cap_bounds_set, CSetBoundsImm>;
 def : PatYGPR<int_cheri_cap_tag_clear, CClearTag, YLenVT>;
+
+// [LLM-generated] M6.0 D87. The isel pseudo only uses the register. The
+// post-RA pass turns it into PseudoCheriCapClear, which defines that same
+// register so a loan in a callee-saved register is dead before a later call.
+// Expanded to cmove rd, cnull at pre-emit, after copy-prop. Spill-slot
+// nulling is separate and never writes a callee-saved save slot.
+let Predicates = [HasCheri] in {
+let hasSideEffects = 1, mayLoad = 1, mayStore = 1, isCodeGenOnly = 1 in
+def PseudoCheriCapInvalidate
+    : Pseudo<(outs), (ins YGPR:$rs), [], "cheri.cap.invalidate", "$rs">;
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1,
+    Constraints = "$rd = $rs" in
+def PseudoCheriCapClear
+    : Pseudo<(outs YGPR:$rd), (ins YGPR:$rs), [], "cheri.cap.clear", "$rd, $rs">;
+def : Pat<(int_cheri_cap_invalidate YGPR:$rs),
+          (PseudoCheriCapInvalidate YGPR:$rs)>;
+}
 def : PatYGPRYGPR<int_cheri_cap_build, CBuildCap>;
 def : PatYGPRYGPR<int_cheri_cap_type_copy, CCopyType>;
 def : PatYGPRYGPR<int_cheri_cap_conditional_seal, CCSeal>;
