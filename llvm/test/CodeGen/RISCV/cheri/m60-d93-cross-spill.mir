@@ -1,0 +1,96 @@
+# [LLM-generated] M6.1 D93. Cross-block spill nulling. merge_same reloads one
+# spill slot on both paths into the clear, so the slot is nulled once at the
+# clear. merge_diff reloads two slots; each is nulled on its own path, and the
+# merge does not null a slot the other path did not hold.
+# Search bound: 16 blocks, 128 instructions, 8 predecessors, no re-entry.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -run-pass=riscv-cheri-cap-invalidate -o - %s | FileCheck %s
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @merge_same() addrspace(200) { ret void }
+  define void @merge_diff() addrspace(200) { ret void }
+...
+---
+name:            merge_same
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.1(0x40000000), %bb.2(0x40000000)
+    liveins: $x11
+    BNE $x11, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    successors: %bb.3(0x80000000)
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoBR %bb.3
+
+  bb.2:
+    successors: %bb.3(0x80000000)
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: merge_same
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK: CSC_128 $x0_y, %stack.0, 0
+# CHECK-NEXT: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NOT: mem.loan
+---
+name:            merge_diff
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.1(0x40000000), %bb.2(0x40000000)
+    liveins: $x11
+    BNE $x11, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.1:
+    successors: %bb.3(0x80000000)
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoBR %bb.3
+
+  bb.2:
+    successors: %bb.3(0x80000000)
+    $x10_y = CLC_128 %stack.1, 0
+    PseudoBR %bb.3
+
+  bb.3:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 1, name: '', type: spill-slot, offset: 16, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: merge_diff
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NEXT: CSC_128 $x0_y, %stack.0, 0
+# CHECK: $x10_y = CLC_128 %stack.1, 0
+# CHECK-NEXT: CSC_128 $x0_y, %stack.1, 0
+# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NOT: CSC_128 $x0_y

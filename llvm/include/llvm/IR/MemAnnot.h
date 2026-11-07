@@ -209,6 +209,13 @@ LLVM_ABI void detachLastUseBeforeEarlierMove(Instruction &I);
 /// \p Vec does not follow keeps an anchor at the lane, so the widened op does
 /// not clear earlier than that lane.
 LLVM_ABI void preserveWidenedLastUse(Instruction &Vec, ArrayRef<Value *> Scalars);
+/// [LLM-generated] M6.1 D96. The post-RA spill walk reports bound failures and
+/// nulls it actually inserted. llc appends one line to
+/// -cheri-invalidate-stats-out from the machine pass.
+LLVM_ABI void noteSpillSearchAbort();
+LLVM_ABI void noteSpillNull();
+LLVM_ABI void noteCapRegSkippedLive();
+LLVM_ABI void flushSpillInvalidateStats();
 } // namespace memannot
 } // namespace llvm
 #endif

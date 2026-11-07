@@ -25,12 +25,15 @@ define void @color(ptr addrspace(200) %p, ptr addrspace(200) %q) addrspace(200) 
   ret void
 }
 
+; D92 inserts a register clear of the alloca before each lifetime.end.
 ; BEFORE: CSC_128 {{.*}}pcsections
-; BEFORE-NEXT: LIFETIME_END %stack.0
-; BEFORE-NEXT: LIFETIME_START %stack.1
+; BEFORE: PseudoCheriCapInvalidate
+; BEFORE: LIFETIME_END %stack.0
+; BEFORE: LIFETIME_START %stack.1
 ; BEFORE-NOT: pcsections
 
 ; AFTER: CSC_128 {{.*}}%stack.0{{.*}}pcsections
-; AFTER-NEXT: CSC_128 {{.*}}%stack.0
+; AFTER: PseudoCheriCapInvalidate
+; AFTER: CSC_128 {{.*}}%stack.0
 
 !0 = !{!"cheri_inv_loan"}
