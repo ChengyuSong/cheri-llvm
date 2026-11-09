@@ -706,10 +706,32 @@ struct Inv {
   static constexpr unsigned KindScopeEscape = 1;
   static constexpr unsigned KindScopeLocal = 2;
 
+  // D104. PHIs must stay grouped at the top of the block. A last use that is
+  // a PHI (or the next instruction, which is still a PHI) is not a valid
+  // insertion point. The first non-PHI is after every PHI, so it is still
+  // after that use.
+  static Instruction *afterPhiGroup(Instruction *At) {
+    if (!At || !isa<PHINode>(At))
+      return At;
+    return At->getParent()->getFirstNonPHI();
+  }
   void emitOne(IRBuilder<> &B, Value *V, Instruction *At, unsigned Kind,
                unsigned &Counter) {
-    if (!At || At->isTerminator())
+    At = afterPhiGroup(At);
+    if (!At)
       return;
+    // One invalidate of this value and kind per block. A scope end that is
+    // visited again, or several copies that share this value, must not stack
+    // identical calls between (or after) the PHIs.
+    for (Instruction &I : *At->getParent()) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->getIntrinsicID() != Intrinsic::cheri_cap_invalidate ||
+          CB->arg_size() < 2 || CB->getArgOperand(0) != V)
+        continue;
+      if (auto *K = dyn_cast<ConstantInt>(CB->getArgOperand(1)))
+        if (K->getZExtValue() == Kind)
+          return;
+    }
     B.SetInsertPoint(At);
     B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
                  {V, B.getInt32(Kind)});
