@@ -143,6 +143,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVGatherScatterLoweringPass(*PR);
   initializeRISCVCodeGenPrepareLegacyPassPass(*PR);
   initializeRISCVCheriBoundsLoweringPass(*PR);
+  initializeRISCVCheriHwSubsumePass(*PR);
   initializeRISCVCheriCapInvalidatePass(*PR);
   initializeRISCVCheriCapInvalidateExpandPass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
@@ -667,6 +668,9 @@ void RISCVPassConfig::addMachineSSAOptimization() {
 }
 
 void RISCVPassConfig::addPreRegAlloc() {
+  // D108. Virtual registers are still SSA here. This is after instruction
+  // selection and before PHI elimination. Not part of cap-invalidate (post-RA).
+  addPass(createRISCVCheriHwSubsumePass());
   addPass(createRISCVPreRAExpandPseudoPass());
   if (TM->getOptLevel() != CodeGenOptLevel::None) {
     addPass(createRISCVCheriCleanupOptPass());
