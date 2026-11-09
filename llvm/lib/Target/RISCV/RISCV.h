@@ -244,6 +244,9 @@ void initializeRISCVZacasABIFixPass(PassRegistry &);
 FunctionPass *createRISCVCheriCleanupOptPass();
 void initializeRISCVCheriCleanupOptPass(PassRegistry &);
 
+FunctionPass *createRISCVCheriHwSubsumePass();
+void initializeRISCVCheriHwSubsumePass(PassRegistry &);
+
 FunctionPass *createRISCVCheriCapInvalidatePass();
 void initializeRISCVCheriCapInvalidatePass(PassRegistry &);
 FunctionPass *createRISCVCheriCapInvalidateExpandPass();

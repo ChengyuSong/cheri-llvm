@@ -138,6 +138,7 @@
 ; CHECK-NEXT:       Peephole Optimizations
 ; CHECK-NEXT:       Remove dead machine instructions
 ; RV64-NEXT:        RISC-V Optimize W Instructions
+; CHECK-NEXT:       RISC-V CHERI hardware-subsumed bounds check
 ; CHECK-NEXT:       RISC-V Pre-RA pseudo instruction expansion pass
 ; CHECK-NEXT:       RISCV CHERIoT early bounds check elision pass
 ; CHECK-NEXT:       RISC-V Merge Base Offset

@@ -40,6 +40,7 @@ add_llvm_target(RISCVCodeGen
   RISCVDeadRegisterDefinitions.cpp
   RISCVCheriCleanup.cpp
   RISCVCheriCapInvalidate.cpp
+  RISCVCheriHwSubsume.cpp
   RISCVExpandAtomicPseudoInsts.cpp
   RISCVExpandPseudoInsts.cpp
   RISCVFoldMemOffset.cpp

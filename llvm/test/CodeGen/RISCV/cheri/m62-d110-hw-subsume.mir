@@ -1,0 +1,450 @@
+# [LLM-generated] M6.2 D110. One pre-RA block: CSetBoundsImm of a constant
+# length in 1..4095, an unsigned compare of an index against that length,
+# and a branch to a panic block with no other predecessor. The index is
+# used only as the offset of a CIncOffset of that capability, and that
+# pointer is only loaded or stored.
+#
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -run-pass=riscv-cheri-hw-subsume -verify-machineinstrs -o - %s | FileCheck %s
+
+---
+name: match_fallthrough
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: match_gep_store
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %val:gpr = COPY $x12
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 32
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    CSB %val, %p, 0
+    PseudoCRET
+
+  bb.2:
+    UNIMP
+...
+---
+name: match_taken_ok
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 32
+    BLTU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    UNIMP
+
+  bb.2:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+...
+---
+name: match_4095
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 4095
+    %hi:gpr = LUI 1
+    %lim:gpr = ADDI %hi, -2
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: match_nested_gep
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %q:ygpr = CIncOffsetImm %p, 4
+    %v:gpr = CLB %q, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_rounded
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %n:gpr = COPY $x12
+    %cap:ygpr = CSetBounds %base, %n
+    %lim:gpr = ADDI $x0, 32
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_exact_reg
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %n:gpr = COPY $x12
+    %cap:ygpr = CSetBoundsExact %base, %n
+    %lim:gpr = ADDI $x0, 32
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_len4096
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %n:gpr = LUI 1
+    %cap:ygpr = CSetBounds %base, %n
+    %lim:gpr = LUI 1
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_gep_stored
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12_y
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %slot:ygpr = COPY $x12_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    CSC_128 %p, %slot, 0
+    PseudoCRET
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_gep_returned
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    $x10_y = COPY %p
+    PseudoCRET implicit $x10_y
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_other_cap
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %base, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_shared_panic
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.3
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %idx2:gpr = COPY $x12
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.3
+    PseudoCBR %bb.1
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    %cap2:ygpr = CSetBoundsImm %base, 16
+    %lim2:gpr = ADDI $x0, 15
+    BLTU %lim2, %idx2, %bb.3
+    PseudoCBR %bb.2
+
+  bb.2:
+    %q:ygpr = CIncOffset %cap2, %idx2
+    %w:gpr = CLB %q, 0
+    $x10 = COPY %w
+    PseudoCRET implicit $x10
+
+  bb.3:
+    UNIMP
+...
+---
+name: keep_index_add
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    %s:gpr = ADD %idx, %idx
+    $x10 = COPY %s
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_no_deref
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    PseudoCRET
+
+  bb.2:
+    UNIMP
+...
+
+# CHECK-LABEL: name: match_fallthrough
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BLTU
+# CHECK-NOT: BGEU
+# CHECK-NOT: PseudoCBR
+# CHECK: CIncOffset
+# CHECK: CLB
+# CHECK-LABEL: bb.2:
+# CHECK: UNIMP
+
+# CHECK-LABEL: name: match_gep_store
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BGEU
+# CHECK-NOT: BLTU
+# CHECK: CIncOffset
+# CHECK: CSB
+
+# CHECK-LABEL: name: match_taken_ok
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BLTU
+# CHECK: PseudoCBR %bb.2
+# CHECK-LABEL: bb.1:
+# CHECK: UNIMP
+# CHECK-LABEL: bb.2:
+# CHECK: CLB
+
+# CHECK-LABEL: name: match_4095
+# CHECK: CSetBoundsImm
+# CHECK-SAME: 4095
+# CHECK-NOT: BLTU
+# CHECK: CLB
+
+# CHECK-LABEL: name: match_nested_gep
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BLTU
+# CHECK: CIncOffset
+# CHECK: CIncOffsetImm
+# CHECK: CLB
+
+# CHECK-LABEL: name: keep_rounded
+# CHECK: CSetBounds
+# CHECK: BGEU
+# CHECK: CIncOffset
+
+# CHECK-LABEL: name: keep_exact_reg
+# CHECK: CSetBoundsExact
+# CHECK: BGEU
+
+# CHECK-LABEL: name: keep_len4096
+# CHECK: CSetBounds
+# CHECK: BGEU
+
+# CHECK-LABEL: name: keep_gep_stored
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
+# CHECK: CSC_128
+
+# CHECK-LABEL: name: keep_gep_returned
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
+# CHECK: COPY
+
+# CHECK-LABEL: name: keep_other_cap
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
+# CHECK: CIncOffset
+
+# CHECK-LABEL: name: keep_shared_panic
+# CHECK: BLTU
+# CHECK: BLTU
+
+# CHECK-LABEL: name: keep_index_add
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
+# CHECK: ADD
+
+# CHECK-LABEL: name: keep_no_deref
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
