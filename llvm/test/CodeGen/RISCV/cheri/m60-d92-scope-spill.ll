@@ -14,18 +14,19 @@ define void @scope_spill() addrspace(200) {
 ; CHECK-LABEL: scope_spill:
 ; CHECK: csc a0, 0(sp) {{.*}} Folded Spill
 ; CHECK: clc a0, 0(sp) {{.*}} Folded Reload
-; CHECK-NEXT: csc zero, 0(sp) {{.*}} Folded Spill
-; CHECK-NEXT: cmove a0, zero
+; CHECK: csc zero, 0(sp) {{.*}} Folded Spill
   %a = alloca i8, align 16, addrspace(200)
   call void @llvm.lifetime.start.p200(i64 1, ptr addrspace(200) %a)
   %c = call ptr addrspace(200) asm sideeffect "", "={x10},{x10}"(ptr addrspace(200) %a)
   call void asm sideeffect "", "~{x1},~{x3},~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{x18},~{x19},~{x20},~{x21},~{x22},~{x23},~{x24},~{x25},~{x26},~{x27},~{x28},~{x29},~{x30},~{x31}"()
+  ; The load, not the clear, keeps %c live across the clobber, so RA spills it.
+  %b = load i8, ptr addrspace(200) %c
   call void @llvm.lifetime.end.p200(i64 1, ptr addrspace(200) %a)
   call void @later()
   ret void
 }
 
 ; IR-LABEL: define void @scope_spill(
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %a)
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %c)
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %a,
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %c,
 ; IR: call {{.*}}@llvm.lifetime.end

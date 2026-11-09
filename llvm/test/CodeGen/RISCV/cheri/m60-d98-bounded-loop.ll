@@ -1,6 +1,6 @@
-; [LLM-generated] M6.1 D98. The dereferenced pointer is the bounded cap
-; hoisted before the loop. D97 does not clear it inside the loop, where
-; it is live; the post-RA pass clears it on the exit, where it is dead.
+; [LLM-generated] M6.1 D98/D100. The dereferenced pointer is the bounded cap
+; hoisted before the loop. It stays live across iterations, so the only
+; dead point is the exit edge. D100 does not split that edge.
 ; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 < %s | FileCheck %s
 
 target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
@@ -15,8 +15,6 @@ define i8 @bounded_loop(i64 %n) addrspace(200) {
 ; CHECK: cincoffset {{[a-z0-9]+}}, [[B]],
 ; CHECK: ccall check
 ; CHECK-NOT: cmove [[B]], zero
-; CHECK: {{bnez|bltu}}
-; CHECK: cmove [[B]], zero
 start:
   %a = alloca [64 x i8], align 1, addrspace(200)
   %z = icmp eq i64 %n, 0

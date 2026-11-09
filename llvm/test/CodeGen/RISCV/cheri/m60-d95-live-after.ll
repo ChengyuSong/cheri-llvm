@@ -14,7 +14,7 @@ declare void @llvm.lifetime.end.p200(i64, ptr addrspace(200))
 
 define void @realloc_same(ptr addrspace(200) %p) addrspace(200) {
 ; IR-LABEL: define void @realloc_same(
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p)
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p,
 ; IR: call {{.*}}@use(ptr addrspace(200) %p)
 ; ASM-LABEL: realloc_same:
 ; ASM: ccall realloc
@@ -30,7 +30,7 @@ define void @realloc_same(ptr addrspace(200) %p) addrspace(200) {
 
 define void @freed_dead(ptr addrspace(200) %p) addrspace(200) {
 ; IR-LABEL: define void @freed_dead(
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p)
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p,
 ; IR: call {{.*}}@later()
 ; ASM-LABEL: freed_dead:
 ; ASM: cmove {{.*}}, zero
@@ -69,12 +69,13 @@ define void @scope_nocall() addrspace(200) {
 
 define void @scope_later() addrspace(200) {
 ; IR-LABEL: define void @scope_later(
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %a)
+; IR-NOT: llvm.cheri.cap.invalidate
 ; IR: call {{.*}}@llvm.lifetime.end
 ; IR: call {{.*}}@later()
 ; ASM-LABEL: scope_later:
-; ASM: cmove {{.*}}, zero
+; ASM-NOT: cmove
 ; ASM: ccall later
+  ; D99. Nothing reads this alloca, so there is no capability to clear.
   %a = alloca i8, align 16, addrspace(200)
   call void @llvm.lifetime.end.p200(i64 1, ptr addrspace(200) %a)
   call void @later()

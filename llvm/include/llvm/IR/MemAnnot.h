@@ -215,6 +215,12 @@ LLVM_ABI void preserveWidenedLastUse(Instruction &Vec, ArrayRef<Value *> Scalars
 LLVM_ABI void noteSpillSearchAbort();
 LLVM_ABI void noteSpillNull();
 LLVM_ABI void noteCapRegSkippedLive();
+/// [LLM-generated] M6.1 D99–D102. Scope clears the late pass dropped, by reason.
+LLVM_ABI void noteCapRegSkippedNoEscape();
+LLVM_ABI void noteCapRegSkippedCSR();
+LLVM_ABI void noteCapRegSkippedSoonRedef();
+LLVM_ABI void noteCapRegSkippedEdge();
+LLVM_ABI void noteCapRegSkippedDup();
 LLVM_ABI void flushSpillInvalidateStats();
 } // namespace memannot
 } // namespace llvm

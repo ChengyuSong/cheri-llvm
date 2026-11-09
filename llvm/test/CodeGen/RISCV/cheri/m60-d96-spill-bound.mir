@@ -101,7 +101,7 @@ body:             |
 
   bb.16:
     liveins: $x10_y
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     PseudoCRET
 
 stack:
@@ -124,7 +124,7 @@ body:             |
     liveins: $x11_y
     $x10_y = CLC_128 %stack.0, 0
     CSC_128 $x11_y, %stack.1, 0
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     PseudoCRET
 
 stack:

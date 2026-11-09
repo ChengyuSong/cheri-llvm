@@ -28,6 +28,6 @@ define void @freed(ptr addrspace(200) %p) addrspace(200) {
 
 ; IR-LABEL: define void @freed(
 ; IR: call {{.*}}@free(ptr addrspace(200) %p)
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p)
-; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %pinned)
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p,
+; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %pinned,
 ; IR: call {{.*}}@later()

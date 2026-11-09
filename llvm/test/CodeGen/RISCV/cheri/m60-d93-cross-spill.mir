@@ -37,7 +37,7 @@ body:             |
 
   bb.3:
     liveins: $x10_y
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     PseudoCRET
 
 stack:
@@ -76,7 +76,7 @@ body:             |
 
   bb.3:
     liveins: $x10_y
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     PseudoCRET
 
 stack:

@@ -130,9 +130,19 @@ static cl::opt<std::string> InvStatsOut(
 static unsigned SpillSearchAborts = 0;
 static unsigned SpillNulls = 0;
 static unsigned CapRegSkippedLive = 0;
+static unsigned CapRegSkippedNoEscape = 0;
+static unsigned CapRegSkippedCSR = 0;
+static unsigned CapRegSkippedSoon = 0;
+static unsigned CapRegSkippedEdge = 0;
+static unsigned CapRegSkippedDup = 0;
 void llvm::memannot::noteSpillSearchAbort() { ++SpillSearchAborts; }
 void llvm::memannot::noteSpillNull() { ++SpillNulls; }
 void llvm::memannot::noteCapRegSkippedLive() { ++CapRegSkippedLive; }
+void llvm::memannot::noteCapRegSkippedNoEscape() { ++CapRegSkippedNoEscape; }
+void llvm::memannot::noteCapRegSkippedCSR() { ++CapRegSkippedCSR; }
+void llvm::memannot::noteCapRegSkippedSoonRedef() { ++CapRegSkippedSoon; }
+void llvm::memannot::noteCapRegSkippedEdge() { ++CapRegSkippedEdge; }
+void llvm::memannot::noteCapRegSkippedDup() { ++CapRegSkippedDup; }
 void llvm::memannot::flushSpillInvalidateStats() {
   if (InvStatsOut.empty())
     return;
@@ -141,10 +151,20 @@ void llvm::memannot::flushSpillInvalidateStats() {
   if (!EC)
     OS << "cheri-invalidate-spill: aborts=" << SpillSearchAborts
        << " nulls=" << SpillNulls
-       << " capreg_skipped_live=" << CapRegSkippedLive << "\n";
+       << " capreg_skipped_live=" << CapRegSkippedLive
+       << " capreg_skipped_noescape=" << CapRegSkippedNoEscape
+       << " capreg_skipped_csr=" << CapRegSkippedCSR
+       << " capreg_skipped_soon_redef=" << CapRegSkippedSoon
+       << " capreg_skipped_edge=" << CapRegSkippedEdge
+       << " capreg_skipped_dup=" << CapRegSkippedDup << "\n";
   SpillSearchAborts = 0;
   SpillNulls = 0;
   CapRegSkippedLive = 0;
+  CapRegSkippedNoEscape = 0;
+  CapRegSkippedCSR = 0;
+  CapRegSkippedSoon = 0;
+  CapRegSkippedEdge = 0;
+  CapRegSkippedDup = 0;
 }
 
 namespace {
@@ -574,15 +594,22 @@ struct Inv {
       return DT.dominates(I, At);
     return isa<Argument>(V);
   }
+  // Trunc is set when the copy walk hits its bound, so a missed user is
+  // treated as an escape rather than dropped.
   void capCopies(Value *Root, Instruction *At, DominatorTree &DT,
-                 SmallVectorImpl<Value *> &Out) {
+                 SmallVectorImpl<Value *> &Out, bool &Trunc) {
+    Trunc = false;
     if (!At || !fatCap(Root) || !dominatesAt(Root, At, DT))
       return;
     SmallPtrSet<Value *, 16> In;
     SmallVector<Value *, 8> Wave;
     auto Push = [&](Value *V) {
-      if (Out.size() >= 8 || !fatCap(V) || !dominatesAt(V, At, DT))
+      if (!fatCap(V) || !dominatesAt(V, At, DT))
         return;
+      if (Out.size() >= 8) {
+        Trunc = true;
+        return;
+      }
       if (!In.insert(V).second)
         return;
       Out.push_back(V);
@@ -593,8 +620,10 @@ struct Inv {
     while (!Wave.empty() && Out.size() < 8 && SeenUsers < 32) {
       Value *V = Wave.pop_back_val();
       for (User *U : V->users()) {
-        if (Out.size() >= 8 || SeenUsers >= 32)
+        if (Out.size() >= 8 || SeenUsers >= 32) {
+          Trunc = true;
           break;
+        }
         ++SeenUsers;
         auto *I = dyn_cast<Instruction>(U);
         if (!I || !fatCap(I) || !dominatesAt(I, At, DT))
@@ -672,17 +701,140 @@ struct Inv {
         return true;
     return false;
   }
-  // D97 decides at the physical register whether this use is a kill. The IR
-  // clear is emitted even if a later instruction still names the value.
+  // 0 loan/free, 1 scope that escapes, 2 scope that does not.
+  static constexpr unsigned KindLoanFree = 0;
+  static constexpr unsigned KindScopeEscape = 1;
+  static constexpr unsigned KindScopeLocal = 2;
+
+  void emitOne(IRBuilder<> &B, Value *V, Instruction *At, unsigned Kind,
+               unsigned &Counter) {
+    if (!At || At->isTerminator())
+      return;
+    B.SetInsertPoint(At);
+    B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                 {V, B.getInt32(Kind)});
+    ++Counter;
+  }
+  // Latest use of V that dominates End, ignoring lifetime markers and the
+  // invalidate itself. The pseudo goes immediately after this use so the
+  // live range does not stretch to lifetime.end across a later call (D100).
+  Instruction *latestUse(Value *V, Instruction *End, DominatorTree &DT) const {
+    Instruction *Best = nullptr;
+    for (User *U : V->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I || I == End || isa<DbgInfoIntrinsic>(I))
+        continue;
+      if (auto *CB = dyn_cast<CallBase>(I)) {
+        if (CB->isLifetimeStartOrEnd() ||
+            CB->getIntrinsicID() == Intrinsic::cheri_cap_invalidate)
+          continue;
+      }
+      if (!DT.dominates(I, End))
+        continue;
+      if (!Best || DT.dominates(Best, I))
+        Best = I;
+    }
+    return Best;
+  }
+  static bool memIntrinsic(const CallBase &CB) {
+    switch (CB.getIntrinsicID()) {
+    case Intrinsic::memcpy:
+    case Intrinsic::memcpy_inline:
+    case Intrinsic::memset:
+    case Intrinsic::memset_inline:
+    case Intrinsic::memmove:
+      return true;
+    default:
+      return false;
+    }
+  }
+  // D99. The address leaves this function: passed to a real call, stored,
+  // returned, or handed to something that is not a local use of the memory.
+  // memcpy/memset and an empty asm do not capture it. A truncated copy walk
+  // counts as escape so a missed user is not treated as local.
+  bool allocaEscapes(ArrayRef<Value *> Copies, bool Trunc) const {
+    if (Trunc)
+      return true;
+    SmallPtrSet<const Value *, 8> In;
+    for (Value *V : Copies)
+      In.insert(V);
+    for (Value *V : Copies) {
+      for (User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (auto *SI = dyn_cast<StoreInst>(I)) {
+          if (In.count(SI->getValueOperand()))
+            return true;
+          continue;
+        }
+        if (isa<ReturnInst>(I))
+          return true;
+        if (auto *CB = dyn_cast<CallBase>(I)) {
+          if (CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB) ||
+              CB->getIntrinsicID() == Intrinsic::cheri_cap_invalidate)
+            continue;
+          if (InvAsmNoEscape && isEmptyAsm(CB))
+            continue;
+          if (memIntrinsic(*CB))
+            continue;
+          for (Value *A : CB->args())
+            if (In.count(A))
+              return true;
+          continue;
+        }
+        if (isa<LoadInst>(I) || isa<AtomicRMWInst>(I) || isa<ICmpInst>(I) ||
+            isa<PtrToIntInst>(I) || isa<GetElementPtrInst>(I) ||
+            isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
+            isa<FreezeInst>(I) || isa<PHINode>(I) || isa<SelectInst>(I))
+          continue;
+        if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+          if (CX->getPointerOperand() == V)
+            continue;
+          return true;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  // D97 decides at the physical register whether this use is a kill. Loan
+  // and free pass kind 0. Scope passes 1 or 2 (D99).
   void emitCapRegs(IRBuilder<> &B, Value *Root, Instruction *At,
                    DominatorTree &DT, unsigned &Counter) {
+    emitCapRegsKind(B, Root, At, DT, Counter, KindLoanFree);
+  }
+  void emitCapRegsKind(IRBuilder<> &B, Value *Root, Instruction *At,
+                       DominatorTree &DT, unsigned &Counter, unsigned Kind) {
     if (!InvCapReg)
       return;
     SmallVector<Value *, 8> Vs;
-    capCopies(Root, At, DT, Vs);
+    bool Trunc = false;
+    capCopies(Root, At, DT, Vs, Trunc);
+    if (Kind == KindScopeLocal && allocaEscapes(Vs, Trunc))
+      Kind = KindScopeEscape;
     for (Value *V : Vs) {
-      B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {V});
-      ++Counter;
+      // Loan and free stay at At: after the call and after the range-check
+      // loads inserted at the same point. Moving them earlier breaks the
+      // free sequence and can clear a register the call still needs.
+      if (Kind == KindLoanFree) {
+        emitOne(B, V, At, Kind, Counter);
+        continue;
+      }
+      Instruction *U = latestUse(V, At, DT);
+      // Loan, free, and an escaping scope still name a copy that has no
+      // further use: a pinned register can hold the capability with no
+      // other instruction reading it. A local scope object does not.
+      if (!U && Kind == KindScopeLocal)
+        continue;
+      // After the last real use when that use is before End, so the live
+      // range is not stretched across a later call. With no such use, End
+      // itself is the point.
+      Instruction *Ins = At;
+      if (U && !U->isTerminator())
+        if (Instruction *N = U->getNextNode())
+          Ins = N;
+      emitOne(B, V, Ins, Kind, Counter);
     }
   }
 
@@ -727,7 +879,8 @@ struct Inv {
         // !pcsections tag, not a loan id on the store's MachineMemOperand.
         if (InvCapReg)
           if (Value *Cap = loanCapValue(L, C, At, DT)) {
-            B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {Cap});
+            B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                         {Cap, B.getInt32(KindLoanFree)});
             ++CapRegLoan;
           }
         ++LoanClears;
@@ -1090,11 +1243,13 @@ struct Inv {
             }
           }
         }
-        // D94: only when a real call follows. D97 drops the clear if the
-        // physical register is still live (stack-coloring reuse, a loop-carried
-        // bounded cap). D98 clears that bounded cap where it actually dies.
+        // D94: only when a real call follows. D99 tags a non-escaping alloca
+        // so the late pass can drop it unless the register was spilled. The
+        // pseudo is placed just after the last real use (D100), not at
+        // lifetime.end, so the live range does not cross a later call.
         if (RegScope && callAfter(E))
-          emitCapRegs(B, A ? static_cast<Value *>(A) : Op, E, DT, CapRegScope);
+          emitCapRegsKind(B, A ? static_cast<Value *>(A) : Op, E, DT,
+                          CapRegScope, KindScopeLocal);
       }
     auto clearFreedReg = [&](CallBase *C, Instruction *At) {
       if (!At)

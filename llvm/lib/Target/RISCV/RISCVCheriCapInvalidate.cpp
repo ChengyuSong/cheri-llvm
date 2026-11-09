@@ -27,8 +27,13 @@
 // iteration) keeps its pseudo dropped. A spill slot is nulled only when no
 // later reload of that slot happens before a store.
 // D98: a csetbounds of that frame address is the capability the program
-// dereferences. Clear that register where it dies, splitting the exit edge
-// when a loop keeps it live across iterations.
+// dereferences. Clear that register where it dies in the same block.
+// D99 drops a non-escaping scope clear unless the register was spilled.
+// D100 does not split an edge, and does not clear a callee-saved scope
+// register that no call can save before it is overwritten.
+// D101 drops a scope clear overwritten within 8 straight-line instructions.
+// D102 drops a repeated clear of the same register on one path.
+// D103: a loop backedge is not a spill-search abort.
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
@@ -40,6 +45,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -169,18 +175,25 @@ struct SpillSearch {
     Opc[FI] = StoreOpc;
   }
 
-  bool walk(MachineBasicBlock *MBB, MachineBasicBlock::iterator Stop,
-            SmallVector<Register, 4> Regs, SmallSet<int, 4> &Holds,
-            SmallSet<int, 4> &Killed, DenseMap<int, unsigned> &Opc) {
-    if (!Active.insert(MBB).second || BlocksLeft-- == 0) {
+  // Ok: Holds is valid. Stop: a budget was hit, null nothing. Cycle: this
+  // block is already on the walk; its instructions are scanned by that
+  // visit, so the backedge adds nothing and must not abort the search (D103).
+  enum class Result { Ok, Stop, Cycle };
+
+  Result walk(MachineBasicBlock *MBB, MachineBasicBlock::iterator Stop,
+              SmallVector<Register, 4> Regs, SmallSet<int, 4> &Holds,
+              SmallSet<int, 4> &Killed, DenseMap<int, unsigned> &Opc) {
+    if (!Active.insert(MBB).second)
+      return Result::Cycle;
+    if (BlocksLeft-- == 0) {
       memannot::noteSpillSearchAbort();
-      return false;
+      return Result::Stop;
     }
     auto Leave = make_scope_exit([&] { Active.erase(MBB); });
     for (auto It = Stop; It != MBB->begin();) {
       if (InstLeft-- == 0) {
         memannot::noteSpillSearchAbort();
-        return false;
+        return Result::Stop;
       }
       --It;
       MachineInstr &I = *It;
@@ -216,17 +229,19 @@ struct SpillSearch {
           regsRemove(Regs, D, TRI);
       }
       if (Regs.empty())
-        return true;
+        return Result::Ok;
     }
     if (Regs.empty() || MBB->pred_empty())
-      return true;
+      return Result::Ok;
     if (MBB->pred_size() > MaxPreds) {
       memannot::noteSpillSearchAbort();
-      return false;
+      return Result::Stop;
     }
     if (MBB->pred_size() == 1) {
       MachineBasicBlock *P = *MBB->pred_begin();
-      return walk(P, P->end(), Regs, Holds, Killed, Opc);
+      Result R = walk(P, P->end(), Regs, Holds, Killed, Opc);
+      // A backedge has no instructions this visit did not already scan.
+      return R == Result::Cycle ? Result::Ok : R;
     }
     SmallVector<SmallSet<int, 4>, 4> PerH;
     SmallVector<DenseMap<int, unsigned>, 4> PerO;
@@ -235,12 +250,17 @@ struct SpillSearch {
       SmallSet<int, 4> H = Holds;
       SmallSet<int, 4> K = Killed;
       DenseMap<int, unsigned> O = Opc;
-      if (!walk(P, P->end(), Regs, H, K, O))
-        return false;
+      Result R = walk(P, P->end(), Regs, H, K, O);
+      if (R == Result::Stop)
+        return Result::Stop;
+      if (R == Result::Cycle)
+        continue;
       PerH.push_back(std::move(H));
       PerO.push_back(std::move(O));
       Preds.push_back(P);
     }
+    if (PerH.empty())
+      return Result::Ok;
     SmallSet<int, 4> Inter;
     DenseMap<int, unsigned> InterOpc;
     for (int FI : PerH[0]) {
@@ -265,7 +285,7 @@ struct SpillSearch {
           OnPath[Preds[i]].push_back({FI, PerO[i].lookup(FI)});
     Holds = std::move(Inter);
     Opc = std::move(InterOpc);
-    return true;
+    return Result::Ok;
   }
 };
 
@@ -502,6 +522,92 @@ static bool reloadBeforeStore(MachineBasicBlock &MBB,
   return reloadBeforeStoreRec(MBB, Start, FI, Stack, Budget, Blocks);
 }
 
+// Loan/free, escaping scope, local scope. Matches the intrinsic immediate.
+static constexpr int KindLoanFree = 0;
+static constexpr int KindScopeEscape = 1;
+static constexpr int KindScopeLocal = 2;
+// D101. A dead register overwritten this soon, with no call and no branch
+// in between, is not saved by a callee and has no path that skips the
+// overwrite. Eight instructions covers the move/offset/bounds setup that
+// reuses the register after a scope without treating the epilogue as soon.
+static constexpr unsigned SoonRedefWindow = 8;
+
+static int pseudoKind(const MachineInstr &MI) {
+  if (MI.getNumOperands() > 1 && MI.getOperand(1).isImm())
+    return MI.getOperand(1).getImm();
+  return KindLoanFree;
+}
+
+static bool isCalleeSavedReg(Register R, const MachineFunction &MF,
+                             const TargetRegisterInfo &TRI) {
+  for (const MCPhysReg *CS = TRI.getCalleeSavedRegs(&MF); CS && *CS; ++CS)
+    if (TRI.regsOverlap(*CS, R))
+      return true;
+  return false;
+}
+
+// A call clobbers every caller-saved register. A callee-saved register
+// survives, which is why a clear before that call matters.
+static bool callClobbers(const MachineInstr &MI, Register R,
+                         const MachineFunction &MF,
+                         const TargetRegisterInfo &TRI) {
+  if (!MI.isCall() || MI.getOpcode() == RISCV::PseudoCheriCapInvalidate)
+    return false;
+  if (MI.isMetaInstruction())
+    return false;
+  return !isCalleeSavedReg(R, MF, TRI);
+}
+
+// D101. Scope only. A def that does not read R, or a call that clobbers a
+// caller-saved R, within SoonRedefWindow instructions in this block.
+static bool soonRedef(MachineInstr &MI, Register R, const MachineFunction &MF,
+                      const TargetRegisterInfo &TRI) {
+  unsigned N = 0;
+  for (auto It = std::next(MI.getIterator()); It != MI.getParent()->end();
+       ++It) {
+    if (It->isDebugInstr())
+      continue;
+    if (callClobbers(*It, R, MF, TRI))
+      return true;
+    if (It->isCall() || It->isBranch() || It->isTerminator())
+      return false;
+    if (definesOverlap(*It, R, TRI) && !readsReg(*It, R, TRI))
+      return true;
+    if (++N >= SoonRedefWindow)
+      return false;
+  }
+  return false;
+}
+
+// D100. True when some path reaches a call before R is redefined.
+static bool callBeforeRedef(MachineInstr &MI, Register R,
+                            const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 64;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    for (; It != BB.end(); ++It) {
+      if (Budget-- == 0)
+        return true;
+      if (It->isDebugInstr())
+        continue;
+      if (It->isCall() && It->getOpcode() != RISCV::PseudoCheriCapInvalidate &&
+          !It->isMetaInstruction())
+        return true;
+      if (definesOverlap(*It, R, TRI))
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, *MI.getParent(), std::next(MI.getIterator()));
+}
+
 static bool isCalleeSavedSlot(const MachineFrameInfo &MFI, int FI) {
   for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo())
     if (CS.getFrameIdx() == FI)
@@ -539,6 +645,14 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
           return true;
     return false;
   };
+  SmallSet<Register, 16> SpillRegs;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB) {
+      if (!isSpillStore(MI.getOpcode()) && !isSpillReload(MI.getOpcode()))
+        continue;
+      if (MI.getOperand(0).isReg())
+        SpillRegs.insert(MI.getOperand(0).getReg());
+    }
   SmallVector<MachineInstr *, 8> Drop;
   SmallSet<int, 8> ScopeFIs;
   auto keepNull = [&](MachineBasicBlock *MBB, MachineInstr *Before, int FI,
@@ -555,25 +669,43 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
   };
   for (MachineInstr *MI : Work) {
     Register Rs = MI->getOperand(0).getReg();
+    int Kind = pseudoKind(*MI);
+    bool Scope = Kind == KindScopeEscape || Kind == KindScopeLocal;
+    auto noteFrame = [&]() {
+      // D98 follows an escaping scope (and loan/free) to the bounded cap.
+      // A local scope is cleared only when its own register was spilled.
+      if (Kind == KindScopeLocal || Rs.isVirtual())
+        return;
+      if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
+        ScopeFIs.insert(*FI);
+    };
     if (Rs.isVirtual() || !deadAfter(*MI, Rs, TRI)) {
       // D97: a live register still holds a cap for a later read (colored
       // frame address, pointer compared after free). Drop the pseudo.
       Drop.push_back(MI);
       memannot::noteCapRegSkippedLive();
-      if (!Rs.isVirtual())
-        if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
-          ScopeFIs.insert(*FI);
+      noteFrame();
       continue;
     }
-    if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
-      ScopeFIs.insert(*FI);
-    SpillSearch Search(TRI);
-    SmallSet<int, 4> Holds;
-    SmallSet<int, 4> Killed;
-    DenseMap<int, unsigned> Opc;
-    SmallVector<Register, 4> Regs{Rs};
-    if (Search.walk(MI->getParent(), MI->getIterator(), Regs, Holds, Killed,
-                    Opc)) {
+    bool HasSpill = SpillRegs.count(Rs);
+    if (Kind == KindScopeLocal && !HasSpill) {
+      // D99. Nothing stored this register to a spill slot, and the address
+      // does not escape. The dead register is overwritten by later code.
+      Drop.push_back(MI);
+      memannot::noteCapRegSkippedNoEscape();
+      continue;
+    }
+    // Null a spill even when the register clear itself is redundant. The
+    // slot outlives the register.
+    noteFrame();
+    if (HasSpill) {
+      SpillSearch Search(TRI);
+      SmallSet<int, 4> Holds;
+      SmallSet<int, 4> Killed;
+      DenseMap<int, unsigned> Opc;
+      SmallVector<Register, 4> Regs{Rs};
+      if (Search.walk(MI->getParent(), MI->getIterator(), Regs, Holds, Killed,
+                      Opc) == SpillSearch::Result::Ok) {
       for (int FI : Holds)
         if (unsigned StoreOpc = Opc.lookup(FI))
           keepNull(MI->getParent(), MI, FI, StoreOpc);
@@ -583,6 +715,18 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
             continue;
           keepNull(Path.first, nullptr, FI, StoreOpc);
         }
+      }
+    }
+    if (Scope && soonRedef(*MI, Rs, MF, TRI)) {
+      Drop.push_back(MI);
+      memannot::noteCapRegSkippedSoonRedef();
+      continue;
+    }
+    if (Scope && isCalleeSavedReg(Rs, MF, TRI) &&
+        !callBeforeRedef(*MI, Rs, TRI)) {
+      Drop.push_back(MI);
+      memannot::noteCapRegSkippedCSR();
+      continue;
     }
   }
   for (const NullAt &N : Nulls) {
@@ -673,6 +817,15 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
         // A terminator reads the old value. Clearing after it in this block
         // is not valid MIR; the value is already dead on every outgoing edge.
         // A return has no successors, so a returned capability is kept.
+        // D100/D101 also apply to the bounded register. It is a scope clear.
+        if (soonRedef(MI, B, MF, TRI)) {
+          memannot::noteCapRegSkippedSoonRedef();
+          continue;
+        }
+        if (isCalleeSavedReg(B, MF, TRI) && !callBeforeRedef(MI, B, TRI)) {
+          memannot::noteCapRegSkippedCSR();
+          continue;
+        }
         if (MI.isTerminator()) {
           for (MachineBasicBlock *S : MBB.successors())
             Edges.push_back({&MBB, S, B});
@@ -684,8 +837,7 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
       for (MachineBasicBlock *S : MBB.successors()) {
         if (S == &MBB || blockReads(*S, B, TRI))
           continue;
-        // Dead only on this edge (the loop keeps the cap live on the
-        // backedge). Split so the other predecessors of S are untouched.
+        // D100. Clearing only on this edge needs a new block and a branch.
         Edges.push_back({&MBB, S, B});
       }
     }
@@ -705,31 +857,14 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
         .addReg(C.Reg);
     Changed = true;
   }
-  DenseMap<std::pair<MachineBasicBlock *, MachineBasicBlock *>,
-           SmallVector<Register, 2>>
-      ByEdge;
+  SmallSet<std::pair<std::pair<MachineBasicBlock *, MachineBasicBlock *>,
+                     Register>,
+           8>
+      SeenEdge;
   for (const EdgeClear &E : Edges) {
-    SmallVector<Register, 2> &Regs = ByEdge[{E.From, E.To}];
-    if (!is_contained(Regs, E.Reg))
-      Regs.push_back(E.Reg);
-  }
-  for (auto &KV : ByEdge) {
-    MachineBasicBlock *From = KV.first.first;
-    MachineBasicBlock *To = KV.first.second;
-    MachineBasicBlock::SplitCriticalEdgeAnalyses None{nullptr, nullptr,
-                                                      nullptr, nullptr};
-    MachineBasicBlock *EB =
-        From->SplitCriticalEdge(To, None, nullptr, nullptr);
-    if (!EB)
+    if (!SeenEdge.insert({{E.From, E.To}, E.Reg}).second)
       continue;
-    for (Register B : KV.second) {
-      EB->addLiveIn(B);
-      EB->sortUniqueLiveIns();
-      BuildMI(*EB, EB->begin(), DebugLoc(),
-              TII.get(RISCV::PseudoCheriCapClear), B)
-          .addReg(B);
-      Changed = true;
-    }
+    memannot::noteCapRegSkippedEdge();
   }
   for (MachineInstr *MI : Work) {
     if (is_contained(Drop, MI))
@@ -744,6 +879,63 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
   for (MachineInstr *MI : Drop) {
     MI->eraseFromParent();
     Changed = true;
+  }
+  // D102. A clear that dominates another clear of the same register, with no
+  // def of that register in between, already killed it.
+  SmallVector<MachineInstr *, 8> Clears;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (MI.getOpcode() == RISCV::PseudoCheriCapClear)
+        Clears.push_back(&MI);
+  if (Clears.size() > 1) {
+    MachineDominatorTree MDT(MF);
+    SmallPtrSet<MachineInstr *, 8> Dup;
+    auto redefined = [&](MachineInstr *From, MachineInstr *To, Register R) {
+      SmallPtrSet<MachineBasicBlock *, 8> Seen;
+      unsigned Budget = 32;
+      auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                      MachineBasicBlock::iterator It) -> bool {
+        for (; It != BB.end(); ++It) {
+          if (&*It == To)
+            return false;
+          if (Budget-- == 0)
+            return true;
+          if (It->getOpcode() == RISCV::PseudoCheriCapClear)
+            continue;
+          if (definesOverlap(*It, R, TRI))
+            return true;
+        }
+        for (MachineBasicBlock *S : BB.successors()) {
+          if (!Seen.insert(S).second)
+            continue;
+          if (Self(Self, *S, S->begin()))
+            return true;
+        }
+        return false;
+      };
+      return Walk(Walk, *From->getParent(), std::next(From->getIterator()));
+    };
+    for (MachineInstr *A : Clears) {
+      if (Dup.count(A))
+        continue;
+      Register RA = A->getOperand(0).getReg();
+      for (MachineInstr *B : Clears) {
+        if (A == B || Dup.count(B))
+          continue;
+        if (B->getOperand(0).getReg() != RA)
+          continue;
+        if (!MDT.dominates(A, B))
+          continue;
+        if (redefined(A, B, RA))
+          continue;
+        Dup.insert(B);
+      }
+    }
+    for (MachineInstr *MI : Dup) {
+      MI->eraseFromParent();
+      memannot::noteCapRegSkippedDup();
+      Changed = true;
+    }
   }
   return Changed;
 }

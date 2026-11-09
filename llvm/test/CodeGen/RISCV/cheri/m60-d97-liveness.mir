@@ -26,7 +26,7 @@ isSSA:           false
 body:             |
   bb.0:
     liveins: $x10_y
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     $x11_y = COPY $x10_y
     PseudoCRET implicit $x11_y
 
@@ -43,7 +43,7 @@ isSSA:           false
 body:             |
   bb.0:
     liveins: $x10_y
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     PseudoCRET
 
 # CHECK-LABEL: name: dead_reg
@@ -58,7 +58,7 @@ isSSA:           false
 body:             |
   bb.0:
     $x8_y = CIncOffsetImm %stack.0, 0
-    PseudoCheriCapInvalidate $x8_y
+    PseudoCheriCapInvalidate $x8_y, 0
     $x10_y = CSetBoundsImm $x8_y, 48
     PseudoCRET implicit $x10_y
 
@@ -81,7 +81,7 @@ body:             |
   bb.0:
     successors: %bb.1(0x80000000)
     liveins: $x8_y
-    PseudoCheriCapInvalidate $x8_y
+    PseudoCheriCapInvalidate $x8_y, 0
     $x11 = PseudoCGetAddr $x8_y
     PseudoBR %bb.1
 
@@ -103,7 +103,7 @@ body:             |
   bb.0:
     liveins: $x10_y
     $x10_y = CLC_128 %stack.0, 0
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     $x11_y = CLC_128 %stack.0, 0
     PseudoCRET implicit $x11_y
 
@@ -134,7 +134,7 @@ body:             |
     successors: %bb.1(0x40000000), %bb.2(0x40000000)
     liveins: $x10_y, $x11_y
     $x12_y = COPY $x10_y
-    PseudoCheriCapInvalidate $x11_y
+    PseudoCheriCapInvalidate $x11_y, 1
     BNE $x0, $x0, %bb.1
     PseudoBR %bb.2
 
@@ -152,8 +152,10 @@ stack:
 # CHECK: $x12_y = COPY $x10_y
 # CHECK-NOT: PseudoCheriCapClear $x10_y
 # CHECK: $x11_y = PseudoCheriCapClear $x11_y
-# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NOT: PseudoCheriCapClear $x10_y
 # CHECK: bb.2:
-# STATS: aborts=1
+# The bounded cap dies only on the exit edge. D100 does not split it.
+# STATS: aborts=0
 # STATS: nulls=0
 # STATS: capreg_skipped_live=3
+# STATS: capreg_skipped_edge=1
