@@ -8,12 +8,12 @@
 
 target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
-declare void @llvm.cheri.cap.invalidate(ptr addrspace(200))
+declare void @llvm.cheri.cap.invalidate(ptr addrspace(200), i32)
 
 define void @direct(ptr addrspace(200) %p) addrspace(200) optnone noinline {
   %a = alloca i32, align 4, addrspace(200)
   store volatile i32 1, ptr addrspace(200) %a, align 4
-  call void @llvm.cheri.cap.invalidate(ptr addrspace(200) %a)
+  call void @llvm.cheri.cap.invalidate(ptr addrspace(200) %a, i32 0)
   ret void
 }
 
@@ -21,7 +21,7 @@ define void @through_gep() addrspace(200) {
   %a = alloca i32, align 4, addrspace(200)
   %g = getelementptr inbounds i32, ptr addrspace(200) %a, i64 0
   store volatile i32 1, ptr addrspace(200) %a, align 4
-  call void @llvm.cheri.cap.invalidate(ptr addrspace(200) %g)
+  call void @llvm.cheri.cap.invalidate(ptr addrspace(200) %g, i32 0)
   ret void
 }
 
@@ -30,7 +30,7 @@ define void @through_gep() addrspace(200) {
 
 ; CHECK-LABEL: define void @direct(
 ; CHECK-NOT: llvm.cheri.bounded.stack.cap
-; CHECK: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %a)
+; CHECK: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %a, i32 0)
 ; CHECK-LABEL: define void @through_gep(
 ; CHECK-NOT: llvm.cheri.bounded.stack.cap
-; CHECK: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %g)
+; CHECK: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %g, i32 0)

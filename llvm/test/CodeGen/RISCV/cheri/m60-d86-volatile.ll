@@ -1,6 +1,7 @@
 ; [LLM-generated] M6.0 D86. DAGCombiner deletes a plain store contained in an
 ; object immediately before lifetime.end. The same store marked volatile
 ; survives -O2, and its cheri_inv_loan pcsections label is in the asm.
+; D94 does not put a scope register clear here: nothing calls after the end.
 ; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 < %s | FileCheck %s
 
 target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"

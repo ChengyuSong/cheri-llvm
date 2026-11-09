@@ -1566,13 +1566,14 @@ def : PatYGPR<int_cheri_cap_tag_clear, CClearTag, YLenVT>;
 let Predicates = [HasCheri] in {
 let hasSideEffects = 1, mayLoad = 1, mayStore = 1, isCodeGenOnly = 1 in
 def PseudoCheriCapInvalidate
-    : Pseudo<(outs), (ins YGPR:$rs), [], "cheri.cap.invalidate", "$rs">;
+    : Pseudo<(outs), (ins YGPR:$rs, i32imm:$kind), [], "cheri.cap.invalidate",
+             "$rs, $kind">;
 let hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1,
     Constraints = "$rd = $rs" in
 def PseudoCheriCapClear
     : Pseudo<(outs YGPR:$rd), (ins YGPR:$rs), [], "cheri.cap.clear", "$rd, $rs">;
-def : Pat<(int_cheri_cap_invalidate YGPR:$rs),
-          (PseudoCheriCapInvalidate YGPR:$rs)>;
+def : Pat<(int_cheri_cap_invalidate YGPR:$rs, timm:$kind),
+          (PseudoCheriCapInvalidate YGPR:$rs, timm:$kind)>;
 }
 def : PatYGPRYGPR<int_cheri_cap_build, CBuildCap>;
 def : PatYGPRYGPR<int_cheri_cap_type_copy, CCopyType>;

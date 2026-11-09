@@ -20,7 +20,7 @@ body:             |
   bb.0:
     liveins: $x10_y
     $x10_y = CLC_128 %stack.0, 0
-    PseudoCheriCapInvalidate $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
     $x11_y = CLC_128 %stack.0, 0
     PseudoCRET implicit $x11_y
 
@@ -29,12 +29,13 @@ stack:
       stack-id: default, callee-saved-register: '', callee-saved-restored: true,
       debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
 
+# D97: the slot is reloaded after the clear, so it is not nulled. The
+# register itself is dead and is cleared.
 # CHECK-LABEL: name: spill
 # CHECK: $x10_y = CLC_128 %stack.0, 0
-# CHECK-NEXT: CSC_128 $x0_y, %stack.0, 0
 # CHECK-NEXT: $x10_y = PseudoCheriCapClear $x10_y
 # CHECK-NEXT: $x11_y = CLC_128 %stack.0, 0
-# CHECK-NOT: mem.loan
+# CHECK-NOT: CSC_128 $x0_y
 ---
 name:            csr
 alignment:       2
@@ -45,7 +46,7 @@ body:             |
   bb.0:
     liveins: $x10_y
     $x20_y = CLC_128 %stack.0, 0
-    PseudoCheriCapInvalidate $x20_y
+    PseudoCheriCapInvalidate $x20_y, 0
     PseudoCRET
 
 stack:

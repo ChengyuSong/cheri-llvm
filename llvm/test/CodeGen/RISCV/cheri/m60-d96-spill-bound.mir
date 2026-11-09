@@ -1,0 +1,144 @@
+# [LLM-generated] M6.1 D96. A backward walk that exceeds 16 blocks aborts
+# and nulls nothing. aborts= is appended to -cheri-invalidate-stats-out.
+# A capability store of a different register does not null that slot.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
+# RUN: FileCheck %s --check-prefix=STATS < %t.stats
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @abort() addrspace(200) { ret void }
+  define void @reuse() addrspace(200) { ret void }
+...
+---
+name:            abort
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+
+  bb.0:
+    successors: %bb.1(0x80000000)
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoBR %bb.1
+
+  bb.1:
+    successors: %bb.2(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.2
+
+  bb.2:
+    successors: %bb.3(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.3
+
+  bb.3:
+    successors: %bb.4(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.4
+
+  bb.4:
+    successors: %bb.5(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.5
+
+  bb.5:
+    successors: %bb.6(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.6
+
+  bb.6:
+    successors: %bb.7(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.7
+
+  bb.7:
+    successors: %bb.8(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.8
+
+  bb.8:
+    successors: %bb.9(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.9
+
+  bb.9:
+    successors: %bb.10(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.10
+
+  bb.10:
+    successors: %bb.11(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.11
+
+  bb.11:
+    successors: %bb.12(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.12
+
+  bb.12:
+    successors: %bb.13(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.13
+
+  bb.13:
+    successors: %bb.14(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.14
+
+  bb.14:
+    successors: %bb.15(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.15
+
+  bb.15:
+    successors: %bb.16(0x80000000)
+    liveins: $x10_y
+    PseudoBR %bb.16
+
+  bb.16:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: abort
+# CHECK: PseudoCheriCapClear
+# CHECK-NOT: CSC_128 $x0_y
+# STATS: aborts=1
+---
+name:            reuse
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x11_y
+    $x10_y = CLC_128 %stack.0, 0
+    CSC_128 $x11_y, %stack.1, 0
+    PseudoCheriCapInvalidate $x10_y, 0
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 1, name: '', type: spill-slot, offset: 16, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: reuse
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK: CSC_128 $x11_y, %stack.1, 0
+# CHECK-NOT: CSC_128 $x0_y, %stack.1
+# CHECK: CSC_128 $x0_y, %stack.0, 0
+# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# STATS: nulls=1

@@ -90,10 +90,12 @@ def int_cheri_cap_tag_clear  :
 // [LLM-generated] M6.0 D87. Uses the capability so the register (including a
 // callee-saved one) stays live until this point, then is cleared. Not a mem
 // fact: stripAnnotations leaves it for isel. Loan ids are not put on MMOs.
+// The i32 is the clear class: 0 loan/free, 1 scope whose address escapes,
+// 2 scope that does not escape (D99; the late pass clears it only if spilled).
 def int_cheri_cap_invalidate :
   Intrinsic<[],
-            [llvm_cap_ty],
-            [IntrInaccessibleMemOnly, IntrWillReturn]>;
+            [llvm_cap_ty, llvm_i32_ty],
+            [IntrInaccessibleMemOnly, IntrWillReturn, ImmArg<ArgIndex<1>>]>;
 
 def int_cheri_cap_untagged_from_int  :
   Intrinsic<[llvm_cap_ty],

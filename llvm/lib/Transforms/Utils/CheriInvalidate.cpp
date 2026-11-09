@@ -14,6 +14,7 @@
 // (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
 // or a '+'-list (e.g. scope+free, the R4 "all").
 //===----------------------------------------------------------------------===//
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Transforms/Utils/MemAnnotCensus.h"
 #include "llvm/ADT/MapVector.h"
@@ -86,16 +87,17 @@ static unsigned FLogNoFree = 0;
 static cl::opt<bool> InvVolatile(
     "cheri-invalidate-volatile", cl::init(true), cl::Hidden,
     cl::desc("M5r R5: emit own-slot nulls and loan clears as volatile stores"));
-// [LLM-generated] M6.0 D87. Off leaves only the slot store. On also emits
-// llvm.cheri.cap.invalidate on the capability value so a loan held in a
-// callee-saved register is cleared there; a later call cannot save it.
-// Spill-slot nulling is the post-RA pass. Callee-saved save slots (the
-// incoming register) are not nulled. D89: this does not put loan ids on MMOs.
+// [LLM-generated] M6.0 D87, M6.1 D90. Off leaves only the slot stores. On also
+// emits llvm.cheri.cap.invalidate so the capability cannot survive in a
+// register (including a callee-saved one) past a loan last-use, a free, or a
+// scope end. The post-RA pass nulls RA spill slots that still hold that value.
+// Callee-saved save slots (the caller's incoming register) are not written.
+// D89: this does not put loan ids on MMOs.
 static cl::opt<bool> InvCapReg(
     "cheri-invalidate-cap-reg", cl::init(true), cl::Hidden,
-    cl::desc("M6.0 D87: at a loan last-use, clear the capability register "
-             "(including a callee-saved one) and, after RA, a spill slot "
-             "reloaded into it"));
+    cl::desc("M6.1 D90: at a loan last-use, free, or scope end, clear the "
+             "capability register (including a callee-saved one) and, after "
+             "RA, spill slots that still hold it"));
 // [LLM-generated] R6 (D41): a loan slot may have its address passed to a
 // call or stored (fmt's `&&T` arguments). Every Rust pointer to the slot is a
 // borrow of it whose region is inside the slot's type region, which is inside
@@ -124,6 +126,46 @@ static cl::opt<bool> InvFilter(
 static cl::opt<std::string> InvStatsOut(
     "cheri-invalidate-stats-out", cl::init(""), cl::Hidden,
     cl::desc("Append one line of per-module invalidation counts"));
+// D96. The machine pass increments these; flushSpillInvalidateStats appends.
+static unsigned SpillSearchAborts = 0;
+static unsigned SpillNulls = 0;
+static unsigned CapRegSkippedLive = 0;
+static unsigned CapRegSkippedNoEscape = 0;
+static unsigned CapRegSkippedCSR = 0;
+static unsigned CapRegSkippedSoon = 0;
+static unsigned CapRegSkippedEdge = 0;
+static unsigned CapRegSkippedDup = 0;
+void llvm::memannot::noteSpillSearchAbort() { ++SpillSearchAborts; }
+void llvm::memannot::noteSpillNull() { ++SpillNulls; }
+void llvm::memannot::noteCapRegSkippedLive() { ++CapRegSkippedLive; }
+void llvm::memannot::noteCapRegSkippedNoEscape() { ++CapRegSkippedNoEscape; }
+void llvm::memannot::noteCapRegSkippedCSR() { ++CapRegSkippedCSR; }
+void llvm::memannot::noteCapRegSkippedSoonRedef() { ++CapRegSkippedSoon; }
+void llvm::memannot::noteCapRegSkippedEdge() { ++CapRegSkippedEdge; }
+void llvm::memannot::noteCapRegSkippedDup() { ++CapRegSkippedDup; }
+void llvm::memannot::flushSpillInvalidateStats() {
+  if (InvStatsOut.empty())
+    return;
+  std::error_code EC;
+  raw_fd_ostream OS(InvStatsOut, EC, sys::fs::OF_Append | sys::fs::OF_Text);
+  if (!EC)
+    OS << "cheri-invalidate-spill: aborts=" << SpillSearchAborts
+       << " nulls=" << SpillNulls
+       << " capreg_skipped_live=" << CapRegSkippedLive
+       << " capreg_skipped_noescape=" << CapRegSkippedNoEscape
+       << " capreg_skipped_csr=" << CapRegSkippedCSR
+       << " capreg_skipped_soon_redef=" << CapRegSkippedSoon
+       << " capreg_skipped_edge=" << CapRegSkippedEdge
+       << " capreg_skipped_dup=" << CapRegSkippedDup << "\n";
+  SpillSearchAborts = 0;
+  SpillNulls = 0;
+  CapRegSkippedLive = 0;
+  CapRegSkippedNoEscape = 0;
+  CapRegSkippedCSR = 0;
+  CapRegSkippedSoon = 0;
+  CapRegSkippedEdge = 0;
+  CapRegSkippedDup = 0;
+}
 
 namespace {
 struct Slot {
@@ -141,6 +183,8 @@ struct Inv {
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
   unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0, LoanEscaped = 0,
            AsmNoEscape = 0;
+  // M6.1 D90: register clears emitted, by kind.
+  unsigned CapRegLoan = 0, CapRegFree = 0, CapRegScope = 0;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -536,6 +580,286 @@ struct Inv {
     return Best;
   }
 
+  // M6.1 D91/D92. Root plus dominating copies of that capability: bitcast,
+  // addrspacecast, freeze, GEP, a phi or select whose incoming caps are all
+  // already copies, and an empty inline asm that returns its pointer operand.
+  // Bound: 8 values and 32 users. A phi/select that mixes in another object
+  // is left alone (the register at the merge is not this capability on every
+  // path).
+  bool fatCap(const Value *V) const {
+    return V && !isa<Constant>(V) && DL.isFatPointer(V->getType());
+  }
+  bool dominatesAt(const Value *V, Instruction *At, DominatorTree &DT) const {
+    if (const auto *I = dyn_cast<Instruction>(V))
+      return DT.dominates(I, At);
+    return isa<Argument>(V);
+  }
+  // Trunc is set when the copy walk hits its bound, so a missed user is
+  // treated as an escape rather than dropped.
+  void capCopies(Value *Root, Instruction *At, DominatorTree &DT,
+                 SmallVectorImpl<Value *> &Out, bool &Trunc) {
+    Trunc = false;
+    if (!At || !fatCap(Root) || !dominatesAt(Root, At, DT))
+      return;
+    SmallPtrSet<Value *, 16> In;
+    SmallVector<Value *, 8> Wave;
+    auto Push = [&](Value *V) {
+      if (!fatCap(V) || !dominatesAt(V, At, DT))
+        return;
+      if (Out.size() >= 8) {
+        Trunc = true;
+        return;
+      }
+      if (!In.insert(V).second)
+        return;
+      Out.push_back(V);
+      Wave.push_back(V);
+    };
+    Push(Root);
+    unsigned SeenUsers = 0;
+    while (!Wave.empty() && Out.size() < 8 && SeenUsers < 32) {
+      Value *V = Wave.pop_back_val();
+      for (User *U : V->users()) {
+        if (Out.size() >= 8 || SeenUsers >= 32) {
+          Trunc = true;
+          break;
+        }
+        ++SeenUsers;
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I || !fatCap(I) || !dominatesAt(I, At, DT))
+          continue;
+        bool Take = false;
+        if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
+            isa<FreezeInst>(I) || isa<GetElementPtrInst>(I))
+          Take = true;
+        else if (auto *PN = dyn_cast<PHINode>(I))
+          Take = any_of(PN->incoming_values(),
+                        [&](Value *Inc) { return In.count(Inc); }) &&
+                 all_of(PN->incoming_values(), [&](Value *Inc) {
+                   return isa<UndefValue>(Inc) || In.count(Inc);
+                 });
+        else if (auto *Sel = dyn_cast<SelectInst>(I))
+          Take = (In.count(Sel->getTrueValue()) ||
+                  In.count(Sel->getFalseValue())) &&
+                 (isa<UndefValue>(Sel->getTrueValue()) ||
+                  In.count(Sel->getTrueValue())) &&
+                 (isa<UndefValue>(Sel->getFalseValue()) ||
+                  In.count(Sel->getFalseValue()));
+        else if (auto *CB = dyn_cast<CallBase>(I))
+          if (InvAsmNoEscape && isEmptyAsm(CB)) {
+            bool Any = false, All = true;
+            for (Value *A : CB->args()) {
+              if (!A->getType()->isPointerTy())
+                continue;
+              if (In.count(A))
+                Any = true;
+              else
+                All = false;
+            }
+            Take = Any && All;
+          }
+        if (Take)
+          Push(I);
+      }
+    }
+  }
+  static bool realCall(const Instruction &I) {
+    const auto *CB = dyn_cast<CallBase>(&I);
+    return CB && !CB->isInlineAsm() &&
+           CB->getIntrinsicID() == Intrinsic::not_intrinsic;
+  }
+  // Blocks that contain a real call, or can reach one. Built per function.
+  DenseSet<BasicBlock *> CallReach;
+  void buildCallReach(Function &F) {
+    CallReach.clear();
+    SmallVector<BasicBlock *, 16> Work;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (realCall(I)) {
+          Work.push_back(&BB);
+          break;
+        }
+    while (!Work.empty()) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (!CallReach.insert(BB).second)
+        continue;
+      for (BasicBlock *P : predecessors(BB))
+        Work.push_back(P);
+    }
+  }
+  // D94. A callee after this point can save a callee-saved register that
+  // still holds the cap. With no later call, the epilogue restores the
+  // incoming register before any other function runs, so a dead address
+  // does not need a clear (and adding one forces a save).
+  bool callAfter(Instruction *E) const {
+    BasicBlock *BB = E->getParent();
+    for (auto It = std::next(E->getIterator()); It != BB->end(); ++It)
+      if (realCall(*It))
+        return true;
+    for (BasicBlock *S : successors(BB))
+      if (CallReach.count(S))
+        return true;
+    return false;
+  }
+  // 0 loan/free, 1 scope that escapes, 2 scope that does not.
+  static constexpr unsigned KindLoanFree = 0;
+  static constexpr unsigned KindScopeEscape = 1;
+  static constexpr unsigned KindScopeLocal = 2;
+
+  // D104. PHIs must stay grouped at the top of the block. A last use that is
+  // a PHI (or the next instruction, which is still a PHI) is not a valid
+  // insertion point. The first non-PHI is after every PHI, so it is still
+  // after that use.
+  static Instruction *afterPhiGroup(Instruction *At) {
+    if (!At || !isa<PHINode>(At))
+      return At;
+    return At->getParent()->getFirstNonPHI();
+  }
+  void emitOne(IRBuilder<> &B, Value *V, Instruction *At, unsigned Kind,
+               unsigned &Counter) {
+    At = afterPhiGroup(At);
+    if (!At)
+      return;
+    // One invalidate of this value and kind per block. A scope end that is
+    // visited again, or several copies that share this value, must not stack
+    // identical calls between (or after) the PHIs.
+    for (Instruction &I : *At->getParent()) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->getIntrinsicID() != Intrinsic::cheri_cap_invalidate ||
+          CB->arg_size() < 2 || CB->getArgOperand(0) != V)
+        continue;
+      if (auto *K = dyn_cast<ConstantInt>(CB->getArgOperand(1)))
+        if (K->getZExtValue() == Kind)
+          return;
+    }
+    B.SetInsertPoint(At);
+    B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                 {V, B.getInt32(Kind)});
+    ++Counter;
+  }
+  // Latest use of V that dominates End, ignoring lifetime markers and the
+  // invalidate itself. The pseudo goes immediately after this use so the
+  // live range does not stretch to lifetime.end across a later call (D100).
+  Instruction *latestUse(Value *V, Instruction *End, DominatorTree &DT) const {
+    Instruction *Best = nullptr;
+    for (User *U : V->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I || I == End || isa<DbgInfoIntrinsic>(I))
+        continue;
+      if (auto *CB = dyn_cast<CallBase>(I)) {
+        if (CB->isLifetimeStartOrEnd() ||
+            CB->getIntrinsicID() == Intrinsic::cheri_cap_invalidate)
+          continue;
+      }
+      if (!DT.dominates(I, End))
+        continue;
+      if (!Best || DT.dominates(Best, I))
+        Best = I;
+    }
+    return Best;
+  }
+  static bool memIntrinsic(const CallBase &CB) {
+    switch (CB.getIntrinsicID()) {
+    case Intrinsic::memcpy:
+    case Intrinsic::memcpy_inline:
+    case Intrinsic::memset:
+    case Intrinsic::memset_inline:
+    case Intrinsic::memmove:
+      return true;
+    default:
+      return false;
+    }
+  }
+  // D99. The address leaves this function: passed to a real call, stored,
+  // returned, or handed to something that is not a local use of the memory.
+  // memcpy/memset and an empty asm do not capture it. A truncated copy walk
+  // counts as escape so a missed user is not treated as local.
+  bool allocaEscapes(ArrayRef<Value *> Copies, bool Trunc) const {
+    if (Trunc)
+      return true;
+    SmallPtrSet<const Value *, 8> In;
+    for (Value *V : Copies)
+      In.insert(V);
+    for (Value *V : Copies) {
+      for (User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (auto *SI = dyn_cast<StoreInst>(I)) {
+          if (In.count(SI->getValueOperand()))
+            return true;
+          continue;
+        }
+        if (isa<ReturnInst>(I))
+          return true;
+        if (auto *CB = dyn_cast<CallBase>(I)) {
+          if (CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB) ||
+              CB->getIntrinsicID() == Intrinsic::cheri_cap_invalidate)
+            continue;
+          if (InvAsmNoEscape && isEmptyAsm(CB))
+            continue;
+          if (memIntrinsic(*CB))
+            continue;
+          for (Value *A : CB->args())
+            if (In.count(A))
+              return true;
+          continue;
+        }
+        if (isa<LoadInst>(I) || isa<AtomicRMWInst>(I) || isa<ICmpInst>(I) ||
+            isa<PtrToIntInst>(I) || isa<GetElementPtrInst>(I) ||
+            isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
+            isa<FreezeInst>(I) || isa<PHINode>(I) || isa<SelectInst>(I))
+          continue;
+        if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+          if (CX->getPointerOperand() == V)
+            continue;
+          return true;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  // D97 decides at the physical register whether this use is a kill. Loan
+  // and free pass kind 0. Scope passes 1 or 2 (D99).
+  void emitCapRegs(IRBuilder<> &B, Value *Root, Instruction *At,
+                   DominatorTree &DT, unsigned &Counter) {
+    emitCapRegsKind(B, Root, At, DT, Counter, KindLoanFree);
+  }
+  void emitCapRegsKind(IRBuilder<> &B, Value *Root, Instruction *At,
+                       DominatorTree &DT, unsigned &Counter, unsigned Kind) {
+    if (!InvCapReg)
+      return;
+    SmallVector<Value *, 8> Vs;
+    bool Trunc = false;
+    capCopies(Root, At, DT, Vs, Trunc);
+    if (Kind == KindScopeLocal && allocaEscapes(Vs, Trunc))
+      Kind = KindScopeEscape;
+    for (Value *V : Vs) {
+      // Loan and free stay at At: after the call and after the range-check
+      // loads inserted at the same point. Moving them earlier breaks the
+      // free sequence and can clear a register the call still needs.
+      if (Kind == KindLoanFree) {
+        emitOne(B, V, At, Kind, Counter);
+        continue;
+      }
+      Instruction *U = latestUse(V, At, DT);
+      // Loan, free, and an escaping scope still name a copy that has no
+      // further use: a pinned register can hold the capability with no
+      // other instruction reading it. A local scope object does not.
+      if (!U && Kind == KindScopeLocal)
+        continue;
+      // After the last real use when that use is before End, so the live
+      // range is not stretched across a later call. With no such use, End
+      // itself is the point.
+      Instruction *Ins = At;
+      if (U && !U->isTerminator())
+        if (Instruction *N = U->getNextNode())
+          Ins = N;
+      emitOne(B, V, Ins, Kind, Counter);
+    }
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -576,8 +900,11 @@ struct Inv {
         // D89: the clear's identity for the rest of codegen is this
         // !pcsections tag, not a loan id on the store's MachineMemOperand.
         if (InvCapReg)
-          if (Value *Cap = loanCapValue(L, C, At, DT))
-            B.CreateCall(decl(Intrinsic::cheri_cap_invalidate), {Cap});
+          if (Value *Cap = loanCapValue(L, C, At, DT)) {
+            B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                         {Cap, B.getInt32(KindLoanFree)});
+            ++CapRegLoan;
+          }
         ++LoanClears;
       }
     }
@@ -883,12 +1210,19 @@ struct Inv {
               ++LUFrameCopies;
         }
       }
-    if (CapSlots.empty())
+    // D91/D92: a free or scope end still clears registers when this function
+    // has no frame capability slot for the existing range checks.
+    bool RegFree = InvCapReg && (Free || AFLog);
+    bool RegScope = InvCapReg && Scope;
+    if (CapSlots.empty() && !RegFree && !RegScope)
       return;
     DominatorTree DT(F);
-    collectLoanSlots(F);
-    if (Loan)
-      loanClears(F, DT);
+    buildCallReach(F);
+    if (!CapSlots.empty()) {
+      collectLoanSlots(F);
+      if (Loan)
+        loanClears(F, DT);
+    }
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -902,35 +1236,55 @@ struct Inv {
     IRBuilder<> B(M.getContext());
     if (Scope)
       for (IntrinsicInst *E : Ends) {
-        auto *A = dyn_cast<AllocaInst>(E->getArgOperand(E->arg_size() - 1)->stripPointerCasts());
-        if (!A || !A->isStaticAlloca())
-          continue;
-        std::optional<TypeSize> Sz = A->getAllocationSize(DL);
-        if (!Sz || Sz->isScalable())
-          continue;
-        ++ScopeEvents;
+        Value *Op = E->getArgOperand(E->arg_size() - 1)->stripPointerCasts();
+        auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(Op));
         B.SetInsertPoint(E);
-        auto It = CapSlots.find(A);
-        if (It != CapSlots.end() && InvOwnNullEff)
-          for (int64_t Off : It->second) {
-            Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
-            markClear(B.CreateAlignedStore(
-                ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
-                Align(16), InvVolatile), "cheri_inv_own");
-            ++OwnNulled;
+        if (A && A->isStaticAlloca()) {
+          std::optional<TypeSize> Sz = A->getAllocationSize(DL);
+          if (Sz && !Sz->isScalable()) {
+            ++ScopeEvents;
+            auto It = CapSlots.find(A);
+            if (It != CapSlots.end() && InvOwnNullEff)
+              for (int64_t Off : It->second) {
+                Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
+                markClear(B.CreateAlignedStore(
+                    ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
+                    Align(16), InvVolatile), "cheri_inv_own");
+                ++OwnNulled;
+              }
+            Value *Lo = nullptr;
+            for (auto &[S, Offs] : CapSlots) {
+              if (S == A || !liveAt(S, E, DT) || !readLater(S, E, DT))
+                continue;
+              if (!Lo)
+                Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
+              for (int64_t Off : Offs)
+                if (mayHoldFrame({S, Off}, A) && !loanCovered(S, Off, E))
+                  checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()),
+                                "cheri_inv_scope");
+            }
           }
-        Value *Lo = nullptr;
-        for (auto &[S, Offs] : CapSlots) {
-          if (S == A || !liveAt(S, E, DT) || !readLater(S, E, DT))
-            continue;
-          if (!Lo)
-            Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
-          for (int64_t Off : Offs)
-            if (mayHoldFrame({S, Off}, A) && !loanCovered(S, Off, E))
-              checkAndClear(B, {S, Off}, Lo, B.getInt64(Sz->getFixedValue()),
-                            "cheri_inv_scope");
         }
+        // D94: only when a real call follows. D99 tags a non-escaping alloca
+        // so the late pass can drop it unless the register was spilled. The
+        // pseudo is placed just after the last real use (D100), not at
+        // lifetime.end, so the live range does not cross a later call.
+        if (RegScope && callAfter(E))
+          emitCapRegsKind(B, A ? static_cast<Value *>(A) : Op, E, DT,
+                          CapRegScope, KindScopeLocal);
       }
+    auto clearFreedReg = [&](CallBase *C, Instruction *At) {
+      if (!At)
+        return;
+      Value *P = C->getOperandBundle(memannot::TagFree)->Inputs[0];
+      if (!DL.isFatPointer(P->getType()))
+        return;
+      B.SetInsertPoint(At);
+      // D91: the pointer passed to dealloc and dominating copies. Aflog
+      // records base/length before the call; this clear is after it, and
+      // after any frame-slot range check inserted at the same point.
+      emitCapRegs(B, P, At, DT, CapRegFree);
+    };
     if (Free)
       for (CallBase *C : Frees) {
         if (isa<InvokeInst>(C))
@@ -938,11 +1292,12 @@ struct Inv {
         Value *P = C->getOperandBundle(memannot::TagFree)->Inputs[0];
         if (!DL.isFatPointer(P->getType()))
           continue;
+        Instruction *At = C->getNextNode();
         ++FreeEvents;
         B.SetInsertPoint(C);
         Value *Lo = B.CreateCall(decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}), {P});
         Value *Len = B.CreateCall(decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}), {P});
-        B.SetInsertPoint(C->getNextNode());
+        B.SetInsertPoint(At);
         for (auto &[S, Offs] : CapSlots) {
           if (!liveAt(S, C, DT) || !readLater(S, C, DT))
             continue;
@@ -950,8 +1305,15 @@ struct Inv {
             if (mayHoldHeap({S, Off}) && !loanCovered(S, Off, C))
               checkAndClear(B, {S, Off}, Lo, Len, "cheri_inv_free");
         }
+        clearFreedReg(C, At);
       }
-    if (FLog)
+    else if (RegFree)
+      for (CallBase *C : Frees) {
+        if (isa<InvokeInst>(C))
+          continue;
+        clearFreedReg(C, C->getNextNode());
+      }
+    if (FLog && !CapSlots.empty())
       flogCalls(F, CapSlots, DT); // last: it splits blocks
   }
 
@@ -979,7 +1341,9 @@ struct Inv {
            << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
            << " asm_noescape=" << AsmNoEscape << " flog_frees=" << FLogFrees
          << " flog_calls=" << FLogCalls << " flog_nofree=" << FLogNoFree
-         << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall << "\n";
+         << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall
+         << " capreg_loan=" << CapRegLoan << " capreg_free=" << CapRegFree
+         << " capreg_scope=" << CapRegScope << "\n";
     }
   }
 };

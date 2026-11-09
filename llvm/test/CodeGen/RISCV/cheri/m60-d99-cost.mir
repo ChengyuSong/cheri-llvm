@@ -1,0 +1,120 @@
+# [LLM-generated] M6.1 D100/D101/D102. Scope kind is the immediate:
+# 1 escaping, 2 local. A scope register overwritten within 8 straight-line
+# instructions is not cleared. A callee-saved scope register with no call
+# before its next def is not cleared. Two clears of one register on one
+# path collapse to the first.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
+# RUN: FileCheck %s --check-prefix=STATS < %t.stats
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @soon() addrspace(200) { ret void }
+  define void @not_soon() addrspace(200) { ret void }
+  define void @csr_nocal() addrspace(200) { ret void }
+  define void @csr_call() addrspace(200) { ret void }
+  define void @dedupe() addrspace(200) { ret void }
+  declare void @later() addrspace(200)
+...
+---
+name:            soon
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 1
+    $x11_y = COPY $x0_y
+    $x10_y = COPY $x0_y
+    PseudoCRET
+
+# CHECK-LABEL: name: soon
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: $x10_y = COPY $x0_y
+---
+name:            not_soon
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 1
+    $x11_y = COPY $x0_y
+    $x12_y = COPY $x0_y
+    $x13_y = COPY $x0_y
+    $x14_y = COPY $x0_y
+    $x15_y = COPY $x0_y
+    $x16_y = COPY $x0_y
+    $x17_y = COPY $x0_y
+    $x6_y = COPY $x0_y
+    $x10_y = COPY $x0_y
+    PseudoCRET
+
+# CHECK-LABEL: name: not_soon
+# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK: $x10_y = COPY $x0_y
+---
+name:            csr_nocal
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x20_y
+    PseudoCheriCapInvalidate $x20_y, 1
+    $x11_y = COPY $x0_y
+    $x12_y = COPY $x0_y
+    $x13_y = COPY $x0_y
+    $x14_y = COPY $x0_y
+    $x15_y = COPY $x0_y
+    $x16_y = COPY $x0_y
+    $x17_y = COPY $x0_y
+    $x6_y = COPY $x0_y
+    $x7_y = COPY $x0_y
+    $x20_y = COPY $x0_y
+    PseudoCRET
+
+# CHECK-LABEL: name: csr_nocal
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: $x20_y = COPY $x0_y
+---
+name:            csr_call
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x20_y
+    PseudoCheriCapInvalidate $x20_y, 1
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+# CHECK-LABEL: name: csr_call
+# CHECK: $x20_y = PseudoCheriCapClear $x20_y
+# CHECK-NEXT: PseudoCCALL
+---
+name:            dedupe
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 1
+    PseudoCheriCapInvalidate $x10_y, 1
+    PseudoCRET
+
+# CHECK-LABEL: name: dedupe
+# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NEXT: PseudoCRET
+# STATS: capreg_skipped_csr=1
+# STATS: capreg_skipped_soon_redef=1
+# STATS: capreg_skipped_dup=1
