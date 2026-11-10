@@ -10,6 +10,9 @@
 //   * R5: !mem.last_use of loan L: after the carrier, null every frame slot
 //     that only ever holds L's reference (all its capability stores carry
 //     the rustc slot fact !mem.loan !{L}).
+//   * M7.1a: llvm.mem.fact ["mem.move"(ptr Slot)] nulls that frame slot and
+//     clears a capability register still holding the moved-from value. The
+//     slot may have escaped. The free-log loop is not involved.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
 // or a '+'-list (e.g. scope+free, the R4 "all").
@@ -185,6 +188,8 @@ struct Inv {
            AsmNoEscape = 0;
   // M6.1 D90: register clears emitted, by kind.
   unsigned CapRegLoan = 0, CapRegFree = 0, CapRegScope = 0;
+  // M7.1a: source slots nulled at a "mem.move" fact.
+  unsigned MoveNulls = 0;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -860,6 +865,204 @@ struct Inv {
     }
   }
 
+  // [LLM-generated] M7.1a. Resolve "mem.move"'s operand to one frame slot:
+  // an alloca at a constant, non-negative, 16-byte-aligned offset. A variable
+  // index, a heap/argument/global address, poison, or a misaligned offset is
+  // not a slot this pass can null.
+  bool frameSlot(Value *P, AllocaInst *&A, int64_t &Off) const {
+    A = nullptr;
+    Off = 0;
+    if (!P || !P->getType()->isPointerTy())
+      return false;
+    Value *Base = GetPointerBaseWithConstantOffset(P, Off, DL);
+    A = dyn_cast<AllocaInst>(Base);
+    return A && Off >= 0 && Off % 16 == 0;
+  }
+  bool isThisSlot(Value *P, AllocaInst *A, int64_t Off) const {
+    AllocaInst *B = nullptr;
+    int64_t O = 0;
+    return frameSlot(P, B, O) && B == A && O == Off;
+  }
+  // A Vec move passes the slot itself to the callee. That call is the move
+  // even though it does not load the owner into a register.
+  bool callTakesSlot(const Instruction *I, AllocaInst *A, int64_t Off) const {
+    auto *CB = dyn_cast<CallBase>(I);
+    if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+      return false;
+    for (Value *Arg : CB->args())
+      if (isThisSlot(Arg, A, Off))
+        return true;
+    return false;
+  }
+  // Last write of the slot in this block before the fact, if that write is
+  // not followed by a move-out. A move-out is a load of the slot (Box: the
+  // fact follows the load), a call that takes the slot (Vec: the fact follows
+  // that call), or any use of the stored value. A store with none of those
+  // still occupies the slot at the fact: a re-init the fact was sunk past.
+  // Nulling it would destroy a live value. No store in this block is not a
+  // re-init (the owner store may be in a predecessor; the fact is trusted).
+  bool reinitBefore(Instruction *Fact, AllocaInst *A, int64_t Off) const {
+    Instruction *Last = nullptr;
+    Value *Stored = nullptr;
+    for (Instruction &I : *Fact->getParent()) {
+      if (&I == Fact)
+        break;
+      Value *Ptr = nullptr;
+      Value *Val = nullptr;
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        Ptr = SI->getPointerOperand();
+        Val = SI->getValueOperand();
+      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+        Ptr = RMW->getPointerOperand();
+      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+        Ptr = CX->getPointerOperand();
+      }
+      if (!Ptr || !isThisSlot(Ptr, A, Off))
+        continue;
+      Last = &I;
+      Stored = Val;
+    }
+    if (!Last)
+      return false;
+    for (Instruction *I = Last->getNextNode(); I && I != Fact;
+         I = I->getNextNode()) {
+      if (isa<DbgInfoIntrinsic>(I))
+        continue;
+      if (auto *LI = dyn_cast<LoadInst>(I))
+        if (isThisSlot(LI->getPointerOperand(), A, Off))
+          return false;
+      if (callTakesSlot(I, A, Off))
+        return false;
+      if (!Stored)
+        continue;
+      for (Value *Op : I->operands())
+        if (Op == Stored)
+          return false;
+    }
+    return true;
+  }
+  // Capability still holding the moved-from value. Prefer the latest load of
+  // the slot before the fact (the reload that was moved), else the value of
+  // the latest store. The slot address itself is not that capability.
+  Value *moveCap(Instruction *Fact, AllocaInst *A, int64_t Off,
+                 DominatorTree &DT) const {
+    Instruction *Best = nullptr;
+    Value *Cap = nullptr;
+    auto Consider = [&](Instruction *Where, Value *V) {
+      if (!V || !DL.isFatPointer(V->getType()) || isa<Constant>(V))
+        return;
+      if (!isa<LoadInst>(V) && getUnderlyingObject(V) == A)
+        return;
+      if (!DT.dominates(Where, Fact))
+        return;
+      if (Best && !DT.dominates(Best, Where))
+        return;
+      Best = Where;
+      Cap = V;
+    };
+    for (Instruction &I : *Fact->getParent()) {
+      if (&I == Fact)
+        break;
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (isThisSlot(LI->getPointerOperand(), A, Off))
+          Consider(LI, LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (isThisSlot(SI->getPointerOperand(), A, Off))
+          Consider(SI, SI->getValueOperand());
+      }
+    }
+    return Cap;
+  }
+  // Box: the fact is the instruction after the load, and the call that
+  // receives the register is still ahead. Invalidating at the fact would be
+  // before that use, and the post-RA pass drops a pseudo whose register is
+  // still live (no spill null either). Put the pseudo after the last use of
+  // the cap in this block. Vec: the fact is already after the call, so the
+  // cap usually has no later use and the pseudo stays at the fact.
+  Instruction *invalidateAt(Value *Cap, Instruction *Fact) const {
+    Instruction *Last = nullptr;
+    if (Cap) {
+      for (User *U : Cap->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I || I == Fact || isa<DbgInfoIntrinsic>(I))
+          continue;
+        if (I->getParent() != Fact->getParent() || !Fact->comesBefore(I))
+          continue;
+        if (!Last || Last->comesBefore(I))
+          Last = I;
+      }
+    }
+    if (Last) {
+      if (!Last->isTerminator())
+        if (Instruction *N = Last->getNextNode())
+          return N;
+      return Last;
+    }
+    return Fact->getNextNode();
+  }
+  // [LLM-generated] M7.1a. At each "mem.move"(slot), null the slot and
+  // invalidate one copy of the capability that was in it (kind 0, the
+  // loan/free class: the post-RA pass spills the same way). The null is the
+  // next instruction after the fact. Escaping does not skip the clear. The
+  // free log is not consulted.
+  //
+  // rustc places the fact immediately after the move. For Box that is after
+  // the load and before the call that takes the register, so the null is
+  // before that call and the register clear is after it. For Vec the slot is
+  // the call argument, so the fact (and the null) follow the call.
+  //
+  // Ignored when the operand is not a constant-offset frame slot, the slot's
+  // lifetime has already ended, or the same block re-initialized it before
+  // the fact (reinitBefore). A re-init store after the fact overwrites the null.
+  void moveClears(Function &F, DominatorTree &DT) {
+    struct Act {
+      CallBase *Fact;
+      Value *Ptr;
+      Value *Cap;
+      Instruction *CapAt;
+    };
+    SmallVector<Act, 4> Acts;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || !memannot::isMemMoveFact(CB))
+        continue;
+      auto OB = CB->getOperandBundle(memannot::TagMove);
+      if (!OB || OB->Inputs.empty())
+        continue;
+      Value *P = OB->Inputs[0];
+      AllocaInst *A = nullptr;
+      int64_t Off = 0;
+      if (!frameSlot(P, A, Off) || !DL.isFatPointer(P->getType()))
+        continue;
+      if (!liveAt(A, CB, DT) || reinitBefore(CB, A, Off))
+        continue;
+      Value *Cap = moveCap(CB, A, Off, DT);
+      Acts.push_back({CB, P, Cap, invalidateAt(Cap, CB)});
+    }
+    IRBuilder<> B(M.getContext());
+    for (Act &A : Acts) {
+      Instruction *At = A.Fact->getNextNode();
+      if (!At)
+        continue;
+      B.SetInsertPoint(At);
+      auto *S = B.CreateAlignedStore(
+          ConstantPointerNull::get(cast<PointerType>(A.Ptr->getType())), A.Ptr,
+          Align(16), InvVolatile);
+      markClear(S, "cheri_inv_move");
+      ++MoveNulls;
+      if (!InvCapReg || !A.Cap || !A.CapAt)
+        continue;
+      // The null was inserted before At. A clear that belongs at At must
+      // follow that null, not precede it.
+      Instruction *CapAt = A.CapAt == At ? At : A.CapAt;
+      if (CapAt->getParent() != A.Fact->getParent())
+        continue;
+      B.SetInsertPoint(CapAt);
+      B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                   {A.Cap, B.getInt32(KindLoanFree)});
+    }
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -1300,9 +1503,18 @@ struct Inv {
       }
     // D91/D92: a free or scope end still clears registers when this function
     // has no frame capability slot for the existing range checks.
+    // M7.1a: a move fact is cleared even when this function has no other
+    // capability slot for the range checks.
+    bool HasMove = false;
+    if (Loan)
+      for (Instruction &I : instructions(F))
+        if (memannot::isMemMoveFact(&I)) {
+          HasMove = true;
+          break;
+        }
     bool RegFree = InvCapReg && (Free || AFLog);
     bool RegScope = InvCapReg && Scope;
-    if (CapSlots.empty() && !RegFree && !RegScope)
+    if (CapSlots.empty() && !RegFree && !RegScope && !HasMove)
       return;
     DominatorTree DT(F);
     buildCallReach(F);
@@ -1311,6 +1523,9 @@ struct Inv {
       if (Loan)
         loanClears(F, DT);
     }
+    // Before flogCalls: that splits blocks. The free-log loop is unchanged.
+    if (HasMove)
+      moveClears(F, DT);
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -1432,7 +1647,8 @@ struct Inv {
          << " flog_nofree=" << FLogNoFree
          << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall
          << " capreg_loan=" << CapRegLoan << " capreg_free=" << CapRegFree
-         << " capreg_scope=" << CapRegScope << "\n";
+         << " capreg_scope=" << CapRegScope << " move_nulls=" << MoveNulls
+         << "\n";
     }
   }
 };

@@ -24,6 +24,11 @@ bool memannot::isMemFact(const Instruction *I) {
   return false;
 }
 
+bool memannot::isMemMoveFact(const Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  return CB && isMemFact(CB) && CB->getOperandBundle(TagMove);
+}
+
 bool memannot::hasMemCheck(const CallBase &CB) {
   return CB.getOperandBundle(TagCheck).has_value();
 }

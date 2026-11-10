@@ -1071,7 +1071,8 @@ def int_assume : DefaultAttrsIntrinsic<[], [llvm_i1_ty],
 
 // 'llvm.mem.fact' (CHERI M5r, target-neutral): carries proved memory-safety
 // facts from the front end to late lowering in operand bundles
-// ("mem.alloc_inbounds", "mem.inbounds"; "mem.dropped" after promotion).
+// ("mem.alloc_inbounds", "mem.inbounds"; "mem.dropped" after promotion;
+// "mem.move"(ptr slot) names a moved-from frame slot, M7.1a).
 // Like llvm.assume it only touches inaccessible memory, so it orders against
 // other facts but not against ordinary loads/stores, and its bundle operands
 // are captures(none). See llvm/IR/MemAnnot.h. [LLM-generated]
