@@ -26,5 +26,10 @@ define i64 @caller(ptr addrspace(200) %p) {
 ; CHECK: load volatile i64, ptr addrspace(200) @__cheri_free_log
 ; CHECK: void @consume(
 ; CHECK: load volatile i64, ptr addrspace(200) @__cheri_free_log
+; D115: one cap-check template in a K loop. Not FLogCheck unrolled tag.clears
+; (the second of those was a Len=0 probe whenever the call appended once).
+; CHECK: %cheri.flog.k = phi i64
 ; CHECK: @llvm.cheri.cap.tag.clear
+; CHECK-NOT: @llvm.cheri.cap.tag.clear
+; CHECK: ret i64
 ; OFF-NOT: __cheri_free_log
