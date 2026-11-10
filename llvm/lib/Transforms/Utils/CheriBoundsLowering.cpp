@@ -93,7 +93,8 @@ static cl::opt<bool> RecoverConst(
     "cheri-bounds-recover-const", cl::init(true), cl::Hidden,
     cl::desc("R5 (D30): a split marker whose index is a constant on its edge "
              "recovers the constant-offset accesses of its base in its Ok "
-             "block as guards (fully unrolled loops)"));
+             "block, or in a block the success edge dominates, as guards "
+             "(fully unrolled loops; D113)"));
 static cl::opt<bool> TrapMap(
     "cheri-trap-map", cl::init(true), cl::Hidden,
     cl::desc("R5 (trap->panic): tag the accesses whose software check was "
@@ -961,8 +962,22 @@ struct Lowering {
   // block at exactly base + K * esz (access size <= esz) as its guards. A
   // narrow of (base, Len * esz) then traps exactly where the compare would
   // have panicked.
+  //
+  // [LLM-generated] M6.2 D113. The same access may sit below Ok, still
+  // dominated by the success edge (an is_less length compare in Ok, with
+  // the v[0] load on the equal-length successor). Walk only the dominator
+  // subtree of Ok, and only blocks DominatorTree::dominates(Edge, BB)
+  // accepts. Depth is the dominator-tree distance from Ok. Stop at
+  // RecovDomDepth and after RecovDomBlocks blocks; the first match in that
+  // order is the guard. An access the success edge does not dominate is
+  // never taken. The D112 preconditions (folded length, K active bits,
+  // esz, index-check only) are unchanged.
+  static constexpr unsigned RecovDomDepth = 4;
+  static constexpr unsigned RecovDomBlocks = 8;
+
   void recoverConst(SmallVectorImpl<Marker> &Ms,
-                    DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards) {
+                    DenseMap<uint64_t, SmallVector<GetElementPtrInst *, 2>> &Guards,
+                    DominatorTree &DT) {
     if (!RecoverConst)
       return;
     for (Marker &Mk : Ms) {
@@ -986,29 +1001,85 @@ struct Lowering {
         if (LI->getParent() == Mk.Ok)
           continue;
       int64_t Want = (int64_t)(K->getZExtValue() * Mk.Esz);
-      SmallVector<Instruction *, 2> Acc;
-      for (Instruction &I : *Mk.Ok) {
+      auto MatchAcc = [&](Instruction &I) -> bool {
         Value *P = getLoadStorePointerOperand(&I);
         if (!P)
-          continue;
+          return false;
         if (auto *SI = dyn_cast<StoreInst>(&I))
           if (SI->getValueOperand() == Mk.Base)
-            continue;
+            return false;
         int64_t C = 0;
         if (P != Mk.Base) {
           auto *G = dyn_cast<GetElementPtrInst>(P);
           if (!G || G->getPointerOperand() != Mk.Base)
-            continue;
+            return false;
           APInt Off(DL.getIndexTypeSizeInBits(G->getType()), 0);
           if (!G->accumulateConstantOffset(DL, Off))
-            continue;
+            return false;
           C = Off.getSExtValue();
         }
         Type *T = isa<LoadInst>(&I) ? I.getType()
                                     : cast<StoreInst>(&I)->getValueOperand()->getType();
-        if (C != Want || DL.getTypeStoreSize(T).getKnownMinValue() > Mk.Esz)
-          continue;
-        Acc.push_back(&I);
+        return C == Want &&
+               DL.getTypeStoreSize(T).getKnownMinValue() <= Mk.Esz;
+      };
+      SmallVector<Instruction *, 2> Acc;
+      for (Instruction &I : *Mk.Ok)
+        if (MatchAcc(I))
+          Acc.push_back(&I);
+      // D113: Ok had no const-index access. Look further, nearest first,
+      // only where the success edge dominates.
+      if (Acc.empty() && Mk.Ok) {
+        BasicBlockEdge Edge(Mk.Pred, Mk.Ok);
+        DomTreeNode *Root = DT.getNode(Mk.Ok);
+        if (Root && DT.dominates(Edge, Mk.Ok)) {
+          SmallVector<DomTreeNode *, 8> Cur, Next;
+          for (DomTreeNode *C : *Root) {
+            if (Cur.size() >= RecovDomBlocks)
+              break;
+            if (DT.dominates(Edge, C->getBlock()))
+              Cur.push_back(C);
+          }
+          unsigned Visited = 0;
+          for (unsigned Depth = 1; Depth <= RecovDomDepth && Acc.empty();
+               ++Depth) {
+            Next.clear();
+            for (DomTreeNode *N : Cur) {
+              if (!Acc.empty() || Visited >= RecovDomBlocks)
+                break;
+              BasicBlock *BB = N->getBlock();
+              if (!DT.dominates(Edge, BB))
+                continue;
+              ++Visited;
+              for (Instruction &I : *BB) {
+                if (!MatchAcc(I))
+                  continue;
+                // The narrow is inserted at this access and uses the
+                // length. Both must dominate it; a success-edge-dominated
+                // block usually does, since the compare already uses them.
+                if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+                  if (!DT.dominates(LI, &I))
+                    continue;
+                if (auto *BI = dyn_cast<Instruction>(Mk.Base))
+                  if (!DT.dominates(BI, &I))
+                    continue;
+                Acc.push_back(&I);
+                break;
+              }
+              if (!Acc.empty() || Depth == RecovDomDepth)
+                continue;
+              for (DomTreeNode *C : *N) {
+                if (Next.size() >= RecovDomBlocks)
+                  break;
+                if (DT.dominates(Edge, C->getBlock()))
+                  Next.push_back(C);
+              }
+            }
+            if (Next.empty() || Visited >= RecovDomBlocks)
+              break;
+            Cur.swap(Next);
+          }
+        }
       }
       if (Acc.empty())
         continue;
@@ -1275,7 +1346,7 @@ struct Lowering {
         Narrowable.insert(G);
     adopt(Markers, DT, Guards);
     RecoveredG.clear();
-    recoverConst(Markers, Guards);
+    recoverConst(Markers, Guards, DT);
     SmallPtrSet<GetElementPtrInst *, 8> Done;
     SmallVector<BasicBlock *, 4> DeadPanics;
     for (Marker &Mk : Markers) {
