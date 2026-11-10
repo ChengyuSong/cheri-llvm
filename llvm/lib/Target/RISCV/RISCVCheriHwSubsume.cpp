@@ -1,5 +1,5 @@
 //===- RISCVCheriHwSubsume.cpp - Drop checks an exact cap already does ----===//
-// [LLM-generated] M6.2 D105–D110.
+// [LLM-generated] M6.2 D105–D111.
 //
 // CheriBoundsLowering keeps the software compare when it will not remove it
 // (borrows, raw checks under elide, unlinked markers, failed coverage,
@@ -20,10 +20,10 @@
 // Requiring the pointer to derive from this setbounds result refuses a
 // check whose access was sunk onto a different capability.
 //
-// At -O1 and above, MachineSink has already moved CSetBoundsImm into the
-// success block before addPreRegAlloc. The setbounds is then not in the
-// compare's block, the pattern does not match, and the compare stays.
-// This pass does not look in another block for the setbounds.
+// D111: MachineSink (before this pass at -O1 and above) moves CSetBoundsImm
+// into the success successor. That block is the only other place searched.
+// Not the panic block, not a further successor, and not the rest of the
+// function. The length, the compare, and the uses are the same as above.
 //
 // No !mem.guard, "mem.check", llvm.mem.fact, or llvm.mem.claim is read.
 // The immediate and the loads and stores are the fact.
@@ -285,6 +285,56 @@ std::optional<CmpMatch> matchUnsignedUlt(const MachineInstr &Br, uint64_t Len,
   return M;
 }
 
+// Length compared by this branch, when it is one of the forms matchUnsignedUlt
+// accepts for a length in 1..4095. Independent of where the setbounds is.
+std::optional<uint64_t> comparedLen(const MachineInstr &Br,
+                                   const MachineRegisterInfo &MRI) {
+  unsigned Opc = Br.getOpcode();
+  if ((Opc != RISCV::BLTU && Opc != RISCV::BGEU) || Br.getNumOperands() < 3 ||
+      !Br.getOperand(0).isReg() || !Br.getOperand(1).isReg())
+    return std::nullopt;
+  Register A = Br.getOperand(0).getReg();
+  Register B = Br.getOperand(1).getReg();
+  std::optional<int64_t> ImmA = materializedImm(A, MRI);
+  std::optional<int64_t> ImmB = materializedImm(B, MRI);
+  auto IsIndex = [](Register R, std::optional<int64_t> Imm) {
+    return R.isVirtual() && !Imm;
+  };
+  auto InRange = [](int64_t V) {
+    return V >= 1 && static_cast<uint64_t>(V) <= RV64ExactImmMax;
+  };
+  // Direct `idx < Len` / `idx >= Len` before the len-1 encoding, matching
+  // the order in matchUnsignedUlt.
+  if (ImmB && IsIndex(A, ImmA) && InRange(*ImmB))
+    return static_cast<uint64_t>(*ImmB);
+  if (ImmA && IsIndex(B, ImmB) && *ImmA >= 0 && InRange(*ImmA + 1))
+    return static_cast<uint64_t>(*ImmA + 1);
+  return std::nullopt;
+}
+
+bool exactSetBoundsImm(const MachineInstr &MI, Register &Cap, int64_t &Imm) {
+  if (MI.getOpcode() != RISCV::CSetBoundsImm || MI.getNumOperands() < 3 ||
+      !MI.getOperand(0).isReg() || !MI.getOperand(0).getReg().isVirtual() ||
+      !MI.getOperand(2).isImm())
+    return false;
+  Imm = MI.getOperand(2).getImm();
+  if (Imm < 1 || static_cast<uint64_t>(Imm) > RV64ExactImmMax)
+    return false;
+  Cap = MI.getOperand(0).getReg();
+  return true;
+}
+
+bool checkSubsumed(const CmpMatch &Cmp, Register Cap, const MachineInstr *Br,
+                   MachineBasicBlock &CmpBB, const MachineRegisterInfo &MRI) {
+  // Another predecessor means the panic block is still reached without
+  // this capability. A PHI means it is not the trivial trap block.
+  if (Cmp.Panic->pred_size() != 1 || *Cmp.Panic->pred_begin() != &CmpBB ||
+      (!Cmp.Panic->empty() && Cmp.Panic->front().isPHI()))
+    return false;
+  bool Saw = false;
+  return indexOnlyDereferenced(Cmp.Idx, Cap, Br, Cmp.Panic, MRI, Saw) && Saw;
+}
+
 void eraseDeadImm(Register R, MachineRegisterInfo &MRI) {
   if (!R.isVirtual() || !MRI.use_nodbg_empty(R))
     return;
@@ -326,34 +376,48 @@ bool subsumeBlock(MachineBasicBlock &MBB, const RISCVInstrInfo &TII,
   CmpMatch Found;
   int64_t Len = 0;
   bool Matched = false;
+  // D110: setbounds in the compare's own block.
   for (MachineInstr &MI : MBB) {
-    if (MI.getOpcode() != RISCV::CSetBoundsImm || MI.getNumOperands() < 3 ||
-        !MI.getOperand(0).isReg() || !MI.getOperand(0).getReg().isVirtual() ||
-        !MI.getOperand(2).isImm())
-      continue;
-    int64_t Imm = MI.getOperand(2).getImm();
+    Register Cap;
+    int64_t Imm = 0;
     // Length 0 has no in-bounds index. The compare's success path is the
     // path the check rejects; deleting it would take that path. 4096 is not
     // an exact RV64 immediate (and does not fit uimm12).
-    if (Imm < 1 || static_cast<uint64_t>(Imm) > RV64ExactImmMax)
+    if (!exactSetBoundsImm(MI, Cap, Imm))
       continue;
-    Register Cap = MI.getOperand(0).getReg();
     std::optional<CmpMatch> Cmp =
         matchUnsignedUlt(*Br, static_cast<uint64_t>(Imm), MRI, MBB);
-    if (!Cmp)
-      continue;
-    // Another predecessor means the panic block is still reached without
-    // this capability. A PHI means it is not the trivial trap block.
-    if (Cmp->Panic->pred_size() != 1 || *Cmp->Panic->pred_begin() != &MBB ||
-        (!Cmp->Panic->empty() && Cmp->Panic->front().isPHI()))
-      continue;
-    bool Saw = false;
-    if (!indexOnlyDereferenced(Cmp->Idx, Cap, Br, Cmp->Panic, MRI, Saw) || !Saw)
+    if (!Cmp || !checkSubsumed(*Cmp, Cap, Br, MBB, MRI))
       continue;
     Found = *Cmp;
     Len = Imm;
     Matched = true;
     break;
+  }
+  // D111: MachineSink puts CSetBoundsImm in the success successor. Look only
+  // there, and only at a setbounds whose length is the compared length and
+  // whose result is the one this index dereferences. A second full match
+  // keeps the compare.
+  if (!Matched) {
+    std::optional<uint64_t> Want = comparedLen(*Br, MRI);
+    std::optional<CmpMatch> Cmp =
+        Want ? matchUnsignedUlt(*Br, *Want, MRI, MBB) : std::nullopt;
+    unsigned Hits = 0;
+    if (Cmp && Cmp->Ok != &MBB) {
+      for (MachineInstr &MI : *Cmp->Ok) {
+        Register Cap;
+        int64_t Imm = 0;
+        if (!exactSetBoundsImm(MI, Cap, Imm) ||
+            static_cast<uint64_t>(Imm) != *Want)
+          continue;
+        if (!checkSubsumed(*Cmp, Cap, Br, MBB, MRI))
+          continue;
+        Found = *Cmp;
+        Len = Imm;
+        ++Hits;
+      }
+    }
+    Matched = Hits == 1;
   }
   if (!Matched)
     return false;

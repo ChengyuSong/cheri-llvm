@@ -1,0 +1,538 @@
+# [LLM-generated] M6.2 D111. Same compare as D110, but CSetBoundsImm may
+# sit in the success successor (where MachineSink puts it). Nowhere else.
+#
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -run-pass=riscv-cheri-hw-subsume -verify-machineinstrs -o - %s | FileCheck %s
+
+---
+name: sunk_load
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: sunk_store
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %val:gpr = COPY $x12
+    %lim:gpr = ADDI $x0, 32
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    CSB %val, %p, 0
+    PseudoCRET
+
+  bb.2:
+    UNIMP
+...
+---
+name: sunk_nested
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %q:ygpr = CIncOffsetImm %p, 4
+    %v:gpr = CLB %q, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: sunk_4095
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %hi:gpr = LUI 1
+    %lim:gpr = ADDI %hi, -2
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 4095
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: sunk_one_of_two
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %other:ygpr = CSetBoundsImm %base, 16
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: same_block
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_pred_block
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %cap:ygpr = CSetBoundsImm %base, 32
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.3
+    PseudoCBR %bb.2
+
+  bb.2:
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.3:
+    UNIMP
+...
+---
+name: keep_further_block
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.3
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.3
+    PseudoCBR %bb.1
+
+  bb.1:
+    successors: %bb.2
+    PseudoCBR %bb.2
+
+  bb.2:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.3:
+    UNIMP
+...
+---
+name: keep_in_panic
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %p:ygpr = CIncOffset %base, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    UNIMP
+...
+---
+name: keep_gep_stored
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12_y
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %slot:ygpr = COPY $x12_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    CSC_128 %p, %slot, 0
+    PseudoCRET
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_gep_returned
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    $x10_y = COPY %p
+    PseudoCRET implicit $x10_y
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_shared_panic
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.3
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %idx2:gpr = COPY $x12
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.3
+    PseudoCBR %bb.1
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    %lim2:gpr = ADDI $x0, 15
+    BLTU %lim2, %idx2, %bb.3
+    PseudoCBR %bb.2
+
+  bb.2:
+    %cap2:ygpr = CSetBoundsImm %base, 16
+    %q:ygpr = CIncOffset %cap2, %idx2
+    %w:gpr = CLB %q, 0
+    $x10 = COPY %w
+    PseudoCRET implicit $x10
+
+  bb.3:
+    UNIMP
+...
+---
+name: keep_len4096
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %n:gpr = LUI 1
+    %lim:gpr = LUI 1
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBounds %base, %n
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_rounded
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11, $x12
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %n:gpr = COPY $x12
+    %lim:gpr = ADDI $x0, 32
+    BGEU %idx, %lim, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBounds %base, %n
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_index_add
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %v:gpr = CLB %p, 0
+    %s:gpr = ADD %idx, %idx
+    $x10 = COPY %s
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_other_cap
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %base, %idx
+    %v:gpr = CLB %p, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+---
+name: keep_both_caps
+isSSA: true
+tracksRegLiveness: false
+noVRegs: false
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10_y, $x11
+    %idx:gpr = COPY $x11
+    %base:ygpr = COPY $x10_y
+    %lim:gpr = ADDI $x0, 31
+    BLTU %lim, %idx, %bb.2
+    PseudoCBR %bb.1
+
+  bb.1:
+    %cap:ygpr = CSetBoundsImm %base, 32
+    %capb:ygpr = CSetBoundsImm %base, 32
+    %p:ygpr = CIncOffset %cap, %idx
+    %q:ygpr = CIncOffset %capb, %idx
+    %v:gpr = CLB %p, 0
+    %w:gpr = CLB %q, 0
+    $x10 = COPY %v
+    PseudoCRET implicit $x10
+
+  bb.2:
+    UNIMP
+...
+
+# CHECK-LABEL: name: sunk_load
+# CHECK: CSetBoundsImm
+# CHECK-SAME: 32
+# CHECK-NOT: BLTU
+# CHECK-NOT: BGEU
+# CHECK: CIncOffset
+# CHECK: CLB
+
+# CHECK-LABEL: name: sunk_store
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BGEU
+# CHECK-NOT: BLTU
+# CHECK: CSB
+
+# CHECK-LABEL: name: sunk_nested
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BLTU
+# CHECK: CIncOffsetImm
+# CHECK: CLB
+
+# CHECK-LABEL: name: sunk_4095
+# CHECK: CSetBoundsImm
+# CHECK-SAME: 4095
+# CHECK-NOT: BLTU
+# CHECK: CLB
+
+# CHECK-LABEL: name: sunk_one_of_two
+# CHECK: CSetBoundsImm
+# CHECK-SAME: 16
+# CHECK: CSetBoundsImm
+# CHECK-SAME: 32
+# CHECK-NOT: BLTU
+# CHECK: CLB
+
+# CHECK-LABEL: name: same_block
+# CHECK: CSetBoundsImm
+# CHECK-NOT: BLTU
+# CHECK: CLB
+
+# CHECK-LABEL: name: keep_pred_block
+# CHECK: CSetBoundsImm
+# CHECK: BLTU
+
+# CHECK-LABEL: name: keep_further_block
+# CHECK: BLTU
+# CHECK: CSetBoundsImm
+
+# CHECK-LABEL: name: keep_in_panic
+# CHECK: BLTU
+# CHECK: CSetBoundsImm
+
+# CHECK-LABEL: name: keep_gep_stored
+# CHECK: BLTU
+# CHECK: CSC_128
+
+# CHECK-LABEL: name: keep_gep_returned
+# CHECK: BLTU
+# CHECK: COPY
+
+# CHECK-LABEL: name: keep_shared_panic
+# CHECK: BLTU
+# CHECK: BLTU
+
+# CHECK-LABEL: name: keep_len4096
+# CHECK: BGEU
+# CHECK: CSetBounds
+
+# CHECK-LABEL: name: keep_rounded
+# CHECK: BGEU
+# CHECK: CSetBounds
+
+# CHECK-LABEL: name: keep_index_add
+# CHECK: BLTU
+# CHECK: ADD
+
+# CHECK-LABEL: name: keep_other_cap
+# CHECK: BLTU
+# CHECK: CIncOffset
+
+# CHECK-LABEL: name: keep_both_caps
+# CHECK: BLTU
+# CHECK: CLB
