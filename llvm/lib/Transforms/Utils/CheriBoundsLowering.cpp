@@ -615,6 +615,9 @@ struct Lowering {
     ConstantInt *ConstIdx = nullptr; // R5 (D30): constant index on this edge
     SmallVector<GetElementPtrInst *, 2> Recov; // R5 (D30): its recovered guards
     SmallVector<GetElementPtrInst *, 2> Group; // re-linked shared guards
+    // [LLM-generated] M6.2 D112: guards whose pointer is a PHI that carries
+    // Base on this marker's success edge. Narrowed on that incoming only.
+    SmallVector<GetElementPtrInst *, 2> PhiBase;
   };
 
   // R4: the borrow made by each guard is only used as the address of loads
@@ -833,6 +836,123 @@ struct Lowering {
     return false;
   }
 
+  static bool sameInt(const ConstantInt *A, const ConstantInt *B) {
+    return A && B && A->getBitWidth() == B->getBitWidth() &&
+           A->getValue() == B->getValue();
+  }
+
+  // [LLM-generated] M6.2 D112. Pred's icmp, normalized to the success edge,
+  // still names a runtime length and the constant index K it excludes:
+  // `runtime != K`, `K <u runtime`, or `runtime >u K`. An `eq` that is true
+  // on the success edge does not exclude K.
+  static bool foldedEdge(const Marker &Mk, Value *&Runtime, ConstantInt *&K) {
+    using namespace PatternMatch;
+    auto *Br = cast<CondBrInst>(Mk.Pred->getTerminator());
+    CmpPredicate P;
+    Value *A, *B;
+    if (!match(Br->getCondition(), m_ICmp(P, m_Value(A), m_Value(B))))
+      return false;
+    ICmpInst::Predicate Pr = P;
+    if (Br->getSuccessor(0) != Mk.Ok)
+      Pr = ICmpInst::getInversePredicate(Pr);
+    auto AsRuntime = [](Value *V) -> Value * {
+      if (isa<Constant>(V) || !V->getType()->isIntegerTy())
+        return nullptr;
+      return V;
+    };
+    Runtime = nullptr;
+    K = nullptr;
+    if (Pr == ICmpInst::ICMP_NE) {
+      if (Value *R = AsRuntime(A))
+        if (auto *CK = dyn_cast<ConstantInt>(B)) {
+          Runtime = R;
+          K = CK;
+          return true;
+        }
+      if (Value *R = AsRuntime(B))
+        if (auto *CK = dyn_cast<ConstantInt>(A)) {
+          Runtime = R;
+          K = CK;
+          return true;
+        }
+      return false;
+    }
+    if (Pr == ICmpInst::ICMP_ULT) {
+      auto *CK = dyn_cast<ConstantInt>(A);
+      Value *R = AsRuntime(B);
+      if (!CK || !R)
+        return false;
+      Runtime = R;
+      K = CK;
+      return true;
+    }
+    if (Pr == ICmpInst::ICMP_UGT) {
+      Value *R = AsRuntime(A);
+      auto *CK = dyn_cast<ConstantInt>(B);
+      if (!CK || !R)
+        return false;
+      Runtime = R;
+      K = CK;
+      return true;
+    }
+    return false;
+  }
+
+  static Value *edgePanicIndex(const Marker &Mk) {
+    if (Mk.Panic->arg_size() < 1)
+      return nullptr;
+    Value *IdxV = Mk.Panic->getArgOperand(0);
+    if (auto *PN = dyn_cast<PHINode>(IdxV))
+      if (PN->getParent() == Mk.Panic->getParent() && Mk.Pred)
+        return PN->getIncomingValueForBlock(Mk.Pred);
+    return IdxV;
+  }
+
+  // [LLM-generated] M6.2 D112. The panic-block bundle length was folded to the
+  // failing edge's constant (often 0). The predecessor icmp still names the
+  // runtime length and the constant index K. Put that length back so
+  // recoverConst / NarrowKeep cannot treat the folded constant as the object
+  // length. K must also be the panic index, and the folded constant must be
+  // K (the value that edge actually forces). A length the icmp does not name
+  // is left alone.
+  static void restoreFoldedLen(SmallVectorImpl<Marker> &Ms, DominatorTree &DT) {
+    if (!RecoverConst)
+      return;
+    for (Marker &Mk : Ms) {
+      auto *Folded = dyn_cast<ConstantInt>(Mk.Len);
+      if (!Folded || !Mk.Pred || Mk.Index || !Mk.Group.empty() || Mk.Esz == 0 ||
+          (Mk.Kind & memannot::CHKF_KindMask) != memannot::CHK_Index)
+        continue;
+      Value *Runtime = nullptr;
+      ConstantInt *K = nullptr;
+      if (!foldedEdge(Mk, Runtime, K) || !K || !Runtime)
+        continue;
+      if (K->getValue().getActiveBits() > 32 || !sameInt(Folded, K) ||
+          Runtime->getType() != Folded->getType())
+        continue;
+      auto *IdxK = dyn_cast<ConstantInt>(edgePanicIndex(Mk));
+      if (!sameInt(IdxK, K))
+        continue;
+      if (auto *LI = dyn_cast<Instruction>(Runtime))
+        if (!DT.dominates(LI, Mk.Pred->getTerminator()))
+          continue;
+      Mk.Len = Runtime;
+    }
+  }
+
+  // [LLM-generated] M6.2 D112. True when PN carries Mk.Base on an incoming
+  // edge dominated by Mk's success edge (the pointer the checked path uses).
+  static bool phiCarriesBase(const Marker &Mk, PHINode *PN, DominatorTree &DT) {
+    if (!PN || !Mk.Pred || !Mk.Ok || PN == Mk.Base)
+      return false;
+    BasicBlockEdge E(Mk.Pred, Mk.Ok);
+    for (unsigned I = 0, N = PN->getNumIncomingValues(); I != N; ++I)
+      if (PN->getIncomingValue(I) == Mk.Base &&
+          DT.dominates(E, PN->getOperandUse(I)))
+        return true;
+    return false;
+  }
+
   // R5 (D30): base-wide guard recovery for fully unrolled loops. After full
   // unrolling the per-iteration accesses are constant-offset GEPs of the
   // base (or the base itself) and carry no !mem.guard, and the exit tests
@@ -926,9 +1046,14 @@ struct Lowering {
     if (!Relink)
       return;
     auto HasGuard = [&](const Marker &Mk) {
-      for (GetElementPtrInst *G : Guards.lookup(Mk.Site))
+      for (GetElementPtrInst *G : Guards.lookup(Mk.Site)) {
         if (G->getPointerOperand() == Mk.Base)
           return true;
+        // [LLM-generated] M6.2 D112: the guard survived, but its pointer is a
+        // PHI that carries Mk.Base on the success edge.
+        if (phiCarriesBase(Mk, dyn_cast<PHINode>(G->getPointerOperand()), DT))
+          return true;
+      }
       return false;
     };
     SmallVector<unsigned, 4> Unlinked;
@@ -940,6 +1065,10 @@ struct Lowering {
     for (Instruction &I : instructions(F)) {
       auto *G = dyn_cast<GetElementPtrInst>(&I);
       if (!G || G->getMetadata(memannot::GuardMD) || G->getNumIndices() != 1)
+        continue;
+      // [LLM-generated] M6.2 D112: a PHI base is not one object for every
+      // incoming edge. Adopted below, not as a shared Group narrow.
+      if (isa<PHINode>(G->getPointerOperand()))
         continue;
       auto *PN = dyn_cast<PHINode>(G->idx_begin()->get());
       if (!PN)
@@ -983,6 +1112,38 @@ struct Lowering {
         Ms[U].Group.push_back(G);
       ++S.Relinked;
       S.RelinkGuards += Members.size();
+    }
+    // [LLM-generated] M6.2 D112. A guard whose !mem.guard was dropped and whose
+    // pointer is a PHI of bases. Accept it when the success edge's incoming is
+    // this marker's base and the index is the checked index. The narrow
+    // rewrites only that incoming.
+    for (Instruction &I : instructions(F)) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G || G->getMetadata(memannot::GuardMD) || G->getNumIndices() != 1)
+        continue;
+      auto *BasePN = dyn_cast<PHINode>(G->getPointerOperand());
+      if (!BasePN)
+        continue;
+      Value *Idx = G->idx_begin()->get();
+      for (unsigned U : Unlinked) {
+        Marker &Mk = Ms[U];
+        if (Mk.Index != Idx || !phiCarriesBase(Mk, BasePN, DT))
+          continue;
+        if (DL.getTypeAllocSize(G->getSourceElementType()) != Mk.Esz)
+          continue;
+        if (auto *CZ = dyn_cast<ConstantInt>(Mk.Len))
+          if (CZ->isZero())
+            continue;
+        bool Dom = true;
+        for (Value *V : {Mk.Base, Mk.Len})
+          if (auto *VI = dyn_cast<Instruction>(V))
+            Dom &= DT.dominates(VI, G);
+        if (!Dom || is_contained(Mk.PhiBase, G))
+          continue;
+        Mk.PhiBase.push_back(G);
+        ++S.Relinked;
+        break;
+      }
     }
   }
 
@@ -1102,6 +1263,9 @@ struct Lowering {
       return;
     DominatorTree DT(F);
     LoopInfo LI(DT); // computed before this pass changes the CFG
+    // D112: before relink / recoverConst, so a path-folded bundle length is
+    // not used as the object length.
+    restoreFoldedLen(Markers, DT);
     relink(Markers, DT, Guards, F);
     // Guards this pass will narrow (for the coverage check): every marker's
     // own guards and the re-linked group guards.
@@ -1127,6 +1291,23 @@ struct Lowering {
           OnEdge.push_back(G);
         }
       for (GetElementPtrInst *G : Guards.lookup(Mk.Site)) {
+        // [LLM-generated] M6.2 D112: a PHI base matches only on the success
+        // edge. It is not Mine: replacing the GEP pointer would narrow every
+        // incoming edge.
+        if (auto *PN = dyn_cast<PHINode>(G->getPointerOperand())) {
+          if (phiCarriesBase(Mk, PN, DT) && !is_contained(Mk.PhiBase, G) &&
+              Mk.Esz != 0) {
+            bool Zero = false;
+            if (auto *CZ = dyn_cast<ConstantInt>(Mk.Len))
+              Zero = CZ->isZero();
+            bool Dom = true;
+            if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+              Dom = DT.dominates(LI, G);
+            if (!Zero && Dom)
+              Mk.PhiBase.push_back(G);
+          }
+          continue;
+        }
         if (Mk.ConstIdx)
           break;
         if (Done.count(G) || G->getPointerOperand() != Mk.Base)
@@ -1145,7 +1326,18 @@ struct Lowering {
       for (GetElementPtrInst *G : Mk.Group)
         if (!Done.count(G))
           GroupG.push_back(G);
-      S.Guards += Mine.size();
+      // D112: drop a still-constant 0 so a folded panic length is never the
+      // narrow. A restored runtime length is not a constant.
+      SmallVector<GetElementPtrInst *, 2> PhiG;
+      for (GetElementPtrInst *G : Mk.PhiBase) {
+        if (Done.count(G))
+          continue;
+        if (auto *CZ = dyn_cast<ConstantInt>(Mk.Len))
+          if (CZ->isZero())
+            continue;
+        PhiG.push_back(G);
+      }
+      S.Guards += Mine.size() + PhiG.size();
       if (Pol == P_Drop) {
         if (Mk.Pred) {
           removeCheck(Mk, DeadPanics);
@@ -1158,10 +1350,18 @@ struct Lowering {
         ++S.Borrow;
       if (RawSite)
         ++S.Raw;
-      if (Mine.empty() && Mk.Group.empty()) {
+      if (Mine.empty() && Mk.Group.empty() && PhiG.empty()) {
         ++S.Unlinked; // no guard left: nothing to narrow, keep the check
         continue;
       }
+      // D112: recoverConst can invent a guard while the only length left is
+      // the folded panic constant 0. Do not exact or narrow to that.
+      if (Mk.ConstIdx)
+        if (auto *CZ = dyn_cast<ConstantInt>(Mk.Len))
+          if (CZ->isZero()) {
+            ++S.Unlinked;
+            continue;
+          }
       std::optional<uint64_t> CB;
       Exactness Ex = exactness(Mk.Base, Mk.Len, Mk.Esz, CB);
       // R4: a dereference-only borrow is lowered as an access check when the
@@ -1226,9 +1426,37 @@ struct Lowering {
           G->setOperand(0, NarrowAt(B, Exact));
           Done.insert(G);
         }
+        // D112: narrow only the success-edge incoming of a PHI base. The
+        // other incomings keep their pointer. A constant 0 length is not a
+        // narrow (PhiG already dropped it).
+        if (Mk.Pred && Mk.Ok)
+          for (GetElementPtrInst *G : PhiG) {
+            auto *PN = dyn_cast<PHINode>(G->getPointerOperand());
+            if (!PN)
+              continue;
+            BasicBlockEdge E(Mk.Pred, Mk.Ok);
+            for (unsigned I = 0, N = PN->getNumIncomingValues(); I != N; ++I) {
+              if (PN->getIncomingValue(I) != Mk.Base)
+                continue;
+              if (!DT.dominates(E, PN->getOperandUse(I)))
+                continue;
+              Instruction *Term = PN->getIncomingBlock(I)->getTerminator();
+              if (auto *LI = dyn_cast<Instruction>(Mk.Len))
+                if (!DT.dominates(LI, Term))
+                  continue;
+              if (auto *BI = dyn_cast<Instruction>(Mk.Base))
+                if (!DT.dominates(BI, Term))
+                  continue;
+              Builder &PB = mk(Term);
+              PN->setIncomingValue(I, NarrowAt(PB, Exact));
+            }
+          }
         ++S.Narrowed;
       };
-      bool CanRemove = Mk.Pred && OnEdge.size() == Mine.size() &&
+      // D112: a PHI-base guard is narrowed on one incoming only. That does not
+      // cover every use of the GEP, so it does not justify removing the check
+      // (and must not turn on two-version under narrow; narrow never removes).
+      bool CanRemove = Mk.Pred && PhiG.empty() && OnEdge.size() == Mine.size() &&
                        (!OnEdge.empty() || !Mk.Group.empty()) &&
                        !Borrow && dominatesTerm(DT, Mk);
       if (CanRemove && Pol != P_Narrow) {
