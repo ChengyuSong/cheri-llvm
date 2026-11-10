@@ -178,7 +178,7 @@ struct Inv {
   const DataLayout &DL;
   bool Scope, Free, Loan, FLog = false, AFLog = false;
   unsigned AFLogSkipFree = 0, AFLogSkipCall = 0;
-  unsigned FLogFrees = 0, FLogCalls = 0;
+  unsigned FLogFrees = 0, FLogCalls = 0, FLogLoops = 0;
   unsigned ScopeEvents = 0, FreeEvents = 0, OwnNulled = 0, RangeChecks = 0,
            Slots = 0, LUFrameCopies = 0, LUCarriers = 0, Filtered = 0;
   unsigned LoanFacts = 0, LoanSlots = 0, LoanClears = 0, LoanSkipped = 0, LoanEscaped = 0,
@@ -976,6 +976,7 @@ struct Inv {
   // Fail-safe: an overflowed ring only misses clears, it never adds one.
   // R11 (D77): ring size and entries checked per call are options; the
   // global's name carries the size so differently built crates cannot mix.
+  // D115: those entries are checked by one loop, not FLogCheck unrolled copies.
   unsigned FLogN = 8, FLogCheck = 4;
   SmallPtrSet<const Function *, 32> MayFree;
   bool callMayFree(const CallBase *C) const {
@@ -1117,6 +1118,97 @@ struct Inv {
     B.CreateAlignedStore(B.CreateAdd(N, B.getInt64(1)), flog(), Align(8), true);
     ++FLogFrees;
   }
+  // Self-referential loop id. Unroll (and unroll-and-jam) would turn this
+  // back into FLogCheck copies; vectorising a volatile cap check is not a
+  // win and can spill the capability being tested. LICM / LSR stay enabled
+  // so the hoisted log pointer can live in one register.
+  static MDNode *flogLoopMetadata(LLVMContext &Ctx) {
+    MDNode *NoUnroll = MDNode::get(
+        Ctx, {MDString::get(Ctx, "llvm.loop.unroll.disable")});
+    MDNode *NoJam = MDNode::get(
+        Ctx, {MDString::get(Ctx, "llvm.loop.unroll_and_jam.disable")});
+    Metadata *False =
+        ConstantAsMetadata::get(ConstantInt::getFalse(Ctx));
+    MDNode *NoVec = MDNode::get(
+        Ctx, {MDString::get(Ctx, "llvm.loop.vectorize.enable"), False});
+    MDNode *ID = MDNode::getDistinct(Ctx, {nullptr, NoUnroll, NoJam, NoVec});
+    ID->replaceOperandWith(0, ID);
+    return ID;
+  }
+  // [LLM-generated] D115. One checkAndClear template per slot, all of them
+  // inside a single loop shared by this call:
+  //   for K = 0 .. min(D, FLogCheck)-1:
+  //     (Lo, Len) = log[N1 - 1 - K]   // flogEnt's ring mask, same as before
+  //     checkAndClear(slot, Lo, Len)
+  // A per-slot loop would repeat the index, the ring mask and both volatile
+  // log loads once per slot. Sharing them is less IR and less code. Each
+  // template loads, tests and stores its capability before the next slot, so
+  // the cap under test dies at the store and a second slot does not extend a
+  // cap live range. The loop-carried state is the integer index plus the log
+  // pointer materialised once in the preheader.
+  //
+  // The loop is bottom-tested, so it is only sound inside the D != 0 split
+  // the caller already emitted. D == 0 must not run K = 0: that would read
+  // log[N1 - 1], an entry this call did not append, and could invent a clear.
+  // Ring overflow still only misses a clear (the mask never addresses a
+  // slot outside the ring, and K stops at FLogCheck).
+  // range_checks increments once per template, in checkAndClear, not per K.
+  void emitFlogLoop(Instruction *ThenTerm, Value *N1, Value *D,
+                    ArrayRef<Slot> Ss) {
+    assert(FLogCheck != 0 && "zero trip count would still run the body");
+    BasicBlock *Enter = ThenTerm->getParent();
+    BasicBlock *Exit = ThenTerm->getSuccessor(0);
+    Function *Fn = Enter->getParent();
+    LLVMContext &Ctx = Fn->getContext();
+    BasicBlock *Header = BasicBlock::Create(Ctx, "cheri.flog.loop", Fn, Exit);
+    Enter->setName("cheri.flog.enter");
+    ThenTerm->eraseFromParent();
+    // The empty then-block was the only D != 0 predecessor of Exit.
+    Exit->replacePhiUsesWith(Enter, Header);
+
+    IRBuilder<> PH(Enter);
+    Value *Bound = PH.CreateBinaryIntrinsic(
+        Intrinsic::umin, D, PH.getInt64(FLogCheck), {}, "cheri.flog.bound");
+    // flogEnt's (0, 1, 0): the first i64 of the {count, entries[]} ring.
+    // Insert, do not let the builder fold this into a constant expression,
+    // so the log capability is one SSA value in the preheader (one register
+    // across the loop) rather than rematerialised at each GEP.
+    // The loop then applies the same ((idx & (FLogN-1)) << 1) + field.
+    Value *Entries = PH.Insert(
+        GetElementPtrInst::CreateInBounds(
+            flog()->getValueType(), flog(),
+            {PH.getInt32(0), PH.getInt32(1), PH.getInt64(0)}),
+        "cheri.flog.ptr");
+    PH.CreateBr(Header);
+
+    IRBuilder<> HB(Header);
+    PHINode *K = HB.CreatePHI(HB.getInt64Ty(), 2, "cheri.flog.k");
+    K->addIncoming(HB.getInt64(0), Enter);
+    // KNext = K + 1, so the entry is log[N1 - (K + 1)], today's Idx.
+    Value *KNext =
+        HB.CreateAdd(K, HB.getInt64(1), "cheri.flog.knext", true, false);
+    Value *Idx = HB.CreateSub(N1, KNext, "cheri.flog.idx");
+    Value *SlotIx =
+        HB.CreateAnd(Idx, HB.getInt64(FLogN - 1), "cheri.flog.slot");
+    Value *Pair = HB.CreateShl(SlotIx, 1, "cheri.flog.pair", true, false);
+    Value *LoPtr =
+        HB.CreateInBoundsGEP(HB.getInt64Ty(), Entries, Pair, "cheri.flog.lop");
+    Value *LenOff =
+        HB.CreateAdd(Pair, HB.getInt64(1), "cheri.flog.lenoff", true, false);
+    Value *LenPtr = HB.CreateInBoundsGEP(HB.getInt64Ty(), Entries, LenOff,
+                                         "cheri.flog.lenp");
+    Value *Lo = HB.CreateAlignedLoad(HB.getInt64Ty(), LoPtr, Align(8), true,
+                                     "cheri.flog.lo");
+    Value *Len = HB.CreateAlignedLoad(HB.getInt64Ty(), LenPtr, Align(8), true,
+                                      "cheri.flog.len");
+    for (Slot S : Ss)
+      checkAndClear(HB, S, Lo, Len, "cheri_inv_free");
+    Value *More = HB.CreateICmpULT(KNext, Bound, "cheri.flog.more");
+    Instruction *Back = HB.CreateCondBr(More, Header, Exit);
+    K->addIncoming(KNext, Header);
+    Back->setMetadata(LLVMContext::MD_loop, flogLoopMetadata(Ctx));
+    ++FLogLoops;
+  }
   void flogCalls(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &CapSlots,
                  DominatorTree &DT) {
     SmallVector<CallBase *, 8> Calls;
@@ -1160,18 +1252,14 @@ struct Inv {
       Value *N0 = flogCount(B);
       B.SetInsertPoint(C->getNextNode());
       Value *N1 = flogCount(B);
-      Value *D = B.CreateSub(N1, N0);
-      Instruction *Then = SplitBlockAndInsertIfThen(B.CreateICmpNE(D, B.getInt64(0)),
-                                                    &*B.GetInsertPoint(), false);
-      IRBuilder<> TB(Then);
-      for (unsigned K = 0; K < FLogCheck; ++K) {
-        Value *Idx = TB.CreateSub(N1, TB.getInt64(K + 1));
-        Value *Lo = TB.CreateAlignedLoad(TB.getInt64Ty(), flogEnt(TB, Idx, 0), Align(8), true);
-        Value *Len = TB.CreateAlignedLoad(TB.getInt64Ty(), flogEnt(TB, Idx, 1), Align(8), true);
-        Len = TB.CreateSelect(TB.CreateICmpUGT(D, TB.getInt64(K)), Len, TB.getInt64(0));
-        for (Slot S : Ss)
-          checkAndClear(TB, S, Lo, Len, "cheri_inv_free");
-      }
+      Value *D = B.CreateSub(N1, N0, "cheri.flog.d");
+      // D == 0 skips the whole bundle. Required, not just a fast path: the
+      // loop below is bottom-tested and would otherwise read an older entry.
+      Instruction *Then = SplitBlockAndInsertIfThen(
+          B.CreateICmpNE(D, B.getInt64(0), "cheri.flog.nz"),
+          &*B.GetInsertPoint(), false);
+      if (FLogCheck != 0)
+        emitFlogLoop(Then, N1, D, Ss);
       ++FLogCalls;
     }
   }
@@ -1340,7 +1428,8 @@ struct Inv {
            << " loan_facts=" << LoanFacts << " loan_slots=" << LoanSlots
            << " loan_clears=" << LoanClears << " loan_skipped=" << LoanSkipped << " loan_escaped=" << LoanEscaped
            << " asm_noescape=" << AsmNoEscape << " flog_frees=" << FLogFrees
-         << " flog_calls=" << FLogCalls << " flog_nofree=" << FLogNoFree
+         << " flog_calls=" << FLogCalls << " flog_loops=" << FLogLoops
+         << " flog_nofree=" << FLogNoFree
          << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall
          << " capreg_loan=" << CapRegLoan << " capreg_free=" << CapRegFree
          << " capreg_scope=" << CapRegScope << "\n";
