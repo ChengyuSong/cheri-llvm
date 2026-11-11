@@ -6055,6 +6055,54 @@ selectPartitionType(Partition &P, const DataLayout &DL, AllocaInst &AI,
   return {ArrayTy, false, nullptr};
 }
 
+// [LLM-generated] M7.1b. \p U is a loan_into operand. When this partition is the
+// owner's buffer-pointer field and it will be promoted, plant a load so
+// mem2reg renames the fact onto that SSA value ("mem.loan_into.val"). A split
+// that stays in memory is retargeted at the new slice and keeps the slot form.
+// Returns true if this use must not be dropped.
+static bool rewriteLoanIntoUse(Use *U, AllocaInst &AI, AllocaInst &NewAI,
+                               Type *PartitionTy, uint64_t Begin, uint64_t End,
+                               bool Promotable) {
+  auto *CB = dyn_cast<CallBase>(U->getUser());
+  if (!CB)
+    return false;
+  if (memannot::isMemLoanIntoValFact(CB))
+    return true;
+  if (!memannot::isMemLoanIntoFact(CB) || !CB->isBundleOperand(U->getOperandNo()))
+    return false;
+  auto OB = CB->getOperandBundle(memannot::TagLoanInto);
+  if (!OB || OB->Inputs.size() < 3 || OB->Inputs[0] != U->get())
+    return false;
+  const DataLayout &DL = AI.getDataLayout();
+  int64_t Off = 0;
+  Value *Base = GetPointerBaseWithConstantOffset(U->get(), Off, DL);
+  if (Base != &AI || Off < 0)
+    return false;
+  uint64_t Field = static_cast<uint64_t>(Off);
+  uint64_t PtrBytes = DL.getPointerSize(AI.getAddressSpace());
+  if (PtrBytes == 0 || Field < Begin || Field + PtrBytes > End)
+    return false;
+  unsigned OpNo = U->getOperandNo();
+  IRBuilder<> B(CB);
+  if (Promotable && PartitionTy->isPointerTy() && Field == Begin) {
+    LoadInst *Ld = B.CreateAlignedLoad(PartitionTy, &NewAI, NewAI.getAlign(),
+                                       "loaninto.field");
+    CB->setOperand(OpNo, Ld);
+    CB->getBundleOpInfoForOperand(OpNo).Tag =
+        CB->getContext().getOrInsertBundleTag(memannot::TagLoanIntoVal);
+    return true;
+  }
+  if (&NewAI != &AI) {
+    Value *Ptr = &NewAI;
+    uint64_t Local = Field - Begin;
+    if (Local)
+      Ptr = B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), &NewAI, Local);
+    CB->setOperand(OpNo, Ptr);
+    return true;
+  }
+  return false;
+}
+
 /// Rewrite an alloca partition's users.
 ///
 /// This routine drives both of the rewriting goals of the SROA pass. It tries
@@ -6160,8 +6208,18 @@ SROA::rewritePartition(AllocaInst &AI, AllocaSlices &AS, Partition &P) {
     NewSelectsToRewrite.emplace_back(std::make_pair(Sel, *Ops));
   }
 
+  // [LLM-generated] M7.1b: do this for every partition, promoted or not. A
+  // later slice must not drop a fact an earlier slice already rewrote.
+  for (Use *U : AS.getDeadUsesIfPromotable())
+    rewriteLoanIntoUse(U, AI, *NewAI, PartitionTy, P.beginOffset(),
+                       P.endOffset(), Promotable);
+
   if (Promotable) {
     for (Use *U : AS.getDeadUsesIfPromotable()) {
+      auto *CB = dyn_cast<CallBase>(U->getUser());
+      if (CB && (memannot::isMemLoanIntoFact(CB) ||
+                 memannot::isMemLoanIntoValFact(CB)))
+        continue;
       auto *OldInst = dyn_cast<Instruction>(U->get());
       Value::dropDroppableUse(*U);
       if (OldInst)
@@ -6450,6 +6508,18 @@ bool SROA::splitAlloca(AllocaInst &AI, AllocaSlices &AS) {
       }
     }
     ++NumPartitions;
+  }
+
+  // [LLM-generated] M7.1b: a loan_into no partition rewrote still names the
+  // original alloca. Drop it once, as mem.loan_into.promoted, not mem.dropped.
+  for (Use *U : AS.getDeadUsesIfPromotable()) {
+    auto *CB = dyn_cast<CallBase>(U->getUser());
+    if (!CB || !memannot::isMemLoanIntoFact(CB))
+      continue;
+    int64_t Off = 0;
+    if (GetPointerBaseWithConstantOffset(U->get(), Off, DL) != &AI)
+      continue;
+    Value::dropDroppableUse(*U);
   }
 
   NumAllocaPartitions += NumPartitions;

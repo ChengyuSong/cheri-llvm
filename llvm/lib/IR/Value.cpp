@@ -239,9 +239,20 @@ void Value::dropDroppableUse(Use &U) {
   if (auto *II = dyn_cast<IntrinsicInst>(U.getUser());
       II && II->getIntrinsicID() == Intrinsic::mem_fact) {
     unsigned OpNo = U.getOperandNo();
-    U.set(PoisonValue::get(U.get()->getType()));
     CallInst::BundleOpInfo &BOI = II->getBundleOpInfoForOperand(OpNo);
-    BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag("mem.dropped");
+    // [LLM-generated] M7.1b: SROA calls this once per slice of the same alloca.
+    // The first call on mem.loan_into renames it to mem.loan_into.promoted.
+    // A later slice must not see that tag and rename it again to mem.dropped
+    // (InstCombine then deletes mem.dropped). A value-form fact's buffer
+    // operand is the promoted capability; do not poison it.
+    StringRef Cur = BOI.Tag->getKey();
+    if (Cur == memannot::TagLoanIntoVal)
+      return;
+    U.set(PoisonValue::get(U.get()->getType()));
+    StringRef NewTag = memannot::TagDropped;
+    if (Cur == memannot::TagLoanInto || Cur == memannot::TagLoanIntoPromoted)
+      NewTag = memannot::TagLoanIntoPromoted;
+    BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag(NewTag);
     return;
   }
   // [LLM-generated] M5r: a "mem.check" base whose object was promoted out of

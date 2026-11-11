@@ -1398,10 +1398,11 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
 
     // [LLM-generated] M5r: llvm.mem.fact only writes inaccessible memory, for
     // the same reason as assume; it must not bump the memory generation.
-    // M7.1a: mem.move clobbers its slot, so a load must not be forwarded
-    // across it. Fall through and let the normal write handling run.
+    // M7.1a/M7.1b: mem.move and mem.loan_into clobber their slot, so a load
+    // must not be forwarded across them. Fall through and let the normal
+    // write handling run.
     if (match(&Inst, m_Intrinsic<Intrinsic::mem_fact>()) &&
-        !memannot::isMemMoveFact(&Inst)) {
+        !memannot::slotClobber(&Inst)) {
       LLVM_DEBUG(dbgs() << "EarlyCSE skipping mem.fact: " << Inst << '\n');
       continue;
     }

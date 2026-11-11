@@ -25,6 +25,9 @@ define void @good(ptr %p, ptr %q, i64 %n, i64 %i) {
   ; R9 (D67): an inlined deallocator's free is kept on llvm.mem.fact.
   call void @llvm.mem.fact() [ "mem.free"(ptr %p) ]
   call void @llvm.mem.fact() [ "mem.move"(ptr %p) ]
+  call void @llvm.mem.fact() [ "mem.loan_into"(ptr %p, ptr %q, i64 3) ]
+  call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr %q, ptr %p, i64 3) ]
+  call void @llvm.mem.fact() [ "mem.loan_into.promoted"(ptr poison, ptr %q, i64 3) ]
   ret void
 }
 !0 = !{i64 7}
@@ -73,6 +76,12 @@ define void @bad(ptr %p, i64 %n, i64 %i) {
   call void @llvm.mem.fact() [ "mem.move"(i64 %n) ]
 ; CHECK: "mem.move" bundle must be (ptr slot) on llvm.mem.fact
   call void @free(ptr %p) [ "mem.move"(ptr %p) ]
+; CHECK: "mem.loan_into" bundle must be (ptr slot, ptr loan, i64 id) on llvm.mem.fact
+  call void @llvm.mem.fact() [ "mem.loan_into"(ptr %p, ptr %p) ]
+; CHECK: "mem.loan_into" bundle must be (ptr slot, ptr loan, i64 id) on llvm.mem.fact
+  call void @llvm.mem.fact() [ "mem.loan_into"(ptr %p, i64 %n, i64 1) ]
+; CHECK: "mem.loan_into" bundle must be (ptr slot, ptr loan, i64 id) on llvm.mem.fact
+  call void @free(ptr %p) [ "mem.loan_into"(ptr %p, ptr %p, i64 1) ]
   ret void
 }
 !0 = !{i64 7}

@@ -79,6 +79,16 @@ inline constexpr StringRef TagFree = "mem.free";
 /// not a loan id. Not droppable: losing it loses the clear. Generic passes
 /// must not sink it past a re-init or promote the slot out from under it.
 inline constexpr StringRef TagMove = "mem.move";
+/// [LLM-generated] M7.1b: "mem.loan_into"(ptr owner_ptr_field, ptr loan_val,
+/// i64 id) on llvm.mem.fact. The loan was stored into a heap container whose
+/// buffer pointer lives in this frame slot. The id matches !mem.last_use.
+/// Generic passes keep it. Promotion of the owner alloca rewrites it to
+/// "mem.loan_into.val"(ptr buf_cap, ptr loan_val, i64 id), the buffer
+/// capability in SSA at the fact. If that value cannot be recovered the tag
+/// becomes "mem.loan_into.promoted" and the late pass counts a skip.
+inline constexpr StringRef TagLoanInto = "mem.loan_into";
+inline constexpr StringRef TagLoanIntoVal = "mem.loan_into.val";
+inline constexpr StringRef TagLoanIntoPromoted = "mem.loan_into.promoted";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
@@ -182,6 +192,16 @@ inline bool isDroppableFactTag(StringRef Tag) {
 LLVM_ABI bool isMemFact(const Instruction *I);
 /// [LLM-generated] M7.1a: llvm.mem.fact ["mem.move"(ptr slot)].
 LLVM_ABI bool isMemMoveFact(const Instruction *I);
+/// [LLM-generated] M7.1b: llvm.mem.fact ["mem.loan_into"(ptr slot, ptr val, i64 id)].
+LLVM_ABI bool isMemLoanIntoFact(const Instruction *I);
+/// [LLM-generated] M7.1b: "mem.loan_into.val"(ptr buf_cap, ptr val, i64 id).
+/// The owner slot was promoted; \c buf_cap is the buffer pointer itself.
+LLVM_ABI bool isMemLoanIntoValFact(const Instruction *I);
+/// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
+/// Header copies must not be reordered across that program point.
+LLVM_ABI const Value *slotClobber(const Instruction *I);
+/// The i64 loan id of a mem.loan_into fact, as a packed LoanRef.
+LLVM_ABI void appendLoanIntoRefs(const CallBase &CB, SmallVectorImpl<LoanRef> &Out);
 /// llvm.mem.claim call (value-returning claim, D11).
 LLVM_ABI bool isMemClaim(const Value *V);
 /// Deallocation call that may carry a "mem.free" bundle: allockind("free"),
