@@ -188,8 +188,9 @@ struct Inv {
            AsmNoEscape = 0;
   // M6.1 D90: register clears emitted, by kind.
   unsigned CapRegLoan = 0, CapRegFree = 0, CapRegScope = 0;
-  // M7.1a: source slots nulled at a "mem.move" fact.
-  unsigned MoveNulls = 0;
+  // M7.1a: source slots nulled at a "mem.move" fact, and facts skipped
+  // because the slot may still be read after the fact.
+  unsigned MoveNulls = 0, MoveNullSkippedLive = 0;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -895,32 +896,30 @@ struct Inv {
     return false;
   }
   // Last write of the slot in this block before the fact, if that write is
-  // not followed by a move-out. A move-out is a load of the slot (Box: the
-  // fact follows the load), a call that takes the slot (Vec: the fact follows
-  // that call), or any use of the stored value. A store with none of those
-  // still occupies the slot at the fact: a re-init the fact was sunk past.
-  // Nulling it would destroy a live value. No store in this block is not a
-  // re-init (the owner store may be in a predecessor; the fact is trusted).
+  // not followed by a move-out of the slot itself. A move-out is a load of
+  // the slot (Box: the fact follows the load) or a call that takes the slot
+  // (Vec: the fact follows that call, including a memcpy that copies it out).
+  // A later use of the value that was stored is not a move-out: that SSA
+  // value can still be live while the slot is copied (from_elem fills the
+  // buffer from the same cap it stored). Treating it as one justified a null
+  // of a slot the memcpy had not read yet. A store with no slot move-out
+  // still occupies the slot at the fact. No store in this block is not a
+  // re-init (the owner store may be in a predecessor).
   bool reinitBefore(Instruction *Fact, AllocaInst *A, int64_t Off) const {
     Instruction *Last = nullptr;
-    Value *Stored = nullptr;
     for (Instruction &I : *Fact->getParent()) {
       if (&I == Fact)
         break;
       Value *Ptr = nullptr;
-      Value *Val = nullptr;
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (auto *SI = dyn_cast<StoreInst>(&I))
         Ptr = SI->getPointerOperand();
-        Val = SI->getValueOperand();
-      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+      else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
         Ptr = RMW->getPointerOperand();
-      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+      else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I))
         Ptr = CX->getPointerOperand();
-      }
       if (!Ptr || !isThisSlot(Ptr, A, Off))
         continue;
       Last = &I;
-      Stored = Val;
     }
     if (!Last)
       return false;
@@ -933,13 +932,140 @@ struct Inv {
           return false;
       if (callTakesSlot(I, A, Off))
         return false;
-      if (!Stored)
-        continue;
-      for (Value *Op : I->operands())
-        if (Op == Stored)
-          return false;
     }
     return true;
+  }
+  // Pointer into A, or the address of A itself. A loaded capability is not
+  // this: getUnderlyingObject does not look through the load.
+  bool derivedFrom(const Value *P, const AllocaInst *A) const {
+    return P && P->getType()->isPointerTy() && getUnderlyingObject(P) == A;
+  }
+  // [Start, Start+Len) overlaps the 16 bytes this fact would null. An unknown
+  // length or a non-constant offset into A may overlap.
+  bool overlapsNull(const Value *P, const AllocaInst *A, int64_t Off,
+                    std::optional<uint64_t> Len) const {
+    if (!derivedFrom(P, A))
+      return false;
+    int64_t O = 0;
+    if (GetPointerBaseWithConstantOffset(P, O, DL) != A)
+      return true;
+    if (O >= Off + 16)
+      return false;
+    if (!Len)
+      return true;
+    return O + (int64_t)*Len > Off;
+  }
+  bool coversNull(const Value *P, const AllocaInst *A, int64_t Off,
+                  uint64_t Len) const {
+    if (!derivedFrom(P, A))
+      return false;
+    int64_t O = 0;
+    if (GetPointerBaseWithConstantOffset(P, O, DL) != A)
+      return false;
+    return O <= Off && O + (int64_t)Len >= Off + 16;
+  }
+  static std::optional<uint64_t> constLen(const Value *V) {
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      if (C->getBitWidth() <= 64)
+        return C->getZExtValue();
+    return std::nullopt;
+  }
+  // A memory read of the nulled bytes, or a use that can still observe them:
+  // load, memcpy/memmove source, a call taking the slot or a pointer derived
+  // from it, or an escaping store/return of that address.
+  bool readsSlot(const Instruction *I, AllocaInst *A, int64_t Off) const {
+    if (isa<DbgInfoIntrinsic>(I))
+      return false;
+    if (auto *MT = dyn_cast<MemTransferInst>(I))
+      return overlapsNull(MT->getRawSource(), A, Off, constLen(MT->getLength()));
+    if (isa<MemSetInst>(I))
+      return false;
+    auto Sized = [&](Type *Ty) -> std::optional<uint64_t> {
+      TypeSize Sz = DL.getTypeStoreSize(Ty);
+      if (Sz.isScalable())
+        return std::nullopt;
+      return Sz.getFixedValue();
+    };
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      return overlapsNull(LI->getPointerOperand(), A, Off, Sized(LI->getType()));
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
+      return overlapsNull(RMW->getPointerOperand(), A, Off,
+                          Sized(RMW->getValOperand()->getType()));
+    if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I))
+      return overlapsNull(CX->getPointerOperand(), A, Off,
+                          Sized(CX->getCompareOperand()->getType()));
+    if (auto *SI = dyn_cast<StoreInst>(I))
+      return derivedFrom(SI->getValueOperand(), A);
+    if (auto *RI = dyn_cast<ReturnInst>(I))
+      return RI->getReturnValue() && derivedFrom(RI->getReturnValue(), A);
+    if (auto *CB = dyn_cast<CallBase>(I)) {
+      if (memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+        return false;
+      for (const Value *Arg : CB->args())
+        if (derivedFrom(Arg, A))
+          return true;
+    }
+    return false;
+  }
+  // A write that replaces every byte the null would clear. Later reads see
+  // the new value. An unknown size is not a re-init.
+  bool reinitsSlot(const Instruction *I, AllocaInst *A, int64_t Off) const {
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      if (derivedFrom(SI->getValueOperand(), A))
+        return false;
+      TypeSize Sz = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+      if (Sz.isScalable())
+        return false;
+      return coversNull(SI->getPointerOperand(), A, Off, Sz.getFixedValue());
+    }
+    if (auto *MS = dyn_cast<MemSetInst>(I)) {
+      auto N = constLen(MS->getLength());
+      return N && coversNull(MS->getRawDest(), A, Off, *N);
+    }
+    if (auto *MT = dyn_cast<MemTransferInst>(I)) {
+      if (overlapsNull(MT->getRawSource(), A, Off, constLen(MT->getLength())))
+        return false;
+      auto N = constLen(MT->getLength());
+      return N && coversNull(MT->getRawDest(), A, Off, *N);
+    }
+    return false;
+  }
+  // True when a read of the slot can still happen after Fact and before a
+  // store that covers the nulled bytes. The rest of the block is scanned, then
+  // every successor. A backedge to this block is a read we cannot see from
+  // the fact forward, so it counts.
+  bool slotReadAfter(Instruction *Fact, AllocaInst *A, int64_t Off) const {
+    Instruction *Start = Fact->getNextNode();
+    if (!Start)
+      return false;
+    BasicBlock *FactBB = Fact->getParent();
+    SmallPtrSet<BasicBlock *, 8> Queued;
+    SmallVector<std::pair<BasicBlock *, Instruction *>, 8> WL;
+    Queued.insert(FactBB);
+    WL.push_back({FactBB, Start});
+    while (!WL.empty()) {
+      auto [BB, From] = WL.pop_back_val();
+      bool Reinit = false;
+      for (Instruction *I = From; I; I = I->getNextNode()) {
+        if (readsSlot(I, A, Off))
+          return true;
+        if (reinitsSlot(I, A, Off)) {
+          Reinit = true;
+          break;
+        }
+      }
+      if (Reinit)
+        continue;
+      for (BasicBlock *S : successors(BB)) {
+        if (!Queued.insert(S).second) {
+          if (S == FactBB)
+            return true;
+          continue;
+        }
+        WL.push_back({S, &*S->begin()});
+      }
+    }
+    return false;
   }
   // Capability still holding the moved-from value. Prefer the latest load of
   // the slot before the fact (the reload that was moved), else the value of
@@ -1013,7 +1139,10 @@ struct Inv {
   //
   // Ignored when the operand is not a constant-offset frame slot, the slot's
   // lifetime has already ended, or the same block re-initialized it before
-  // the fact (reinitBefore). A re-init store after the fact overwrites the null.
+  // the fact (reinitBefore). A read of the slot after the fact and before a
+  // covering store (memcpy source, load, call, escape, or a successor) skips
+  // the null: the fact was emitted too early. A re-init store after the fact
+  // overwrites the null.
   void moveClears(Function &F, DominatorTree &DT) {
     struct Act {
       CallBase *Fact;
@@ -1034,7 +1163,14 @@ struct Inv {
       int64_t Off = 0;
       if (!frameSlot(P, A, Off) || !DL.isFatPointer(P->getType()))
         continue;
-      if (!liveAt(A, CB, DT) || reinitBefore(CB, A, Off))
+      if (!liveAt(A, CB, DT))
+        continue;
+      // A later read wins over any earlier "move-out". The slot is still live.
+      if (slotReadAfter(CB, A, Off)) {
+        ++MoveNullSkippedLive;
+        continue;
+      }
+      if (reinitBefore(CB, A, Off))
         continue;
       Value *Cap = moveCap(CB, A, Off, DT);
       Acts.push_back({CB, P, Cap, invalidateAt(Cap, CB)});
@@ -1648,7 +1784,7 @@ struct Inv {
          << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall
          << " capreg_loan=" << CapRegLoan << " capreg_free=" << CapRegFree
          << " capreg_scope=" << CapRegScope << " move_nulls=" << MoveNulls
-         << "\n";
+         << " move_null_skipped_live=" << MoveNullSkippedLive << "\n";
     }
   }
 };

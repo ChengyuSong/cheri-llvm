@@ -26,6 +26,7 @@ declare void @g()
 declare void @llvm.lifetime.start.p200(ptr addrspace(200))
 declare void @llvm.lifetime.end.p200(ptr addrspace(200))
 declare void @llvm.mem.fact()
+declare void @llvm.memcpy.p200.p200.i64(ptr addrspace(200), ptr addrspace(200), i64, i1)
 
 ; Box. Address-taken local, then load, fact, call. The call still receives
 ; the loaded owner. The null is between the fact and that call.
@@ -221,6 +222,68 @@ define void @ended(ptr addrspace(200) %p) {
 ; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
 ; CHECK: ret void
 
+; Fact before the memcpy that still reads the slot. The use of the stored
+; cap must not count as a move-out. No null; the skip is counted.
+define void @move_before_copy(ptr addrspace(200) %p, ptr addrspace(200) %dst) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %p, ptr addrspace(200) %s, align 16
+  call void @eat_box(ptr addrspace(200) %p)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %dst, ptr addrspace(200) %s, i64 48, i1 false)
+  ret void
+}
+; CHECK-LABEL: define void @move_before_copy(
+; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK: call {{.*}}@llvm.memcpy
+; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK: ret void
+
+; The copy has already read the slot. The fact after it may null.
+define void @move_after_copy(ptr addrspace(200) %p, ptr addrspace(200) %dst) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %p, ptr addrspace(200) %s, align 16
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %dst, ptr addrspace(200) %s, i64 48, i1 false)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
+  ret void
+}
+; CHECK-LABEL: define void @move_after_copy(
+; CHECK: call {{.*}}@llvm.memcpy
+; CHECK-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %s, align 16
+; CHECK-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p, i32 0)
+; CHECK: ret void
+
+; Fact before a load of the same slot. The load still needs the old bytes.
+define void @move_before_load(ptr addrspace(200) %p) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %p, ptr addrspace(200) %s, align 16
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
+  %b = load ptr addrspace(200), ptr addrspace(200) %s, align 16
+  call void @eat_box(ptr addrspace(200) %b)
+  ret void
+}
+; CHECK-LABEL: define void @move_before_load(
+; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK: %b = load ptr addrspace(200), ptr addrspace(200) %s, align 16
+; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK: ret void
+
+; Using the stored capability is not a move-out of the slot. With no later
+; read of the slot, the fact is not a null either.
+define void @stored_cap_use(ptr addrspace(200) %p) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %p, ptr addrspace(200) %s, align 16
+  call void @eat_box(ptr addrspace(200) %p)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
+  call void @g()
+  ret void
+}
+; CHECK-LABEL: define void @stored_cap_use(
+; CHECK: call {{.*}}@eat_box(ptr addrspace(200) %p)
+; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK: ret void
+
 ; CHECK: [[PMV]] = !{!"cheri_inv_move"}
-; basic, vec, escaped, reinit_after, field.
-; STATS: move_nulls=5
+; basic, vec, escaped, reinit_after, field, move_after_copy.
+; move_before_copy and move_before_load are the live skips.
+; STATS: move_nulls=6
+; STATS: move_null_skipped_live=2
