@@ -34,6 +34,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
@@ -294,6 +295,9 @@ instructionClobbersQuery(const MemoryDef *MD, const MemoryLocation &UseLoc,
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r
+      // M7.1a: mem.move clobbers its slot. Other facts are still markers.
+      if (memannot::isMemMoveFact(DefInst))
+        break;
       return false;
     case Intrinsic::dbg_declare:
     case Intrinsic::dbg_label:
@@ -1778,6 +1782,9 @@ MemoryUseOrDef *MemorySSA::createNewAccess(Instruction *I,
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r: like assume, no access
+      // M7.1a: mem.move is a real def of its slot so memcpy forwarding sees it.
+      if (memannot::isMemMoveFact(I))
+        break;
       return nullptr;
     }
   }

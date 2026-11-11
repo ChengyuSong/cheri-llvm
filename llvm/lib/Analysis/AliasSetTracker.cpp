@@ -18,6 +18,7 @@
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -357,6 +358,12 @@ void AliasSetTracker::addUnknown(Instruction *Inst) {
     case Intrinsic::sideeffect:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r
+      // M7.1a: record the slot, not an unknown access to all memory.
+      if (memannot::isMemMoveFact(II))
+        if (auto OB = II->getOperandBundle(memannot::TagMove))
+          if (!OB->Inputs.empty() && OB->Inputs[0]->getType()->isPointerTy())
+            addMemoryLocation(MemoryLocation::getBeforeOrAfter(OB->Inputs[0]),
+                              AliasSet::ModRefAccess);
       return;
     }
   }
