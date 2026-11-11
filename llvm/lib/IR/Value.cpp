@@ -241,7 +241,13 @@ void Value::dropDroppableUse(Use &U) {
     unsigned OpNo = U.getOperandNo();
     U.set(PoisonValue::get(U.get()->getType()));
     CallInst::BundleOpInfo &BOI = II->getBundleOpInfoForOperand(OpNo);
-    BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag("mem.dropped");
+    // [LLM-generated] M7.1b: promoting the owner slot drops a loan_into fact
+    // (there is no slot left to re-read) but keeps a distinct tag so the late
+    // pass can count it. Other facts still become "mem.dropped".
+    StringRef NewTag = BOI.Tag->getKey() == memannot::TagLoanInto
+                           ? memannot::TagLoanIntoPromoted
+                           : memannot::TagDropped;
+    BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag(NewTag);
     return;
   }
   // [LLM-generated] M5r: a "mem.check" base whose object was promoted out of

@@ -13,6 +13,11 @@
 //   * M7.1a: llvm.mem.fact ["mem.move"(ptr Slot)] nulls that frame slot and
 //     clears a capability register still holding the moved-from value. The
 //     slot may have escaped. The free-log loop is not involved.
+//   * M7.1b: llvm.mem.fact ["mem.loan_into"(ptr Slot, ptr Loan, i64 Id)] at a
+//     last use of Id re-reads Slot and, when that buffer is still live,
+//     nulls each 16-byte element exactly equal to Loan. The scan is a loop
+//     in this function. A promoted slot keeps a "mem.loan_into.promoted"
+//     marker and is counted, not scanned.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
 // or a '+'-list (e.g. scope+free, the R4 "all").
@@ -191,6 +196,17 @@ struct Inv {
   // M7.1a: source slots nulled at a "mem.move" fact, and facts skipped
   // because the slot may still be read after the fact.
   unsigned MoveNulls = 0, MoveNullSkippedLive = 0;
+  // M7.1b: heap loans. nulls is the number of null stores emitted (one per
+  // scan loop), not the number of elements a run of the loop clears.
+  unsigned LoanIntoFacts = 0, LoanIntoScans = 0, LoanIntoNulls = 0;
+  unsigned LoanIntoSkippedFreed = 0, LoanIntoSkippedMoved = 0;
+  unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
+  struct LoanIntoScan {
+    Instruction *At;
+    Value *Slot;
+    Value *Loan;
+  };
+  SmallVector<LoanIntoScan, 4> PendingLoanInto;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -1179,6 +1195,219 @@ struct Inv {
     }
   }
 
+  // [LLM-generated] M7.1b. A mem.loan_into fact is live at a last use of its id
+  // when the fact dominates that point, the owner slot's lifetime has not
+  // ended, no mem.move of the slot sits between them, and the buffer currently
+  // in the slot was not passed to mem.free without a later store. The scan
+  // re-reads the slot (grow/realloc) and walks [base, base+length) by 16.
+  bool dominatesBetween(Instruction *From, Instruction *Mid, Instruction *To,
+                        DominatorTree &DT) const {
+    return From != Mid && Mid != To && DT.dominates(From, Mid) &&
+           DT.dominates(Mid, To);
+  }
+  bool loadFromSlot(Value *P, AllocaInst *A, int64_t Off) const {
+    SmallPtrSet<Value *, 8> Seen;
+    SmallVector<Value *, 4> Work{P};
+    while (!Work.empty()) {
+      Value *X = Work.pop_back_val()->stripPointerCasts();
+      if (!Seen.insert(X).second)
+        continue;
+      if (auto *L = dyn_cast<LoadInst>(X))
+        if (isThisSlot(L->getPointerOperand(), A, Off))
+          return true;
+      if (auto *G = dyn_cast<GetElementPtrInst>(X))
+        Work.push_back(G->getPointerOperand());
+    }
+    return false;
+  }
+  bool storeToSlotBetween(Instruction *From, Instruction *To, AllocaInst *A,
+                          int64_t Off, DominatorTree &DT) const {
+    for (Instruction &I : instructions(*From->getFunction())) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !isThisSlot(SI->getPointerOperand(), A, Off))
+        continue;
+      if (dominatesBetween(From, SI, To, DT))
+        return true;
+    }
+    return false;
+  }
+  // The value in the slot at Free was passed to this mem.free, and nothing
+  // stored a new buffer before the last use.
+  bool freesThisBuffer(CallBase *Free, AllocaInst *A, int64_t Off,
+                       Instruction *At, DominatorTree &DT) const {
+    auto OB = Free->getOperandBundle(memannot::TagFree);
+    if (!OB || OB->Inputs.empty())
+      return false;
+    Value *P = OB->Inputs[0];
+    bool This = loadFromSlot(P, A, Off);
+    if (!This)
+      for (User *U : P->users()) {
+        auto *SI = dyn_cast<StoreInst>(U);
+        if (!SI || SI->getValueOperand() != P)
+          continue;
+        if (!isThisSlot(SI->getPointerOperand(), A, Off))
+          continue;
+        if (!DT.dominates(SI, Free))
+          continue;
+        if (!storeToSlotBetween(SI, Free, A, Off, DT))
+          This = true;
+      }
+    return This && !storeToSlotBetween(Free, At, A, Off, DT);
+  }
+  bool loanValAvailable(Value *V, Instruction *At, DominatorTree &DT) const {
+    if (!V || isa<UndefValue>(V) || !V->getType()->isPointerTy())
+      return false;
+    if (auto *I = dyn_cast<Instruction>(V))
+      return DT.dominates(I, At);
+    return true;
+  }
+  void loanIntoPlan(Function &F, DominatorTree &DT) {
+    unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
+    SmallVector<Instruction *, 8> Carriers;
+    for (Instruction &I : instructions(F)) {
+      if (I.isTerminator())
+        continue;
+      bool Meta = I.getMetadata(LUKind);
+      SmallVector<memannot::LoanRef, 2> Bundle;
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB))
+          memannot::appendBundleLoanRefs(*CB, Bundle);
+      if ((Meta || !Bundle.empty()) && I.getNextNode())
+        Carriers.push_back(&I);
+    }
+    SmallVector<CallBase *, 4> Facts, Moves, Frees;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (memannot::isMemLoanIntoFact(CB))
+        Facts.push_back(CB);
+      else if (memannot::isMemMoveFact(CB))
+        Moves.push_back(CB);
+      if (CB->getOperandBundle(memannot::TagFree))
+        Frees.push_back(CB);
+    }
+    for (CallBase *Fact : Facts) {
+      auto OB = Fact->getOperandBundle(memannot::TagLoanInto);
+      if (!OB || OB->Inputs.size() < 3)
+        continue;
+      Value *Slot = OB->Inputs[0];
+      Value *Loan = OB->Inputs[1];
+      auto *IdC = dyn_cast<ConstantInt>(OB->Inputs[2]);
+      if (!IdC || !IdC->getType()->isIntegerTy(64))
+        continue;
+      uint64_t Id = IdC->getZExtValue();
+      memannot::LoanRef Ref{Id & memannot::LoanKeyMask, Id, 0};
+      AllocaInst *A = nullptr;
+      int64_t Off = 0;
+      if (!frameSlot(Slot, A, Off))
+        continue;
+      for (Instruction *C : Carriers) {
+        SmallVector<memannot::LoanRef, 4> Ids;
+        memannot::appendLoanRefs(C->getMetadata(LUKind), Ids);
+        if (auto *CB = dyn_cast<CallBase>(C))
+          if (memannot::isMemFact(CB))
+            memannot::appendBundleLoanRefs(*CB, Ids);
+        if (!refsOverlap(ArrayRef<memannot::LoanRef>(Ref), Ids))
+          continue;
+        Instruction *At = C->getNextNode();
+        if (!DT.dominates(Fact, At))
+          continue;
+        if (!liveAt(A, At, DT))
+          continue;
+        bool Moved = false;
+        for (CallBase *Mv : Moves) {
+          auto MB = Mv->getOperandBundle(memannot::TagMove);
+          if (!MB || MB->Inputs.empty() ||
+              !isThisSlot(MB->Inputs[0], A, Off))
+            continue;
+          if (dominatesBetween(Fact, Mv, At, DT))
+            Moved = true;
+        }
+        if (Moved) {
+          ++LoanIntoSkippedMoved;
+          continue;
+        }
+        bool Freed = false;
+        for (CallBase *Fr : Frees)
+          if (dominatesBetween(Fact, Fr, At, DT) &&
+              freesThisBuffer(Fr, A, Off, At, DT))
+            Freed = true;
+        if (Freed) {
+          ++LoanIntoSkippedFreed;
+          continue;
+        }
+        if (!loanValAvailable(Loan, At, DT)) {
+          ++LoanIntoSkippedNoval;
+          continue;
+        }
+        PendingLoanInto.push_back({At, Slot, Loan});
+      }
+    }
+  }
+  // In-function loop, not an out-of-line helper. One static null store.
+  void loanIntoEmit() {
+    Type *CapTy = PointerType::get(M.getContext(), 200);
+    for (const LoanIntoScan &S : PendingLoanInto) {
+      Instruction *At = S.At;
+      if (!At || !At->getParent())
+        continue;
+      BasicBlock *Cont =
+          SplitBlock(At->getParent(), At->getIterator(),
+                     static_cast<DominatorTree *>(nullptr), nullptr, nullptr,
+                     "loaninto.cont");
+      BasicBlock *Pre = Cont->getSinglePredecessor();
+      Pre->getTerminator()->eraseFromParent();
+      LLVMContext &Ctx = M.getContext();
+      Function *Fn = Cont->getParent();
+      auto *Hdr = BasicBlock::Create(Ctx, "loaninto.hdr", Fn, Cont);
+      auto *Loop = BasicBlock::Create(Ctx, "loaninto.loop", Fn, Cont);
+      auto *Body = BasicBlock::Create(Ctx, "loaninto.body", Fn, Cont);
+      auto *NullBB = BasicBlock::Create(Ctx, "loaninto.null", Fn, Cont);
+      auto *Next = BasicBlock::Create(Ctx, "loaninto.next", Fn, Cont);
+      IRBuilder<> B(Pre);
+      Value *Buf = B.CreateAlignedLoad(CapTy, S.Slot, Align(16), "loaninto.buf");
+      Value *Tag = B.CreateCall(decl(Intrinsic::cheri_cap_tag_get), {Buf});
+      Value *Live = B.CreateAnd(
+          Tag, B.CreateICmpNE(Buf, ConstantPointerNull::get(cast<PointerType>(CapTy))));
+      B.CreateCondBr(Live, Hdr, Cont);
+      B.SetInsertPoint(Hdr);
+      Value *Base = B.CreateCall(
+          decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}), {Buf});
+      Value *AtBase = B.CreateCall(
+          decl(Intrinsic::cheri_cap_address_set, {B.getInt64Ty()}),
+          {Buf, Base});
+      Value *Len = B.CreateCall(
+          decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}), {Buf});
+      Value *N = B.CreateLShr(Len, B.getInt64(4), "loaninto.n");
+      B.CreateBr(Loop);
+      B.SetInsertPoint(Loop);
+      PHINode *IV = B.CreatePHI(B.getInt64Ty(), 2, "loaninto.i");
+      IV->addIncoming(B.getInt64(0), Hdr);
+      B.CreateCondBr(B.CreateICmpULT(IV, N), Body, Cont);
+      B.SetInsertPoint(Body);
+      Value *Byte = B.CreateShl(IV, B.getInt64(4));
+      Value *Elt = B.CreateInBoundsGEP(B.getInt8Ty(), AtBase, Byte, "loaninto.elt");
+      Value *Got = B.CreateAlignedLoad(CapTy, Elt, Align(16), "loaninto.eltv");
+      Value *Eq = B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact),
+                               {Got, S.Loan});
+      B.CreateCondBr(Eq, NullBB, Next);
+      B.SetInsertPoint(NullBB);
+      auto *St = B.CreateAlignedStore(
+          ConstantPointerNull::get(cast<PointerType>(CapTy)), Elt, Align(16),
+          InvVolatile);
+      markClear(St, "cheri_inv_loan_into");
+      B.CreateBr(Next);
+      ++LoanIntoNulls;
+      B.SetInsertPoint(Next);
+      Value *Inc = B.CreateAdd(IV, B.getInt64(1));
+      B.CreateBr(Loop);
+      IV->addIncoming(Inc, Next);
+      ++LoanIntoScans;
+    }
+    PendingLoanInto.clear();
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -1622,15 +1851,24 @@ struct Inv {
     // M7.1a: a move fact is cleared even when this function has no other
     // capability slot for the range checks.
     bool HasMove = false;
+    bool HasLoanInto = false;
     if (Loan)
-      for (Instruction &I : instructions(F))
-        if (memannot::isMemMoveFact(&I)) {
+      for (Instruction &I : instructions(F)) {
+        if (memannot::isMemMoveFact(&I))
           HasMove = true;
-          break;
-        }
+        if (memannot::isMemLoanIntoFact(&I)) {
+          ++LoanIntoFacts;
+          HasLoanInto = true;
+        } else if (auto *CB = dyn_cast<CallBase>(&I))
+          if (memannot::isMemFact(CB) &&
+              CB->getOperandBundle(memannot::TagLoanIntoPromoted))
+            ++LoanIntoSkippedPromoted;
+      }
     bool RegFree = InvCapReg && (Free || AFLog);
     bool RegScope = InvCapReg && Scope;
-    if (CapSlots.empty() && !RegFree && !RegScope && !HasMove)
+    // M7.1b: a loan_into fact is scanned even when this function has no other
+    // frame capability slot. A promoted marker is only counted.
+    if (CapSlots.empty() && !RegFree && !RegScope && !HasMove && !HasLoanInto)
       return;
     DominatorTree DT(F);
     buildCallReach(F);
@@ -1642,6 +1880,10 @@ struct Inv {
     // Before flogCalls: that splits blocks. The free-log loop is unchanged.
     if (HasMove)
       moveClears(F, DT);
+    // Plan while the CFG (and DT) still match the incoming IR. Emit after
+    // flogCalls, which splits blocks; the carrier's next instruction stays.
+    if (Loan && HasLoanInto)
+      loanIntoPlan(F, DT);
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -1733,7 +1975,9 @@ struct Inv {
         clearFreedReg(C, C->getNextNode());
       }
     if (FLog && !CapSlots.empty())
-      flogCalls(F, CapSlots, DT); // last: it splits blocks
+      flogCalls(F, CapSlots, DT); // last DT user: it splits blocks
+    if (Loan && !PendingLoanInto.empty())
+      loanIntoEmit();
   }
 
   void run() {
@@ -1764,7 +2008,14 @@ struct Inv {
          << " aflog_skip_free=" << AFLogSkipFree << " aflog_skip_call=" << AFLogSkipCall
          << " capreg_loan=" << CapRegLoan << " capreg_free=" << CapRegFree
          << " capreg_scope=" << CapRegScope << " move_nulls=" << MoveNulls
-         << " move_null_skipped_live=" << MoveNullSkippedLive << "\n";
+         << " move_null_skipped_live=" << MoveNullSkippedLive
+         << " loan_into_facts=" << LoanIntoFacts
+         << " loan_into_scans=" << LoanIntoScans
+         << " loan_into_nulls=" << LoanIntoNulls
+         << " loan_into_skipped_freed=" << LoanIntoSkippedFreed
+         << " loan_into_skipped_moved=" << LoanIntoSkippedMoved
+         << " loan_into_skipped_promoted=" << LoanIntoSkippedPromoted
+         << " loan_into_skipped_noval=" << LoanIntoSkippedNoval << "\n";
     }
   }
 };

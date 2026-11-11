@@ -1248,7 +1248,10 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
       // [LLM-generated] M7.1a: "mem.move" is the program point of a clear.
       // Hoisting it nulls a still-live slot; sinking it can land past a
       // re-init. Other facts stay assume-like.
-      if (CI->getOperandBundle(memannot::TagMove))
+      // M7.1b: mem.loan_into is the program point of a heap loan. Hoisting
+      // it scans the wrong buffer; sinking it can land past the last use.
+      if (CI->getOperandBundle(memannot::TagMove) ||
+          CI->getOperandBundle(memannot::TagLoanInto))
         return false;
       return true;
     }
@@ -2119,10 +2122,11 @@ bool llvm::promoteLoopAccessesToScalars(
               Store->getAlign(),
               SimplifyQuery(MDL, TLI, DT, AC, Preheader->getTerminator()));
         }
-      } else if (memannot::isMemMoveFact(UI)) {
-        // [LLM-generated] M7.1a: this fact names the slot. Promoting the
-        // loop's loads and stores would sink a store of the moved-from
-        // value to the exit, after the clear.
+      } else if (memannot::isMemMoveFact(UI) ||
+                 memannot::isMemLoanIntoFact(UI)) {
+        // [LLM-generated] M7.1a/M7.1b: this fact names the slot. Promoting
+        // the loop's loads and stores would sink a store of the value to
+        // the exit, after the fact.
         return false;
       } else
         continue; // Not a load or store.

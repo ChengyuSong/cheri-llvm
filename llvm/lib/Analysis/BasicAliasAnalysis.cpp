@@ -942,13 +942,14 @@ ModRefInfo BasicAAResult::getModRefInfo(const CallBase *Call,
   // read would not. Other mem.fact bundles stay inaccessible-only: the
   // intrinsic's memory effects are unchanged, and this return happens before
   // that early exit.
-  if (memannot::isMemMoveFact(Call)) {
-    auto OB = Call->getOperandBundle(memannot::TagMove);
-    if (OB && !OB->Inputs.empty() && OB->Inputs[0]->getType()->isPointerTy()) {
-      MemoryLocation SlotLoc = MemoryLocation::getBeforeOrAfter(OB->Inputs[0]);
-      if (AAQI.AAR.alias(SlotLoc, Loc, AAQI, Call) != AliasResult::NoAlias)
-        return ModRefInfo::ModRef;
-    }
+  // M7.1b: mem.loan_into names the owner's buffer-pointer field. Header
+  // loads, stores, and copies must not move across it; the late scan re-reads
+  // that field. Same ModRef as mem.move, and the same early return so other
+  // mem.fact bundles stay inaccessible-only.
+  if (const Value *Slot = memannot::slotClobber(Call)) {
+    MemoryLocation SlotLoc = MemoryLocation::getBeforeOrAfter(Slot);
+    if (AAQI.AAR.alias(SlotLoc, Loc, AAQI, Call) != AliasResult::NoAlias)
+      return ModRefInfo::ModRef;
     return ModRefInfo::NoModRef;
   }
 

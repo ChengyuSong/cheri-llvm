@@ -29,6 +29,38 @@ bool memannot::isMemMoveFact(const Instruction *I) {
   return CB && isMemFact(CB) && CB->getOperandBundle(TagMove);
 }
 
+bool memannot::isMemLoanIntoFact(const Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  return CB && isMemFact(CB) && CB->getOperandBundle(TagLoanInto);
+}
+
+const Value *memannot::slotClobber(const Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  if (!CB || !isMemFact(CB))
+    return nullptr;
+  auto SlotOf = [&](StringRef Tag) -> const Value * {
+    auto OB = CB->getOperandBundle(Tag);
+    if (OB && !OB->Inputs.empty() && OB->Inputs[0]->getType()->isPointerTy())
+      return OB->Inputs[0];
+    return nullptr;
+  };
+  if (const Value *S = SlotOf(TagMove))
+    return S;
+  return SlotOf(TagLoanInto);
+}
+
+void memannot::appendLoanIntoRefs(const CallBase &CB,
+                                  SmallVectorImpl<LoanRef> &Out) {
+  auto OB = CB.getOperandBundle(TagLoanInto);
+  if (!OB || OB->Inputs.size() < 3)
+    return;
+  auto *C = dyn_cast<ConstantInt>(OB->Inputs[2]);
+  if (!C || C->getBitWidth() != 64)
+    return;
+  uint64_t Id = C->getZExtValue();
+  Out.push_back(LoanRef{Id & LoanKeyMask, Id, 0});
+}
+
 bool memannot::hasMemCheck(const CallBase &CB) {
   return CB.getOperandBundle(TagCheck).has_value();
 }

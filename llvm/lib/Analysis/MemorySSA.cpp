@@ -295,8 +295,9 @@ instructionClobbersQuery(const MemoryDef *MD, const MemoryLocation &UseLoc,
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r
-      // M7.1a: mem.move clobbers its slot. Other facts are still markers.
-      if (memannot::isMemMoveFact(DefInst))
+      // M7.1a/M7.1b: mem.move and mem.loan_into clobber their slot. Other
+      // facts are still markers.
+      if (memannot::slotClobber(DefInst))
         break;
       return false;
     case Intrinsic::dbg_declare:
@@ -1782,8 +1783,9 @@ MemoryUseOrDef *MemorySSA::createNewAccess(Instruction *I,
     case Intrinsic::experimental_noalias_scope_decl:
     case Intrinsic::pseudoprobe:
     case Intrinsic::mem_fact: // [LLM-generated] M5r: like assume, no access
-      // M7.1a: mem.move is a real def of its slot so memcpy forwarding sees it.
-      if (memannot::isMemMoveFact(I))
+      // M7.1a/M7.1b: mem.move and mem.loan_into are real defs of their slot
+      // so memcpy forwarding sees them.
+      if (memannot::slotClobber(I))
         break;
       return nullptr;
     }

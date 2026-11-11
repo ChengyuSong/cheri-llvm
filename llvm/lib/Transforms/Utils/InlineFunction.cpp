@@ -2073,6 +2073,7 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
       if (memannot::isMemFact(CB)) {
         SmallVector<memannot::LoanRef, 4> Refs;
         memannot::appendBundleLoanRefs(*CB, Refs);
+        memannot::appendLoanIntoRefs(*CB, Refs);
         for (const memannot::LoanRef &R : Refs)
           note(R);
       }
@@ -2139,6 +2140,7 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
         if (memannot::isMemFact(CB)) {
           SmallVector<memannot::LoanRef, 4> Refs;
           memannot::appendBundleLoanRefs(*CB, Refs);
+          memannot::appendLoanIntoRefs(*CB, Refs);
           for (const memannot::LoanRef &R : Refs)
             classify(R);
         }
@@ -2220,6 +2222,36 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
       CB->replaceAllUsesWith(Primary);
     CB->eraseFromParent();
   }
+  // [LLM-generated] M7.1b: the loan_into id is the same loan as !mem.last_use.
+  // Rewrite it with the same map. An extended copy does not fit in the i64,
+  // so that fact keeps its old id and the late pass will not match it.
+  for (BasicBlock *BB : NewBBs)
+    for (Instruction &I : *BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || !memannot::isMemLoanIntoFact(CB))
+        continue;
+      auto OB = CB->getOperandBundle(memannot::TagLoanInto);
+      if (!OB || OB->Inputs.size() < 3)
+        continue;
+      auto *C = dyn_cast<ConstantInt>(OB->Inputs[2]);
+      if (!C || !C->getType()->isIntegerTy(64))
+        continue;
+      uint64_t Id = C->getZExtValue();
+      memannot::LoanRef Old{Id & memannot::LoanKeyMask, Id, 0};
+      classify(Old);
+      memannot::LoanRef N = mapped(Old);
+      if (N.extended() || N.Packed == Id)
+        continue;
+      unsigned Idx = CB->getBundleOperandsStartIndex();
+      for (unsigned B = 0, E = CB->getNumOperandBundles(); B != E; ++B) {
+        OperandBundleUse U = CB->getOperandBundleAt(B);
+        if (U.getTagName() == memannot::TagLoanInto) {
+          CB->setOperand(Idx + 2, ConstantInt::get(I64, N.Packed));
+          break;
+        }
+        Idx += U.Inputs.size();
+      }
+    }
 }
 
 static cl::opt<bool> InlineLastUseForward(

@@ -4069,7 +4069,9 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
     // [LLM-generated] M7.1a: a move fact is a program point, not a hint. A
     // second identical "mem.move" of the same slot is a second move. Do not
     // erase it as a redundant copy of an earlier fact.
-    if (II->getOperandBundle(memannot::TagMove))
+    if (II->getOperandBundle(memannot::TagMove) ||
+        II->getOperandBundle(memannot::TagLoanInto) ||
+        II->getOperandBundle(memannot::TagLoanIntoPromoted))
       break;
     // [LLM-generated] M5r D14: a "mem.dropped" placeholder only exists for the
     // census; erase it when no census is running on this module.

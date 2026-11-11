@@ -4167,6 +4167,17 @@ void Verifier::visitCallBase(CallBase &Call) {
               "\"mem.move\" bundle must be (ptr slot) on llvm.mem.fact", Call);
         continue;
       }
+      if (T == memannot::TagLoanInto || T == memannot::TagLoanIntoPromoted) {
+        // M7.1b: the owner's buffer-pointer field, the loan capability, and
+        // the loan id. Promotion poisons the field and renames the tag; the
+        // shape stays so the late pass can count the drop.
+        Check(IsFact && In.size() == 3 && IsPtr(In[0]) && IsPtr(In[1]) &&
+                  IsInt(In[2]) && In[2]->getType()->isIntegerTy(64),
+              "\"mem.loan_into\" bundle must be (ptr slot, ptr loan, i64 id) "
+              "on llvm.mem.fact",
+              Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

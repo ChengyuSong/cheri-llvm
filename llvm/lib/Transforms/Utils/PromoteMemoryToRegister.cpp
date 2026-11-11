@@ -81,6 +81,24 @@ static bool isOnlyMemBundleUser(const User *Usr, const Value *V) {
   return true;
 }
 
+// [LLM-generated] M7.1b: a zero-offset cast used only by lifetime markers,
+// droppable intrinsics, and mem.loan_into facts. Promotion drops the fact
+// (fail-safe) instead of refusing the alloca. mem.move is not included.
+static bool onlyLoanIntoOrMarkers(const Value *V) {
+  if (V->use_empty())
+    return false;
+  for (const User *U : V->users()) {
+    const auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return false;
+    if (I->isDroppable() || I->isLifetimeStartOrEnd() ||
+        memannot::isMemLoanIntoFact(I))
+      continue;
+    return false;
+  }
+  return true;
+}
+
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
   // Only allow direct and non-volatile loads and stores...
   // All loads and stores must use the same type (determined by the first one
@@ -120,12 +138,14 @@ bool llvm::isAllocaPromotable(const AllocaInst *AI) {
     } else if (isOnlyMemBundleUser(U, AI)) { // [LLM-generated] M5r
       continue;
     } else if (const BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
-      if (!onlyUsedByLifetimeMarkersOrDroppableInsts(BCI))
+      if (!onlyUsedByLifetimeMarkersOrDroppableInsts(BCI) &&
+          !onlyLoanIntoOrMarkers(BCI))
         return false;
     } else if (const GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(U)) {
       if (!GEPI->hasAllZeroIndices())
         return false;
-      if (!onlyUsedByLifetimeMarkersOrDroppableInsts(GEPI))
+      if (!onlyUsedByLifetimeMarkersOrDroppableInsts(GEPI) &&
+          !onlyLoanIntoOrMarkers(GEPI))
         return false;
     } else if (const AddrSpaceCastInst *ASCI = dyn_cast<AddrSpaceCastInst>(U)) {
       if (!onlyUsedByLifetimeMarkers(ASCI))
@@ -574,6 +594,12 @@ static void removeIntrinsicUsers(AllocaInst *AI) {
         // Drop the use of I in droppable instructions.
         if (Inst->isDroppable()) {
           Inst->dropDroppableUse(UU);
+          continue;
+        }
+        // [LLM-generated] M7.1b: a loan_into fact on a zero-offset cast of the
+        // slot is dropped (and counted), not erased.
+        if (memannot::isMemLoanIntoFact(Inst) || isMemBundleUse(UU)) {
+          Value::dropDroppableUse(UU);
           continue;
         }
         Inst->eraseFromParent();
