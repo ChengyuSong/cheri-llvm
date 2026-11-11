@@ -27,6 +27,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/ConstantRange.h"
@@ -932,6 +933,24 @@ ModRefInfo BasicAAResult::getModRefInfo(const CallBase *Call,
                                         AAQueryInfo &AAQI) {
   assert(notDifferentParent(Call, Loc.Ptr) &&
          "AliasAnalysis query involving multiple functions!");
+
+  // [LLM-generated] M7.1a. mem.move names the slot that has just been copied
+  // out. MemCpyOpt rewrites memcpy(tmp <- v); memcpy(c <- tmp) into
+  // memcpy(c <- v) at the later copy. A fact between those copies then sits
+  // in front of a read of v (from_elem after inlining). writtenBetween only
+  // treats a mod as blocking that forward, so this fact clobbers v. A pure
+  // read would not. Other mem.fact bundles stay inaccessible-only: the
+  // intrinsic's memory effects are unchanged, and this return happens before
+  // that early exit.
+  if (memannot::isMemMoveFact(Call)) {
+    auto OB = Call->getOperandBundle(memannot::TagMove);
+    if (OB && !OB->Inputs.empty() && OB->Inputs[0]->getType()->isPointerTy()) {
+      MemoryLocation SlotLoc = MemoryLocation::getBeforeOrAfter(OB->Inputs[0]);
+      if (AAQI.AAR.alias(SlotLoc, Loc, AAQI, Call) != AliasResult::NoAlias)
+        return ModRefInfo::ModRef;
+    }
+    return ModRefInfo::NoModRef;
+  }
 
   const Value *Object = getUnderlyingObject(Loc.Ptr);
 

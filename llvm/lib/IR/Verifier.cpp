@@ -4161,6 +4161,12 @@ void Verifier::visitCallBase(CallBase &Call) {
               "\"mem.free\" bundle must be (ptr base)", Call);
         continue;
       }
+      if (T == memannot::TagMove) {
+        // M7.1a: the moved-from frame slot. One pointer, on llvm.mem.fact only.
+        Check(IsFact && In.size() == 1 && IsPtr(In[0]),
+              "\"mem.move\" bundle must be (ptr slot) on llvm.mem.fact", Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

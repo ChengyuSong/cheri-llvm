@@ -12,6 +12,10 @@
 //   %q = call ptr @llvm.mem.claim(ptr P, i64 Bytes, i64 Flags)
 //                                                  q == P, valid for Bytes (D11)
 //   call @free(...) [ "mem.free"(ptr Base) ]       the deallocation of Base
+//   call void @llvm.mem.fact() [ "mem.move"(ptr Slot) ]
+//                                                  M7.1a: unique owner moved out
+//                                                  of frame slot Slot. Not a loan
+//                                                  id. The late pass may null Slot.
 //   call @panic...(...) [ "mem.check"(ptr Base, i64 Len, i64 ElemSize,
 //                          i64 Site, i64 Kind [, ptr ParentBase, i64 ParentLen]) ]
 //                                                  the bounds check whose
@@ -69,6 +73,12 @@ inline constexpr StringRef TagAllocInbounds = "mem.alloc_inbounds";
 inline constexpr StringRef TagInbounds = "mem.inbounds";
 /// "mem.free"(ptr base): operand bundle on a deallocation call (R1).
 inline constexpr StringRef TagFree = "mem.free";
+/// [LLM-generated] M7.1a: "mem.move"(ptr slot) on llvm.mem.fact. The unique
+/// owner that lived in this frame slot was moved out at this program point.
+/// The operand is the slot address (alloca, or a constant-offset GEP of one),
+/// not a loan id. Not droppable: losing it loses the clear. Generic passes
+/// must not sink it past a re-init or promote the slot out from under it.
+inline constexpr StringRef TagMove = "mem.move";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
@@ -170,6 +180,8 @@ inline bool isDroppableFactTag(StringRef Tag) {
   return Tag == TagAllocInbounds || Tag == TagInbounds || Tag == TagDropped;
 }
 LLVM_ABI bool isMemFact(const Instruction *I);
+/// [LLM-generated] M7.1a: llvm.mem.fact ["mem.move"(ptr slot)].
+LLVM_ABI bool isMemMoveFact(const Instruction *I);
 /// llvm.mem.claim call (value-returning claim, D11).
 LLVM_ABI bool isMemClaim(const Value *V);
 /// Deallocation call that may carry a "mem.free" bundle: allockind("free"),

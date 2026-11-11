@@ -1244,8 +1244,14 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
     // [LLM-generated] M5r: llvm.mem.fact is assume-like and has no
     // MemoryAccess; it is hoisted only under the same guaranteed-to-execute
     // rules as llvm.assume.
-    if (match(CI, m_Intrinsic<Intrinsic::mem_fact>()))
+    if (match(CI, m_Intrinsic<Intrinsic::mem_fact>())) {
+      // [LLM-generated] M7.1a: "mem.move" is the program point of a clear.
+      // Hoisting it nulls a still-live slot; sinking it can land past a
+      // re-init. Other facts stay assume-like.
+      if (CI->getOperandBundle(memannot::TagMove))
+        return false;
       return true;
+    }
 
     // Handle simple cases by querying alias analysis.
     MemoryEffects Behavior = AA->getMemoryEffects(CI);
@@ -2113,6 +2119,11 @@ bool llvm::promoteLoopAccessesToScalars(
               Store->getAlign(),
               SimplifyQuery(MDL, TLI, DT, AC, Preheader->getTerminator()));
         }
+      } else if (memannot::isMemMoveFact(UI)) {
+        // [LLM-generated] M7.1a: this fact names the slot. Promoting the
+        // loop's loads and stores would sink a store of the moved-from
+        // value to the exit, after the clear.
+        return false;
       } else
         continue; // Not a load or store.
 

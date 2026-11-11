@@ -33,6 +33,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1397,7 +1398,10 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
 
     // [LLM-generated] M5r: llvm.mem.fact only writes inaccessible memory, for
     // the same reason as assume; it must not bump the memory generation.
-    if (match(&Inst, m_Intrinsic<Intrinsic::mem_fact>())) {
+    // M7.1a: mem.move clobbers its slot, so a load must not be forwarded
+    // across it. Fall through and let the normal write handling run.
+    if (match(&Inst, m_Intrinsic<Intrinsic::mem_fact>()) &&
+        !memannot::isMemMoveFact(&Inst)) {
       LLVM_DEBUG(dbgs() << "EarlyCSE skipping mem.fact: " << Inst << '\n');
       continue;
     }

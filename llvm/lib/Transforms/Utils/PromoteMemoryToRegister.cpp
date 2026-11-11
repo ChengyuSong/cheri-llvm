@@ -109,6 +109,10 @@ bool llvm::isAllocaPromotable(const AllocaInst *AI) {
       else if (StoreType != ExpectedType)
         return false;
     } else if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(U)) {
+      // [LLM-generated] M7.1a: a "mem.move" fact names this alloca. Promoting
+      // it would poison the fact (mem.dropped) and leave no slot to null.
+      if (memannot::isMemMoveFact(II))
+        return false;
       if (!II->isLifetimeStartOrEnd() && !II->isDroppable() &&
           II->getIntrinsicID() != Intrinsic::fake_use &&
           !memannot::isMemFact(II)) // [LLM-generated] M5r

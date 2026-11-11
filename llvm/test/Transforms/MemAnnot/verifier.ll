@@ -24,6 +24,7 @@ define void @good(ptr %p, ptr %q, i64 %n, i64 %i) {
   call void @free(ptr %p) [ "mem.free"(ptr %p) ]
   ; R9 (D67): an inlined deallocator's free is kept on llvm.mem.fact.
   call void @llvm.mem.fact() [ "mem.free"(ptr %p) ]
+  call void @llvm.mem.fact() [ "mem.move"(ptr %p) ]
   ret void
 }
 !0 = !{i64 7}
@@ -68,6 +69,10 @@ define void @bad(ptr %p, i64 %n, i64 %i) {
   %v = load i8, ptr %p, !mem.last_use !1
 ; CHECK: !mem.last_use must be a non-empty list of packed i64 loan ids or !{!"mem.loan.ext", i64 orig, i64 disambiguator} copies
   %w = load i8, ptr %p, !mem.last_use !2
+; CHECK: "mem.move" bundle must be (ptr slot) on llvm.mem.fact
+  call void @llvm.mem.fact() [ "mem.move"(i64 %n) ]
+; CHECK: "mem.move" bundle must be (ptr slot) on llvm.mem.fact
+  call void @free(ptr %p) [ "mem.move"(ptr %p) ]
   ret void
 }
 !0 = !{i64 7}

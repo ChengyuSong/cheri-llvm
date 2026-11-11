@@ -1616,6 +1616,10 @@ private:
   // FIXME: What about debug intrinsics? This matches old behavior, but
   // doesn't make sense.
   void visitIntrinsicInst(IntrinsicInst &II) {
+    // [LLM-generated] M7.1a: keep the alloca a "mem.move" fact names. Poisoning
+    // the operand on promotion would drop the clear.
+    if (memannot::isMemMoveFact(&II))
+      return PI.setAborted(&II);
     if (II.isDroppable() || memannot::isMemFact(&II)) { // [LLM-generated] M5r
       AS.DeadUseIfPromotable.push_back(U);
       return;
@@ -1760,6 +1764,9 @@ private:
   void visitInstruction(Instruction &I) { PI.setAborted(&I); }
 
   void visitCallBase(CallBase &CB) {
+    // [LLM-generated] M7.1a: a move fact names this slot. Do not promote it away.
+    if (memannot::isMemMoveFact(&CB))
+      return PI.setAborted(&CB);
     // [LLM-generated] M5r: "mem." annotation operands (llvm.mem.fact and the
     // "mem.check" bundle) are pure information about the alloca; if it is
     // promoted they are poisoned/renamed (see Value::dropDroppableUse).
