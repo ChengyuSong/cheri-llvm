@@ -44,6 +44,7 @@ define i32 @unaligned_float(float addrspace(200)* nocapture readonly %arg, float
 ; RV32IFXCHERI-NEXT:    csb a1, 0(s0)
 ; RV32IFXCHERI-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 16(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV32IFXCHERI-NEXT:    cflw fs0, 12(sp) # 4-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    cincoffset sp, sp, 32
 ; RV32IFXCHERI-NEXT:    cret
@@ -83,6 +84,7 @@ define i32 @unaligned_float(float addrspace(200)* nocapture readonly %arg, float
 ; RV64IFXCHERI-NEXT:    csb a1, 1(s0)
 ; RV64IFXCHERI-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 32(sp)
 ; RV64IFXCHERI-NEXT:    cflw fs0, 28(sp) # 4-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    cincoffset sp, sp, 64
 ; RV64IFXCHERI-NEXT:    cret
@@ -125,8 +127,11 @@ define i32 @unaligned_double(double addrspace(200)* nocapture readonly %arg, dou
 ; RV32IFXCHERI-NEXT:    csh s1, 0(s2)
 ; RV32IFXCHERI-NEXT:    clc ra, 40(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 32(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 32(sp)
 ; RV32IFXCHERI-NEXT:    clc s1, 24(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 24(sp)
 ; RV32IFXCHERI-NEXT:    clc s2, 16(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV32IFXCHERI-NEXT:    cincoffset sp, sp, 48
 ; RV32IFXCHERI-NEXT:    cret
 ;
@@ -160,7 +165,9 @@ define i32 @unaligned_double(double addrspace(200)* nocapture readonly %arg, dou
 ; RV64IFXCHERI-NEXT:    csh s0, 0(s1)
 ; RV64IFXCHERI-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 32(sp)
 ; RV64IFXCHERI-NEXT:    clc s1, 16(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV64IFXCHERI-NEXT:    cincoffset sp, sp, 64
 ; RV64IFXCHERI-NEXT:    cret
 bb:
@@ -205,10 +212,15 @@ define i32 @unaligned_fp128(fp128 addrspace(200)* nocapture readonly %arg, fp128
 ; RV32IFXCHERI-NEXT:    csw s1, 0(s0)
 ; RV32IFXCHERI-NEXT:    clc ra, 72(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 64(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 64(sp)
 ; RV32IFXCHERI-NEXT:    clc s1, 56(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 56(sp)
 ; RV32IFXCHERI-NEXT:    clc s2, 48(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 48(sp)
 ; RV32IFXCHERI-NEXT:    clc s3, 40(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 40(sp)
 ; RV32IFXCHERI-NEXT:    clc s4, 32(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 32(sp)
 ; RV32IFXCHERI-NEXT:    cincoffset sp, sp, 80
 ; RV32IFXCHERI-NEXT:    cret
 ;
@@ -242,8 +254,11 @@ define i32 @unaligned_fp128(fp128 addrspace(200)* nocapture readonly %arg, fp128
 ; RV64IFXCHERI-NEXT:    csw s1, 0(s2)
 ; RV64IFXCHERI-NEXT:    clc ra, 64(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 48(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 48(sp)
 ; RV64IFXCHERI-NEXT:    clc s1, 32(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 32(sp)
 ; RV64IFXCHERI-NEXT:    clc s2, 16(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV64IFXCHERI-NEXT:    cincoffset sp, sp, 80
 ; RV64IFXCHERI-NEXT:    cret
 bb:
@@ -281,6 +296,7 @@ define i32 @unaligned_int(i32 addrspace(200)* nocapture readonly %arg) unnamed_a
 ; RV32IFXCHERI-NEXT:    csb a1, 0(s0)
 ; RV32IFXCHERI-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 16(sp) # 8-byte Folded Reload
+; RV32IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV32IFXCHERI-NEXT:    cincoffset sp, sp, 32
 ; RV32IFXCHERI-NEXT:    cret
 ;
@@ -310,6 +326,7 @@ define i32 @unaligned_int(i32 addrspace(200)* nocapture readonly %arg) unnamed_a
 ; RV64IFXCHERI-NEXT:    csb a1, 0(s0)
 ; RV64IFXCHERI-NEXT:    clc ra, 32(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 16(sp) # 16-byte Folded Reload
+; RV64IFXCHERI-NEXT:    csc zero, 16(sp)
 ; RV64IFXCHERI-NEXT:    cincoffset sp, sp, 48
 ; RV64IFXCHERI-NEXT:    cret
 bb:

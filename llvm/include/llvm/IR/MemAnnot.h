@@ -254,6 +254,8 @@ LLVM_ABI void noteCapRegSkippedSoonRedef();
 LLVM_ABI void noteCapRegSkippedEdge();
 LLVM_ABI void noteCapRegSkippedDup();
 LLVM_ABI void flushSpillInvalidateStats();
+/// [LLM-generated] M7.1c. Append one line to -cheri-invalidate-stats-out.
+LLVM_ABI void appendInvalidateStatsLine(StringRef Line);
 } // namespace memannot
 } // namespace llvm
 #endif

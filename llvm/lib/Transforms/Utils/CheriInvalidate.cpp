@@ -21,8 +21,8 @@
 //     pointer rewrites the fact to "mem.loan_into.val"(ptr buf, ptr loan, i64 id)
 //     and the scan uses that capability directly.
 // Only capabilities into dead storage (or of an ended loan) are touched
-// (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
-// or a '+'-list (e.g. scope+free, the R4 "all").
+// (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
+// '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
 //===----------------------------------------------------------------------===//
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -50,14 +50,15 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("loan+free+slite+aflog"), cl::Hidden,
+    "cheri-invalidate", cl::init("loan+free+scope+aflog"), cl::Hidden,
     cl::desc("M5r Track B: none, scope, slite (scope range checks without "
              "own-slot nulls, R10 D73), free, loan, flog (R10 D72 free log, "
-             "opt-in), aflog (R12 D80 argument free log), loan+free+slite+aflog "
-             "(default since R14 D83, owner OK 2026-11-05; R10-R13: "
+             "opt-in), aflog (R12 D80 argument free log), "
+             "loan+free+scope+aflog (default since M7.1c, own-slot nulls on; "
+             "R14 D83 through M7.1b: loan+free+slite+aflog; R10-R13: "
              "loan+free+slite, which disables aflog; R9 D69: "
              "loan+free; R8 D57: loan), all, or a "
-             "'+'-list (scope+free = R4 all)"));
+             "'+'-list (scope+free = R4 all). slite remains selectable."));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
 // before lifetime.end, or a loan clear) is a dead store to codegen:
 // SelectionDAG drops stores to a frame object before its LIFETIME_END, so the
@@ -153,6 +154,15 @@ void llvm::memannot::noteCapRegSkippedCSR() { ++CapRegSkippedCSR; }
 void llvm::memannot::noteCapRegSkippedSoonRedef() { ++CapRegSkippedSoon; }
 void llvm::memannot::noteCapRegSkippedEdge() { ++CapRegSkippedEdge; }
 void llvm::memannot::noteCapRegSkippedDup() { ++CapRegSkippedDup; }
+void llvm::memannot::appendInvalidateStatsLine(StringRef Line) {
+  if (InvStatsOut.empty() || Line.empty())
+    return;
+  std::error_code EC;
+  raw_fd_ostream OS(InvStatsOut, EC, sys::fs::OF_Append | sys::fs::OF_Text);
+  if (!EC)
+    OS << Line << "\n";
+}
+
 void llvm::memannot::flushSpillInvalidateStats() {
   if (InvStatsOut.empty())
     return;
@@ -2198,6 +2208,25 @@ bool memannot::cheriInvalidateFreeActive() {
 }
 
 bool memannot::runCheriInvalidate(Module &M) {
+  // [LLM-generated] M7.1c. !pcsections survives SelectionDAG onto the call MI,
+  // so the post-PEI pass can zero dead caller-saved caps after this free.
+  // Intrinsics (llvm.mem.fact) are not calls that leave a/t temporaries.
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
+        continue;
+      if (const Function *Callee = CB->getCalledFunction())
+        if (Callee->isIntrinsic())
+          continue;
+      // A call-site attribute survives strip (operand bundles do not) and is
+      // visible to LowerCall. !pcsections on the call is not: SelectionDAG
+      // asserts when the call instruction has no SDNode of its own.
+      CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
+    }
+  }
   StringRef Mode = InvalidateOpt;
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.

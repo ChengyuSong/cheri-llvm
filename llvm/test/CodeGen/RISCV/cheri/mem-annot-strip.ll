@@ -2,14 +2,16 @@
 ; CheriBoundAllocas and LSR) strips
 ; every M5r annotation, so annotated IR and plain IR give identical code
 ; (also through CheriBoundAllocas, which now runs after the stub).
-; The identity diffs pass -cheri-invalidate=none. Default mode includes
-; aflog (D83), which emits a free log the plain file does not have, so
-; those diffs check the strip itself.
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -O2 < %s > %t.annot.s
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -O2 < %S/Inputs/mem-annot-plain.ll > %t.plain.s
+; The identity diffs pass -cheri-invalidate=none and -cheri-free-zero-regs=off.
+; A "mem.free" call otherwise zeros dead caller-saved caps (M7.1c), which the
+; plain file does not do. Default mode includes scope and aflog (D83 / M7.1c);
+; aflog emits a free log the plain file does not have, so those diffs check
+; the strip itself.
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -cheri-free-zero-regs=off -O2 < %s > %t.annot.s
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -cheri-free-zero-regs=off -O2 < %S/Inputs/mem-annot-plain.ll > %t.plain.s
 ; RUN: diff %t.plain.s %t.annot.s
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -O0 < %s > %t.annot0.s
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -O0 < %S/Inputs/mem-annot-plain.ll > %t.plain0.s
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -cheri-free-zero-regs=off -O0 < %s > %t.annot0.s
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -cheri-invalidate=none -cheri-free-zero-regs=off -O0 < %S/Inputs/mem-annot-plain.ll > %t.plain0.s
 ; RUN: diff %t.plain0.s %t.annot0.s
 ; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -stop-after=riscv-cheri-bounds-lowering < %s | FileCheck %s
 ; CHECK-NOT: mem.fact

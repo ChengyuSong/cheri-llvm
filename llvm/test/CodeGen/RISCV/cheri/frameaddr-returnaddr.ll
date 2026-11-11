@@ -28,6 +28,7 @@ define i8 addrspace(200)* @test_frameaddress_0() nounwind {
 ; RV64IXCHERI-NEXT:    cmove a0, s0
 ; RV64IXCHERI-NEXT:    clc ra, 16(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 0(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 0(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 32
 ; RV64IXCHERI-NEXT:    cret
   %1 = call i8 addrspace(200)* @llvm.frameaddress(i32 0)
@@ -62,6 +63,7 @@ define i8 addrspace(200)* @test_frameaddress_0_alloca() nounwind {
 ; RV64IXCHERI-NEXT:    cmove a0, s0
 ; RV64IXCHERI-NEXT:    clc ra, 128(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 112(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 112(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 144
 ; RV64IXCHERI-NEXT:    cret
   %1 = alloca [100 x i8], addrspace(200)
@@ -95,6 +97,7 @@ define i8 addrspace(200)* @test_frameaddress_2() nounwind {
 ; RV64IXCHERI-NEXT:    clc a0, -16(a0)
 ; RV64IXCHERI-NEXT:    clc ra, 16(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 0(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 0(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 32
 ; RV64IXCHERI-NEXT:    cret
   %1 = call i8 addrspace(200)* @llvm.frameaddress(i32 2)
@@ -133,6 +136,7 @@ define i8 addrspace(200)* @test_frameaddress_3_alloca() nounwind {
 ; RV64IXCHERI-NEXT:    clc a0, -16(a0)
 ; RV64IXCHERI-NEXT:    clc ra, 128(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 112(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 112(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 144
 ; RV64IXCHERI-NEXT:    cret
   %1 = alloca [100 x i8], addrspace(200)
@@ -184,6 +188,7 @@ define i8 addrspace(200)* @test_returnaddress_0_alloca() nounwind {
 ; RV64IXCHERI-NEXT:    cmove a0, s0
 ; RV64IXCHERI-NEXT:    clc ra, 128(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 112(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 112(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 144
 ; RV64IXCHERI-NEXT:    cret
   %1 = alloca [100 x i8], addrspace(200)
@@ -219,6 +224,7 @@ define i8 addrspace(200)* @test_returnaddress_2() nounwind {
 ; RV64IXCHERI-NEXT:    clc a0, -8(a0)
 ; RV64IXCHERI-NEXT:    clc ra, 16(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 0(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 0(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 32
 ; RV64IXCHERI-NEXT:    cret
   %1 = call i8 addrspace(200)* @llvm.returnaddress(i32 2)
@@ -259,6 +265,7 @@ define i8 addrspace(200)* @test_returnaddress_3_alloca() nounwind {
 ; RV64IXCHERI-NEXT:    clc a0, -8(a0)
 ; RV64IXCHERI-NEXT:    clc ra, 128(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 112(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 112(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 144
 ; RV64IXCHERI-NEXT:    cret
   %1 = alloca [100 x i8], addrspace(200)

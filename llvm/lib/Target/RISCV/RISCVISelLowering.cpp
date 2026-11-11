@@ -27130,6 +27130,12 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
     InVals.push_back(RetValue);
   }
 
+  // [LLM-generated] M7.1c. After the result copies, so a used return value has
+  // already left ca0 when it is still live. The late pass deletes this marker.
+  if (CLI.CB && CLI.CB->hasFnAttr("cheri-free-regs"))
+    Chain = SDValue(DAG.getMachineNode(RISCV::PseudoCheriFreeZero, DL,
+                                       MVT::Other, Chain),
+                    0);
   return Chain;
 }
 

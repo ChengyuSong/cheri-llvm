@@ -1574,6 +1574,10 @@ def PseudoCheriCapClear
     : Pseudo<(outs YGPR:$rd), (ins YGPR:$rs), [], "cheri.cap.clear", "$rd, $rs">;
 def : Pat<(int_cheri_cap_invalidate YGPR:$rs, timm:$kind),
           (PseudoCheriCapInvalidate YGPR:$rs, timm:$kind)>;
+// [LLM-generated] M7.1c. LowerCall emits this after a "mem.free" call. The
+// late pass replaces it with cmove of each dead caller-saved capability.
+let hasSideEffects = 1, mayLoad = 0, mayStore = 0, isCodeGenOnly = 1 in
+def PseudoCheriFreeZero : Pseudo<(outs), (ins), [], "cheri.free.zero", "">;
 }
 def : PatYGPRYGPR<int_cheri_cap_build, CBuildCap>;
 def : PatYGPRYGPR<int_cheri_cap_type_copy, CCopyType>;

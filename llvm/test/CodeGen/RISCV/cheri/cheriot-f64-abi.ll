@@ -126,6 +126,7 @@ define dso_local void @_Z6test08dPd(double noundef %a, ptr addrspace(200) nocapt
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -226,6 +227,7 @@ define dso_local noundef double @_Z6test1310TwoDoubles(ptr addrspace(200) nocapt
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -350,6 +352,7 @@ define dso_local noundef double @select_on_int(double noundef %x, double noundef
 ; CHECK-NEXT:  .LBB18_3: # %start
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 start:
@@ -376,6 +379,7 @@ define dso_local void @trunc_store(ptr addrspace(200) noundef writeonly captures
 ; CHECK-NEXT:    ct.csw a0, 0(s0)
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -400,6 +404,7 @@ define dso_local void @ext_store(ptr addrspace(200) noundef writeonly captures(n
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -425,6 +430,7 @@ define dso_local void @load_ext_store(ptr addrspace(200) noundef writeonly captu
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -450,6 +456,7 @@ define dso_local void @load_trunc_store(ptr addrspace(200) noundef readonly capt
 ; CHECK-NEXT:    ct.csw a0, 0(s0)
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 0(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 16
 ; CHECK-NEXT:    ct.cret
 entry:
@@ -492,7 +499,9 @@ define dso_local noundef double @test_frem(double noundef %a, double noundef %b)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.clc ra, 24(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 16(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 16(sp)
 ; CHECK-NEXT:    ct.clc s1, 8(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 8(sp)
 ; CHECK-NEXT:    ct.cincoffset sp, sp, 32
 ; CHECK-NEXT:    ct.cret
 entry:

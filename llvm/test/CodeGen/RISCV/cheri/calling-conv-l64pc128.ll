@@ -19,6 +19,8 @@ define i32 @get_ith_word(i32 signext %i, ...) addrspace(200) nounwind {
 ; CHECK-NEXT:  # %bb.2: # %while.end
 ; CHECK-NEXT:    csc a1, 0(sp)
 ; CHECK-NEXT:    clw a0, -4(a1)
+; CHECK-NEXT:  .Lpcsection0:
+; CHECK-NEXT:    csc zero, 0(sp)
 ; CHECK-NEXT:    cincoffset sp, sp, 16
 ; CHECK-NEXT:    cret
 entry:
@@ -65,6 +67,8 @@ define ptr addrspace(200) @get_ith_cap(i32 signext %i, ...) addrspace(200) nounw
 ; CHECK-NEXT:  # %bb.2: # %while.end
 ; CHECK-NEXT:    csc a1, 0(sp)
 ; CHECK-NEXT:    clc a0, 0(a2)
+; CHECK-NEXT:  .Lpcsection1:
+; CHECK-NEXT:    csc zero, 0(sp)
 ; CHECK-NEXT:    cincoffset sp, sp, 16
 ; CHECK-NEXT:    cret
 entry:

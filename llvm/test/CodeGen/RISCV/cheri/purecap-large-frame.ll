@@ -23,6 +23,7 @@ define void @just_below_threshold() local_unnamed_addr addrspace(200) nounwind {
 ; CHECK-NEXT:    cincoffset a0, sp, 16
 ; CHECK-NEXT:    csetbounds a0, a0, 2014
 ; CHECK-NEXT:    ccall use_large
+; CHECK-NEXT:    csc zero, 0(sp)
 ; CHECK-NEXT:    cincoffset sp, sp, 32
 ; CHECK-NEXT:    clc ra, 2016(sp) # 16-byte Folded Reload
 ; CHECK-NEXT:    cincoffset sp, sp, 2032
@@ -48,6 +49,7 @@ define void @just_above_threshold() local_unnamed_addr addrspace(200) nounwind {
 ; CHECK-NEXT:    cincoffset a0, sp, 24
 ; CHECK-NEXT:    csetbounds a0, a0, 2018
 ; CHECK-NEXT:    ccall use_too_large
+; CHECK-NEXT:    csc zero, 0(sp)
 ; CHECK-NEXT:    cincoffset sp, sp, 48
 ; CHECK-NEXT:    clc ra, 2016(sp) # 16-byte Folded Reload
 ; CHECK-NEXT:    cincoffset sp, sp, 2032

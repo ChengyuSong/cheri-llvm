@@ -33,6 +33,7 @@ define dso_local void @bar() addrspace(200) nounwind {
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset a1, sp, 16
 ; RV64IXCHERI-L64PC128-NEXT:    csetbounds a0, a1, a0
 ; RV64IXCHERI-L64PC128-NEXT:    ccall foo
+; RV64IXCHERI-L64PC128-NEXT:    csc zero, 0(sp)
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 2032
 ; RV64IXCHERI-L64PC128-NEXT:    cincoffset sp, sp, 64
 ; RV64IXCHERI-L64PC128-NEXT:    clc ra, 2016(sp) # 16-byte Folded Reload
