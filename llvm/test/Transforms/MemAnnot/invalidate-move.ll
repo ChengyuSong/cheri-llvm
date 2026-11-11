@@ -6,10 +6,12 @@
 ; the call, which still uses the loaded owner.
 ; Vec: the slot is the call argument. The fact (and the null) are the next
 ; instruction after the call.
-; An escaped slot is still nulled. A re-init after the fact keeps the new
-; value. No fact, a same-block re-init before the fact, a non-alloca, a
-; variable or misaligned address, and a slot whose lifetime already ended
-; are left alone. The clear follows the loan mode switch.
+; An escaped slot is still nulled. A later plain load is the use-after-move
+; and does not skip the null. A memcpy/memmove that still copies the slot out
+; after the fact does. A re-init after the fact keeps the new value. No fact,
+; a same-block re-init before the fact, a non-alloca, a variable or misaligned
+; address, and a slot whose lifetime already ended are left alone. The clear
+; follows the loan mode switch.
 ;
 ; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s
@@ -252,20 +254,25 @@ define void @move_after_copy(ptr addrspace(200) %p, ptr addrspace(200) %dst) {
 ; CHECK-NEXT: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p, i32 0)
 ; CHECK: ret void
 
-; Fact before a load of the same slot. The load still needs the old bytes.
-define void @move_before_load(ptr addrspace(200) %p) {
+; The owner was loaded (the move). A later load, including one in a
+; successor, is the use-after-move. The slot is still nulled at the fact.
+define ptr addrspace(200) @move_before_load(ptr addrspace(200) %p) {
   %s = alloca ptr addrspace(200), align 16, addrspace(200)
   store ptr addrspace(200) %p, ptr addrspace(200) %s, align 16
-  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
   %b = load ptr addrspace(200), ptr addrspace(200) %s, align 16
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
   call void @eat_box(ptr addrspace(200) %b)
-  ret void
+  br label %obs
+obs:
+  %stale = load ptr addrspace(200), ptr addrspace(200) %s, align 16
+  ret ptr addrspace(200) %stale
 }
-; CHECK-LABEL: define void @move_before_load(
-; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
+; CHECK-LABEL: define ptr addrspace(200) @move_before_load(
 ; CHECK: %b = load ptr addrspace(200), ptr addrspace(200) %s, align 16
-; CHECK-NOT: store {{(volatile )?}}ptr addrspace(200) null
-; CHECK: ret void
+; CHECK-NEXT: store volatile ptr addrspace(200) null, ptr addrspace(200) %s, align 16
+; CHECK-NEXT: call {{.*}}@eat_box(ptr addrspace(200) %b)
+; CHECK: obs:
+; CHECK: %stale = load ptr addrspace(200), ptr addrspace(200) %s, align 16
 
 ; Using the stored capability is not a move-out of the slot. With no later
 ; read of the slot, the fact is not a null either.
@@ -283,7 +290,7 @@ define void @stored_cap_use(ptr addrspace(200) %p) {
 ; CHECK: ret void
 
 ; CHECK: [[PMV]] = !{!"cheri_inv_move"}
-; basic, vec, escaped, reinit_after, field, move_after_copy.
-; move_before_copy and move_before_load are the live skips.
-; STATS: move_nulls=6
-; STATS: move_null_skipped_live=2
+; basic, vec, escaped, reinit_after, field, move_after_copy, move_before_load.
+; move_before_copy is the only copy-out skip.
+; STATS: move_nulls=7
+; STATS: move_null_skipped_live=1

@@ -970,42 +970,15 @@ struct Inv {
         return C->getZExtValue();
     return std::nullopt;
   }
-  // A memory read of the nulled bytes, or a use that can still observe them:
-  // load, memcpy/memmove source, a call taking the slot or a pointer derived
-  // from it, or an escaping store/return of that address.
-  bool readsSlot(const Instruction *I, AllocaInst *A, int64_t Off) const {
-    if (isa<DbgInfoIntrinsic>(I))
+  // The only misplacement we have seen is a consuming copy-out after the
+  // fact: memcpy/memmove whose source still overlaps the bytes we would null.
+  // A plain load, an atomic read, a call that takes the slot, or an escaping
+  // use is the use-after-move the null exists to trap, not a reason to skip.
+  bool copyOutOfSlot(const Instruction *I, AllocaInst *A, int64_t Off) const {
+    auto *MT = dyn_cast<MemTransferInst>(I);
+    if (!MT)
       return false;
-    if (auto *MT = dyn_cast<MemTransferInst>(I))
-      return overlapsNull(MT->getRawSource(), A, Off, constLen(MT->getLength()));
-    if (isa<MemSetInst>(I))
-      return false;
-    auto Sized = [&](Type *Ty) -> std::optional<uint64_t> {
-      TypeSize Sz = DL.getTypeStoreSize(Ty);
-      if (Sz.isScalable())
-        return std::nullopt;
-      return Sz.getFixedValue();
-    };
-    if (auto *LI = dyn_cast<LoadInst>(I))
-      return overlapsNull(LI->getPointerOperand(), A, Off, Sized(LI->getType()));
-    if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
-      return overlapsNull(RMW->getPointerOperand(), A, Off,
-                          Sized(RMW->getValOperand()->getType()));
-    if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I))
-      return overlapsNull(CX->getPointerOperand(), A, Off,
-                          Sized(CX->getCompareOperand()->getType()));
-    if (auto *SI = dyn_cast<StoreInst>(I))
-      return derivedFrom(SI->getValueOperand(), A);
-    if (auto *RI = dyn_cast<ReturnInst>(I))
-      return RI->getReturnValue() && derivedFrom(RI->getReturnValue(), A);
-    if (auto *CB = dyn_cast<CallBase>(I)) {
-      if (memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
-        return false;
-      for (const Value *Arg : CB->args())
-        if (derivedFrom(Arg, A))
-          return true;
-    }
-    return false;
+    return overlapsNull(MT->getRawSource(), A, Off, constLen(MT->getLength()));
   }
   // A write that replaces every byte the null would clear. Later reads see
   // the new value. An unknown size is not a re-init.
@@ -1030,35 +1003,39 @@ struct Inv {
     }
     return false;
   }
-  // True when a read of the slot can still happen after Fact and before a
-  // store that covers the nulled bytes. The rest of the block is scanned, then
-  // every successor. A backedge to this block is a read we cannot see from
-  // the fact forward, so it counts.
-  bool slotReadAfter(Instruction *Fact, AllocaInst *A, int64_t Off) const {
+  // True when a memcpy/memmove source that overlaps the nulled bytes is
+  // reachable after Fact and before a store that covers them. The rest of
+  // the block is scanned, then every successor. A backedge re-scans only the
+  // prefix of this block (instructions before the fact) for that copy-out.
+  bool copyOutAfter(Instruction *Fact, AllocaInst *A, int64_t Off) const {
     Instruction *Start = Fact->getNextNode();
     if (!Start)
       return false;
     BasicBlock *FactBB = Fact->getParent();
+    // 1: copy-out, 0: covering re-init ends this path, -1: fell off the range.
+    auto Scan = [&](Instruction *From, Instruction *Stop) -> int {
+      for (Instruction *I = From; I && I != Stop; I = I->getNextNode()) {
+        if (copyOutOfSlot(I, A, Off))
+          return 1;
+        if (reinitsSlot(I, A, Off))
+          return 0;
+      }
+      return -1;
+    };
     SmallPtrSet<BasicBlock *, 8> Queued;
     SmallVector<std::pair<BasicBlock *, Instruction *>, 8> WL;
     Queued.insert(FactBB);
     WL.push_back({FactBB, Start});
     while (!WL.empty()) {
       auto [BB, From] = WL.pop_back_val();
-      bool Reinit = false;
-      for (Instruction *I = From; I; I = I->getNextNode()) {
-        if (readsSlot(I, A, Off))
-          return true;
-        if (reinitsSlot(I, A, Off)) {
-          Reinit = true;
-          break;
-        }
-      }
-      if (Reinit)
+      int R = Scan(From, nullptr);
+      if (R == 1)
+        return true;
+      if (R == 0)
         continue;
       for (BasicBlock *S : successors(BB)) {
         if (!Queued.insert(S).second) {
-          if (S == FactBB)
+          if (S == FactBB && Scan(&*FactBB->begin(), Fact) == 1)
             return true;
           continue;
         }
@@ -1139,9 +1116,10 @@ struct Inv {
   //
   // Ignored when the operand is not a constant-offset frame slot, the slot's
   // lifetime has already ended, or the same block re-initialized it before
-  // the fact (reinitBefore). A read of the slot after the fact and before a
-  // covering store (memcpy source, load, call, escape, or a successor) skips
-  // the null: the fact was emitted too early. A re-init store after the fact
+  // the fact (reinitBefore). A memcpy/memmove whose source overlaps the slot
+  // and is reachable after the fact, before a covering store, skips the null:
+  // that is the early-fact misplacement. A later plain load is the
+  // use-after-move the null exists to trap. A re-init store after the fact
   // overwrites the null.
   void moveClears(Function &F, DominatorTree &DT) {
     struct Act {
@@ -1165,8 +1143,10 @@ struct Inv {
         continue;
       if (!liveAt(A, CB, DT))
         continue;
-      // A later read wins over any earlier "move-out". The slot is still live.
-      if (slotReadAfter(CB, A, Off)) {
+      // A consuming copy-out after the fact means the slot is still live.
+      // A later load does not: safe Rust does not read a moved-from place,
+      // so that load is the use-after-move this null is for.
+      if (copyOutAfter(CB, A, Off)) {
         ++MoveNullSkippedLive;
         continue;
       }
