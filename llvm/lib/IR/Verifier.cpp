@@ -4167,7 +4167,8 @@ void Verifier::visitCallBase(CallBase &Call) {
               "\"mem.move\" bundle must be (ptr slot) on llvm.mem.fact", Call);
         continue;
       }
-      if (T == memannot::TagLoanInto || T == memannot::TagLoanIntoPromoted) {
+      if (T == memannot::TagLoanInto || T == memannot::TagLoanIntoVal ||
+          T == memannot::TagLoanIntoPromoted) {
         // M7.1b: the owner's buffer-pointer field, the loan capability, and
         // the loan id. Promotion poisons the field and renames the tag; the
         // shape stays so the late pass can count the drop.

@@ -26,6 +26,7 @@ define void @good(ptr %p, ptr %q, i64 %n, i64 %i) {
   call void @llvm.mem.fact() [ "mem.free"(ptr %p) ]
   call void @llvm.mem.fact() [ "mem.move"(ptr %p) ]
   call void @llvm.mem.fact() [ "mem.loan_into"(ptr %p, ptr %q, i64 3) ]
+  call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr %q, ptr %p, i64 3) ]
   call void @llvm.mem.fact() [ "mem.loan_into.promoted"(ptr poison, ptr %q, i64 3) ]
   ret void
 }

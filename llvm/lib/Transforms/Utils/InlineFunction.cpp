@@ -2228,9 +2228,12 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
   for (BasicBlock *BB : NewBBs)
     for (Instruction &I : *BB) {
       auto *CB = dyn_cast<CallBase>(&I);
-      if (!CB || !memannot::isMemLoanIntoFact(CB))
+      if (!CB || (!memannot::isMemLoanIntoFact(CB) &&
+                  !memannot::isMemLoanIntoValFact(CB)))
         continue;
-      auto OB = CB->getOperandBundle(memannot::TagLoanInto);
+      auto OB = memannot::isMemLoanIntoValFact(CB)
+                    ? CB->getOperandBundle(memannot::TagLoanIntoVal)
+                    : CB->getOperandBundle(memannot::TagLoanInto);
       if (!OB || OB->Inputs.size() < 3)
         continue;
       auto *C = dyn_cast<ConstantInt>(OB->Inputs[2]);
@@ -2245,7 +2248,8 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
       unsigned Idx = CB->getBundleOperandsStartIndex();
       for (unsigned B = 0, E = CB->getNumOperandBundles(); B != E; ++B) {
         OperandBundleUse U = CB->getOperandBundleAt(B);
-        if (U.getTagName() == memannot::TagLoanInto) {
+        if (U.getTagName() == memannot::TagLoanInto ||
+            U.getTagName() == memannot::TagLoanIntoVal) {
           CB->setOperand(Idx + 2, ConstantInt::get(I64, N.Packed));
           break;
         }

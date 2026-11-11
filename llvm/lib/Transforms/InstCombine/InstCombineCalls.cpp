@@ -4071,6 +4071,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
     // erase it as a redundant copy of an earlier fact.
     if (II->getOperandBundle(memannot::TagMove) ||
         II->getOperandBundle(memannot::TagLoanInto) ||
+        II->getOperandBundle(memannot::TagLoanIntoVal) ||
         II->getOperandBundle(memannot::TagLoanIntoPromoted))
       break;
     // [LLM-generated] M5r D14: a "mem.dropped" placeholder only exists for the

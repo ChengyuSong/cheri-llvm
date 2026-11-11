@@ -1251,7 +1251,8 @@ bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
       // M7.1b: mem.loan_into is the program point of a heap loan. Hoisting
       // it scans the wrong buffer; sinking it can land past the last use.
       if (CI->getOperandBundle(memannot::TagMove) ||
-          CI->getOperandBundle(memannot::TagLoanInto))
+          CI->getOperandBundle(memannot::TagLoanInto) ||
+          CI->getOperandBundle(memannot::TagLoanIntoVal))
         return false;
       return true;
     }

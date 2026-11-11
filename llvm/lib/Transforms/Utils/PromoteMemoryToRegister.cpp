@@ -35,6 +35,8 @@
 #include "llvm/IR/DebugProgramInstruction.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
@@ -824,6 +826,69 @@ static bool promoteSingleBlockAlloca(
   return true;
 }
 
+// [LLM-generated] M7.1b: a loan_into on this pointer alloca becomes
+// mem.loan_into.val(load of the field). Promotion then renames the load to
+// the SSA value of the buffer pointer. Aggregates are SROA's job.
+static void liftLoanInto(AllocaInst *AI) {
+  if (!AI->getAllocatedType()->isPointerTy())
+    return;
+  SmallVector<Use *, 4> Uses;
+  auto Collect = [&](Value *Ptr) {
+    for (Use &U : Ptr->uses()) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      if (!CB || !memannot::isMemLoanIntoFact(CB))
+        continue;
+      if (!CB->isBundleOperand(U.getOperandNo()))
+        continue;
+      auto OB = CB->getOperandBundle(memannot::TagLoanInto);
+      if (!OB || OB->Inputs.size() < 3 || OB->Inputs[0] != U.get())
+        continue;
+      Uses.push_back(&U);
+    }
+  };
+  Collect(AI);
+  for (User *U : AI->users()) {
+    if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+      if (G->hasAllZeroIndices())
+        Collect(G);
+    } else if (auto *B = dyn_cast<BitCastInst>(U))
+      Collect(B);
+  }
+  for (Use *U : Uses) {
+    auto *CB = cast<CallBase>(U->getUser());
+    IRBuilder<> B(CB);
+    LoadInst *Ld = B.CreateAlignedLoad(AI->getAllocatedType(), U->get(),
+                                       AI->getAlign(), "loaninto.field");
+    unsigned OpNo = U->getOperandNo();
+    CB->setOperand(OpNo, Ld);
+    CB->getBundleOpInfoForOperand(OpNo).Tag =
+        CB->getContext().getOrInsertBundleTag(memannot::TagLoanIntoVal);
+  }
+}
+
+// A load with no reaching store is renamed to undef/poison. That is not a
+// buffer capability; count it as a promotion skip instead of scanning it.
+static void demotePoisonLoanInto(Function &F) {
+  for (Instruction &I : instructions(F)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB || !memannot::isMemLoanIntoValFact(CB))
+      continue;
+    auto OB = CB->getOperandBundle(memannot::TagLoanIntoVal);
+    if (!OB || OB->Inputs.empty() || !isa<UndefValue>(OB->Inputs[0]))
+      continue;
+    unsigned Idx = CB->getBundleOperandsStartIndex();
+    for (unsigned B = 0, E = CB->getNumOperandBundles(); B != E; ++B) {
+      OperandBundleUse Bundle = CB->getOperandBundleAt(B);
+      if (Bundle.getTagName() == memannot::TagLoanIntoVal) {
+        CB->getBundleOpInfoForOperand(Idx).Tag =
+            CB->getContext().getOrInsertBundleTag(memannot::TagLoanIntoPromoted);
+        break;
+      }
+      Idx += Bundle.Inputs.size();
+    }
+  }
+}
+
 void PromoteMem2Reg::run() {
   Function &F = *DT.getRoot()->getParent();
 
@@ -840,6 +905,7 @@ void PromoteMem2Reg::run() {
   for (unsigned AllocaNum = 0; AllocaNum != Allocas.size(); ++AllocaNum) {
     AllocaInst *AI = Allocas[AllocaNum];
 
+    liftLoanInto(AI);
     assert(isAllocaPromotable(AI) && "Cannot promote non-promotable alloca!");
     assert(AI->getParent()->getParent() == &F &&
            "All allocas should be in the same function, which is same as DF!");
@@ -923,6 +989,7 @@ void PromoteMem2Reg::run() {
   }
 
   if (Allocas.empty()) {
+    demotePoisonLoanInto(F);
     cleanUpDbgAssigns();
     return; // All of the allocas must have been trivial!
   }
@@ -1055,6 +1122,7 @@ void PromoteMem2Reg::run() {
   }
 
   NewPhiNodes.clear();
+  demotePoisonLoanInto(F);
   cleanUpDbgAssigns();
 }
 

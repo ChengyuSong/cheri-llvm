@@ -82,9 +82,12 @@ inline constexpr StringRef TagMove = "mem.move";
 /// [LLM-generated] M7.1b: "mem.loan_into"(ptr owner_ptr_field, ptr loan_val,
 /// i64 id) on llvm.mem.fact. The loan was stored into a heap container whose
 /// buffer pointer lives in this frame slot. The id matches !mem.last_use.
-/// Generic passes keep it. If the slot is promoted, the tag becomes
-/// "mem.loan_into.promoted" and the late pass counts a skip instead of scanning.
+/// Generic passes keep it. Promotion of the owner alloca rewrites it to
+/// "mem.loan_into.val"(ptr buf_cap, ptr loan_val, i64 id), the buffer
+/// capability in SSA at the fact. If that value cannot be recovered the tag
+/// becomes "mem.loan_into.promoted" and the late pass counts a skip.
 inline constexpr StringRef TagLoanInto = "mem.loan_into";
+inline constexpr StringRef TagLoanIntoVal = "mem.loan_into.val";
 inline constexpr StringRef TagLoanIntoPromoted = "mem.loan_into.promoted";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
@@ -191,6 +194,9 @@ LLVM_ABI bool isMemFact(const Instruction *I);
 LLVM_ABI bool isMemMoveFact(const Instruction *I);
 /// [LLM-generated] M7.1b: llvm.mem.fact ["mem.loan_into"(ptr slot, ptr val, i64 id)].
 LLVM_ABI bool isMemLoanIntoFact(const Instruction *I);
+/// [LLM-generated] M7.1b: "mem.loan_into.val"(ptr buf_cap, ptr val, i64 id).
+/// The owner slot was promoted; \c buf_cap is the buffer pointer itself.
+LLVM_ABI bool isMemLoanIntoValFact(const Instruction *I);
 /// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
 /// Header copies must not be reordered across that program point.
 LLVM_ABI const Value *slotClobber(const Instruction *I);

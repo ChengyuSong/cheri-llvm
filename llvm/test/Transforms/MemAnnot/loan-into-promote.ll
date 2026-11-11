@@ -1,6 +1,7 @@
-; [LLM-generated] M7.1b: promoting the owner slot drops the fact instead of
-; leaving a dangling slot operand. The renamed marker is what the late pass
-; counts. The loan value stays so the drop is visible.
+; [LLM-generated] M7.1b: promoting the owner slot rewrites loan_into onto the SSA
+; value of the buffer pointer. A slot with no reaching store has no capability
+; to scan, so the fact stays as mem.loan_into.promoted (not mem.dropped, which
+; InstCombine would delete).
 ;
 ; RUN: opt -S -passes=mem2reg < %s | FileCheck %s --check-prefix=M2R
 ; RUN: opt -S -passes=sroa < %s | FileCheck %s --check-prefix=SROA
@@ -20,13 +21,27 @@ define void @promo(ptr addrspace(200) %loan, ptr addrspace(200) %buf) {
 }
 ; M2R-LABEL: define void @promo(
 ; M2R-NOT: alloca
-; M2R: call {{.*}}@llvm.mem.fact() [ "mem.loan_into.promoted"(ptr addrspace(200) poison, ptr addrspace(200) %loan, i64 7) ]
+; M2R: call {{.*}}@llvm.mem.fact() [ "mem.loan_into.val"(ptr addrspace(200) %buf, ptr addrspace(200) %loan, i64 7) ]
 ; M2R-NOT: "mem.loan_into"(
+; M2R-NOT: mem.dropped
 ; SROA-LABEL: define void @promo(
 ; SROA-NOT: alloca
-; SROA: call {{.*}}@llvm.mem.fact() [ "mem.loan_into.promoted"(ptr addrspace(200) poison, ptr addrspace(200) %loan, i64 7) ]
-; SROA-NOT: "mem.loan_into"(
+; SROA: call {{.*}}@llvm.mem.fact() [ "mem.loan_into.val"(ptr addrspace(200) %buf, ptr addrspace(200) %loan, i64 7) ]
+; SROA-NOT: mem.dropped
+; An alloca with no memory access is not split, so the slot fact stays.
+; SROA-LABEL: define void @nostore(
+
+define void @nostore(ptr addrspace(200) %loan) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.mem.fact() [ "mem.loan_into"(ptr addrspace(200) %s, ptr addrspace(200) %loan, i64 8) ]
+  ret void
+}
+; M2R-LABEL: define void @nostore(
+; M2R-NOT: alloca
+; M2R: call {{.*}}@llvm.mem.fact() [ "mem.loan_into.promoted"(ptr addrspace(200) {{(poison|undef)}}, ptr addrspace(200) %loan, i64 8) ]
+; M2R-NOT: mem.dropped
 
 ; STATS: loan_into_facts=0
 ; STATS-SAME: loan_into_scans=0
 ; STATS-SAME: loan_into_skipped_promoted=1
+; STATS-SAME: loan_into_val_facts=1
