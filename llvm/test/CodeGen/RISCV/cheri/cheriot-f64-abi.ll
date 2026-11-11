@@ -637,7 +637,9 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.csb a0, 55(sp)
 ; CHECK-NEXT:    ct.clc ra, 88(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 80(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 80(sp)
 ; CHECK-NEXT:    ct.clc s1, 72(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 72(sp)
 ; CHECK-NEXT:    .cfi_restore ra
 ; CHECK-NEXT:    .cfi_restore s0
 ; CHECK-NEXT:    .cfi_restore s1

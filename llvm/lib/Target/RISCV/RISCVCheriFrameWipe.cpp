@@ -3,8 +3,9 @@
 //
 // Two post-PEI passes, purecap only.
 //
-// Frame wipe (-cheri-frame-wipe, default on). At each return, before the frame
-// is deallocated:
+// Frame wipe (-cheri-frame-wipe, default on). At each epilogue
+// (MFI restore point / wherever emitEpilogue ran, including a shrink-wrapped
+// block that is not itself a return), before the frame is deallocated:
 //   * cnull every 16-byte spill slot (a capability, or anything that size);
 //   * cnull every callee-saved save slot except ra/cra, after that register
 //     has been restored.
@@ -38,7 +39,7 @@ using namespace llvm;
 enum class Toggle { Off, On };
 static cl::opt<Toggle> FrameWipeOpt(
     "cheri-frame-wipe", cl::init(Toggle::On), cl::Hidden,
-    cl::desc("M7.1c: at each return, store cnull over capability spill slots "
+    cl::desc("M7.1c: at each epilogue, store cnull over capability spill slots "
              "and callee-saved save slots except ra (purecap)"),
     cl::values(clEnumValN(Toggle::Off, "off", "do not wipe"),
                clEnumValN(Toggle::On, "on", "wipe (default on purecap)")));
@@ -173,8 +174,19 @@ bool RISCVCheriFrameWipe::runOnMachineFunction(MachineFunction &MF) {
 
   bool Changed = false;
   unsigned Stores = 0;
+  // PEI clears restore points after emitting the epilogue. The blocks it
+  // touched still carry FrameDestroy: the shrink-wrap restore block, or each
+  // return when shrink-wrap did not run.
   for (MachineBasicBlock &MBB : MF) {
-    if (!MBB.isReturnBlock() || MBB.empty())
+    if (MBB.empty())
+      continue;
+    bool Epilogue = false;
+    for (const MachineInstr &MI : MBB)
+      if (MI.getFlag(MachineInstr::FrameDestroy)) {
+        Epilogue = true;
+        break;
+      }
+    if (!Epilogue)
       continue;
     MachineBasicBlock::iterator Term = MBB.getFirstTerminator();
     DebugLoc DL;

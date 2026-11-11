@@ -2104,6 +2104,13 @@ class RVPBinaryIntrinsic
   def int_riscv_psabs : RVPUnaryIntrinsic;
 } // TargetPrefix = "riscv"
 
+// [LLM-generated] M7.1c. Planted at each return of an inlined "mem.free" body,
+// after the free-list store. Lowered to PseudoCheriFreeZero.
+let TargetPrefix = "riscv" in {
+  def int_riscv_cheri_free_zero
+      : Intrinsic<[], [], [IntrWriteMem, IntrWillReturn]>;
+}
+
 //===----------------------------------------------------------------------===//
 // Zvfofp8min - OFP8 conversion extension
 // The Zvfofp8min extension provides basic support for the two 8-bit

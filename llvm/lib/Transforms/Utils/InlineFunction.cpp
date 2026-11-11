@@ -1967,6 +1967,31 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
               }))
             Targets.push_back(C);
   }
+  // [LLM-generated] M7.1c. The free has finished at each return of the inlined
+  // body, after a free-list store. An out-of-line helper inside the body
+  // (a wipe) is not that point, even if it inherited the bundle. RISC-V only:
+  // the marker is a target intrinsic lowered to PseudoCheriFreeZero.
+  auto PlantFreeZero = [&]() {
+    if (Tag != memannot::TagFree)
+      return;
+    // The id lives in the RISCV intrinsic enum. Look it up by name so this
+    // generic pass does not include a target header. It only selects on
+    // HasCheri, so skip modules that are not CHERI.
+    const Module *M = Caller->getParent();
+    if (!M->getTargetTriple().isRISCV())
+      return;
+    if (!StringRef(M->getDataLayout().getStringRepresentation()).contains("-pf200:"))
+      return;
+    Intrinsic::ID ZID = Intrinsic::lookupIntrinsicID("llvm.riscv.cheri.free.zero");
+    if (ZID == Intrinsic::not_intrinsic)
+      return;
+    Function *Z = Intrinsic::getOrInsertDeclaration(Caller->getParent(), ZID);
+    for (ReturnInst *R : Returns) {
+      if (!R || !R->getParent())
+        continue;
+      CallInst::Create(Z, {}, "", R->getIterator());
+    }
+  };
   // [LLM-generated] M5r R9 (D67): the whole deallocator was inlined (e.g. a
   // free-list GlobalAlloc): no call is left to carry the free. Keep the fact
   // as llvm.mem.fact ["mem.free"(p)] where the inlined call would have
@@ -1982,8 +2007,10 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
       if (Id)
         F->setMetadata(memannot::IdMD, Id);
     }
+    PlantFreeZero();
     return;
   }
+  PlantFreeZero();
   for (CallBase *C : Targets) {
     SmallVector<OperandBundleDef, 2> OBs;
     C->getOperandBundlesAsDefs(OBs);
@@ -1993,6 +2020,13 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
     NewC->copyMetadata(*C);
     if (Id && !NewC->getMetadata(memannot::IdMD))
       NewC->setMetadata(memannot::IdMD, Id);
+    // [LLM-generated] M7.1c. This call inherited "mem.free" from an inlined
+    // caller. It is not the end of that free (a wipe may return, and the
+    // free-list store is still ahead). Register zeroing uses the marker at
+    // the inlined return.
+    if (Tag == memannot::TagFree)
+      NewC->setMetadata("cheri.free.inner",
+                        MDNode::get(NewC->getContext(), {}));
     C->replaceAllUsesWith(NewC);
     C->eraseFromParent();
   }

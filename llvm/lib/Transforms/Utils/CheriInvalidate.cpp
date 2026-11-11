@@ -2208,9 +2208,13 @@ bool memannot::cheriInvalidateFreeActive() {
 }
 
 bool memannot::runCheriInvalidate(Module &M) {
-  // [LLM-generated] M7.1c. !pcsections survives SelectionDAG onto the call MI,
-  // so the post-PEI pass can zero dead caller-saved caps after this free.
-  // Intrinsics (llvm.mem.fact) are not calls that leave a/t temporaries.
+  // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
+  // free: zero after it returns. A helper that only inherited the bundle
+  // (a wipe inside an inlined allocator) is marked cheri.free.inner and is
+  // not that point; the inliner plants llvm.riscv.cheri.free.zero at the
+  // inlined returns instead. The attribute survives strip and is visible to
+  // LowerCall. !pcsections on the call is not: SelectionDAG asserts when the
+  // call has no SDNode.
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -2218,12 +2222,11 @@ bool memannot::runCheriInvalidate(Module &M) {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
         continue;
+      if (CB->hasMetadata("cheri.free.inner"))
+        continue;
       if (const Function *Callee = CB->getCalledFunction())
         if (Callee->isIntrinsic())
           continue;
-      // A call-site attribute survives strip (operand bundles do not) and is
-      // visible to LowerCall. !pcsections on the call is not: SelectionDAG
-      // asserts when the call instruction has no SDNode of its own.
       CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
     }
   }
