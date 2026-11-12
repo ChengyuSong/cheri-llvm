@@ -124,6 +124,7 @@ define dso_local void @_Z6test08dPd(double noundef %a, ptr addrspace(200) nocapt
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB7_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.csc zero, 0(sp)
@@ -220,6 +221,7 @@ define dso_local noundef double @_Z6test1310TwoDoubles(ptr addrspace(200) nocapt
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB12_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.cmove a1, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:  .LBB12_2: # %entry
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls___adddf3)
@@ -377,6 +379,7 @@ define dso_local void @trunc_store(ptr addrspace(200) noundef writeonly captures
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB19_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.csw a0, 0(s0)
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.csc zero, 0(sp)
@@ -402,6 +405,7 @@ define dso_local void @ext_store(ptr addrspace(200) noundef writeonly captures(n
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB20_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.csc zero, 0(sp)
@@ -428,6 +432,7 @@ define dso_local void @load_ext_store(ptr addrspace(200) noundef writeonly captu
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB21_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.csc a0, 0(s0)
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.csc zero, 0(sp)
@@ -454,6 +459,7 @@ define dso_local void @load_trunc_store(ptr addrspace(200) noundef readonly capt
 ; CHECK-NEXT:    ct.clc t2, %cheriot_compartment_lo_i(.LBB22_1)(t2)
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.csw a0, 0(s0)
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.clc ra, 8(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.clc s0, 0(sp) # 8-byte Folded Reload
 ; CHECK-NEXT:    ct.csc zero, 0(sp)
@@ -491,7 +497,9 @@ define dso_local noundef double @test_frem(double noundef %a, double noundef %b)
 ; CHECK-NEXT:    ct.csb a0, 7(sp)
 ; CHECK-NEXT:    ct.clc a0, 0(sp)
 ; CHECK-NEXT:    ct.cmove a1, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    ct.cmove a2, s1
+; CHECK-NEXT:    ct.cmove s1, zero
 ; CHECK-NEXT:  .LBB23_3: # %entry
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls_fma)
@@ -571,10 +579,12 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    blt a0, s1, .LBB24_8
 ; CHECK-NEXT:  # %bb.2:
 ; CHECK-NEXT:    ct.csc s0, 8(sp) # 8-byte Folded Spill
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    mv a1, s1
 ; CHECK-NEXT:  .LBB24_3: # %frem.loop_exit
 ; CHECK-NEXT:    addi a1, a1, -25
 ; CHECK-NEXT:    ct.clc a0, 8(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 8(sp) # 8-byte Folded Spill
 ; CHECK-NEXT:  .LBB24_15: # %frem.loop_exit
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls_ldexp)
@@ -582,6 +592,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.cmove s0, a0
 ; CHECK-NEXT:    ct.clc a1, 16(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 16(sp) # 8-byte Folded Spill
 ; CHECK-NEXT:  .LBB24_16: # %frem.loop_exit
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls___muldf3)
@@ -598,8 +609,10 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.csb a0, 47(sp)
 ; CHECK-NEXT:    ct.clc a0, 40(sp)
 ; CHECK-NEXT:    ct.clc s1, 24(sp) # 8-byte Folded Reload
+; CHECK-NEXT:    ct.csc zero, 24(sp) # 8-byte Folded Spill
 ; CHECK-NEXT:    ct.cmove a1, s1
 ; CHECK-NEXT:    ct.cmove a2, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:  .LBB24_18: # %frem.loop_exit
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls_fma)
@@ -607,6 +620,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.cmove s0, a0
 ; CHECK-NEXT:    ct.cmove a1, s1
+; CHECK-NEXT:    ct.cmove s1, zero
 ; CHECK-NEXT:  .LBB24_19: # %frem.loop_exit
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls___adddf3)
@@ -623,8 +637,10 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    bltz a0, .LBB24_5
 ; CHECK-NEXT:  # %bb.4: # %frem.loop_exit
 ; CHECK-NEXT:    ct.cmove s1, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:  .LBB24_5: # %frem.loop_exit
 ; CHECK-NEXT:    ct.cmove a0, s1
+; CHECK-NEXT:    ct.cmove s1, zero
 ; CHECK-NEXT:    ct.clw a1, 4(sp) # 4-byte Folded Reload
 ; CHECK-NEXT:  .LBB24_21: # %frem.loop_exit
 ; CHECK-NEXT:    # Label of block must be emitted
@@ -652,6 +668,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:  .LBB24_7: # %frem.loop_body
 ; CHECK-NEXT:    li a1, 26
 ; CHECK-NEXT:    ct.cmove a0, s1
+; CHECK-NEXT:    ct.cmove s1, zero
 ; CHECK-NEXT:  .LBB24_22: # %frem.loop_body
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls_ldexp)
@@ -685,6 +702,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.cmove a1, s1
 ; CHECK-NEXT:    ct.csc s0, 8(sp) # 8-byte Folded Spill
 ; CHECK-NEXT:    ct.cmove a2, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:  .LBB24_25: # %frem.loop_body
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls_fma)
@@ -692,6 +710,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    ct.cjalr t2
 ; CHECK-NEXT:    ct.cmove s0, a0
 ; CHECK-NEXT:    ct.cmove a1, s1
+; CHECK-NEXT:    ct.cmove s1, zero
 ; CHECK-NEXT:  .LBB24_26: # %frem.loop_body
 ; CHECK-NEXT:    # Label of block must be emitted
 ; CHECK-NEXT:    ct.auipcc t2, %cheriot_compartment_code_hi(__library_import_libcalls___adddf3)
@@ -708,6 +727,7 @@ define double @test_frem_cst() addrspace(200) {
 ; CHECK-NEXT:    bltz a0, .LBB24_7
 ; CHECK-NEXT:  # %bb.9: # %frem.loop_body
 ; CHECK-NEXT:    ct.cmove s1, s0
+; CHECK-NEXT:    ct.cmove s0, zero
 ; CHECK-NEXT:    j .LBB24_7
 start:
   %r = frem double 0.000000e+00, 0.000000e+00

@@ -42,6 +42,7 @@ define i32 @unaligned_float(float addrspace(200)* nocapture readonly %arg, float
 ; RV32IFXCHERI-NEXT:    srli a2, a1, 8
 ; RV32IFXCHERI-NEXT:    csb a2, 1(s0)
 ; RV32IFXCHERI-NEXT:    csb a1, 0(s0)
+; RV32IFXCHERI-NEXT:    cmove s0, zero
 ; RV32IFXCHERI-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 16(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    csc zero, 16(sp)
@@ -82,6 +83,7 @@ define i32 @unaligned_float(float addrspace(200)* nocapture readonly %arg, float
 ; RV64IFXCHERI-NEXT:    srli a1, a1, 8
 ; RV64IFXCHERI-NEXT:    csb a2, 2(s0)
 ; RV64IFXCHERI-NEXT:    csb a1, 1(s0)
+; RV64IFXCHERI-NEXT:    cmove s0, zero
 ; RV64IFXCHERI-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    csc zero, 32(sp)
@@ -125,6 +127,7 @@ define i32 @unaligned_double(double addrspace(200)* nocapture readonly %arg, dou
 ; RV32IFXCHERI-NEXT:    srli a1, s1, 16
 ; RV32IFXCHERI-NEXT:    csh a1, 2(s2)
 ; RV32IFXCHERI-NEXT:    csh s1, 0(s2)
+; RV32IFXCHERI-NEXT:    cmove s2, zero
 ; RV32IFXCHERI-NEXT:    clc ra, 40(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 32(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    csc zero, 32(sp)
@@ -163,6 +166,7 @@ define i32 @unaligned_double(double addrspace(200)* nocapture readonly %arg, dou
 ; RV64IFXCHERI-NEXT:    srli a1, s0, 16
 ; RV64IFXCHERI-NEXT:    csh a1, 2(s1)
 ; RV64IFXCHERI-NEXT:    csh s0, 0(s1)
+; RV64IFXCHERI-NEXT:    cmove s1, zero
 ; RV64IFXCHERI-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    csc zero, 32(sp)
@@ -210,6 +214,7 @@ define i32 @unaligned_fp128(fp128 addrspace(200)* nocapture readonly %arg, fp128
 ; RV32IFXCHERI-NEXT:    csw s3, 8(s0)
 ; RV32IFXCHERI-NEXT:    csw s2, 4(s0)
 ; RV32IFXCHERI-NEXT:    csw s1, 0(s0)
+; RV32IFXCHERI-NEXT:    cmove s0, zero
 ; RV32IFXCHERI-NEXT:    clc ra, 72(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 64(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    csc zero, 64(sp)
@@ -252,6 +257,7 @@ define i32 @unaligned_fp128(fp128 addrspace(200)* nocapture readonly %arg, fp128
 ; RV64IFXCHERI-NEXT:    srli a1, s1, 32
 ; RV64IFXCHERI-NEXT:    csw a1, 4(s2)
 ; RV64IFXCHERI-NEXT:    csw s1, 0(s2)
+; RV64IFXCHERI-NEXT:    cmove s2, zero
 ; RV64IFXCHERI-NEXT:    clc ra, 64(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 48(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    csc zero, 48(sp)
@@ -294,6 +300,7 @@ define i32 @unaligned_int(i32 addrspace(200)* nocapture readonly %arg) unnamed_a
 ; RV32IFXCHERI-NEXT:    li a1, 1
 ; RV32IFXCHERI-NEXT:    csb zero, 1(s0)
 ; RV32IFXCHERI-NEXT:    csb a1, 0(s0)
+; RV32IFXCHERI-NEXT:    cmove s0, zero
 ; RV32IFXCHERI-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    clc s0, 16(sp) # 8-byte Folded Reload
 ; RV32IFXCHERI-NEXT:    csc zero, 16(sp)
@@ -324,6 +331,7 @@ define i32 @unaligned_int(i32 addrspace(200)* nocapture readonly %arg) unnamed_a
 ; RV64IFXCHERI-NEXT:    li a1, 1
 ; RV64IFXCHERI-NEXT:    csb zero, 1(s0)
 ; RV64IFXCHERI-NEXT:    csb a1, 0(s0)
+; RV64IFXCHERI-NEXT:    cmove s0, zero
 ; RV64IFXCHERI-NEXT:    clc ra, 32(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    clc s0, 16(sp) # 16-byte Folded Reload
 ; RV64IFXCHERI-NEXT:    csc zero, 16(sp)
