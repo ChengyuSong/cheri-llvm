@@ -2123,8 +2123,13 @@ struct Inv {
     };
     if (Free)
       for (CallBase *C : Frees) {
+        // A musttail must be the instruction before the return. Inserting
+        // the free clear after it is invalid IR, and it is not a zero site.
         if (isa<InvokeInst>(C))
           continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
         Value *P = C->getOperandBundle(memannot::TagFree)->Inputs[0];
         if (!DL.isFatPointer(P->getType()))
           continue;
@@ -2147,6 +2152,9 @@ struct Inv {
       for (CallBase *C : Frees) {
         if (isa<InvokeInst>(C))
           continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
         clearFreedReg(C, C->getNextNode());
       }
     if (FLog && !CapSlots.empty())
@@ -2207,6 +2215,22 @@ bool memannot::cheriInvalidateFreeActive() {
   return Mode == "all" || Mode.contains("free");
 }
 
+// [LLM-generated] M7.1c. One switch for the IR planting, the helper attribute,
+// the tail-call demotion, and the backend cmoves. Off leaves those calls as
+// they were before this pass.
+enum class FreeZeroToggle { Off, On };
+static cl::opt<FreeZeroToggle> FreeZeroRegsOpt(
+    "cheri-free-zero-regs", cl::init(FreeZeroToggle::On), cl::Hidden,
+    cl::desc("M7.1c: after a mem.free call, cmove dead caller-saved "
+             "capability registers to cnull (purecap)"),
+    cl::values(clEnumValN(FreeZeroToggle::Off, "off", "do not zero"),
+               clEnumValN(FreeZeroToggle::On, "on",
+                          "zero (default on purecap)")));
+
+bool memannot::cheriFreeZeroRegsEnabled() {
+  return FreeZeroRegsOpt == FreeZeroToggle::On;
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -2217,27 +2241,31 @@ bool memannot::runCheriInvalidate(Module &M) {
   // call has no SDNode.
   //
   // A tail call never returns, so the zero after it would be dead. Clearing
-  // the tail marker (not musttail: lowering rejects a musttail that is not
-  // a tail call) makes this call return into the existing zero. That is
-  // local to the call that already carries the free. Zeroing in the callee's
-  // epilogue would need a new marker on every function that might sit at the
-  // end of a drop chain, including calls that are not frees.
-  for (Function &F : M) {
-    if (F.isDeclaration())
-      continue;
-    for (Instruction &I : instructions(F)) {
-      auto *CB = dyn_cast<CallBase>(&I);
-      if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
+  // the tail marker makes this call return into the existing zero. musttail
+  // is left alone: lowering rejects a musttail that is not a tail call, and
+  // nothing may be placed after it, so it gets no zero either. Off skips
+  // this whole loop, so the call stays a tail call and gains no attribute.
+  if (memannot::cheriFreeZeroRegsEnabled()) {
+    for (Function &F : M) {
+      if (F.isDeclaration())
         continue;
-      if (CB->hasFnAttr("cheri-free-inner"))
-        continue;
-      if (const Function *Callee = CB->getCalledFunction())
-        if (Callee->isIntrinsic())
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
           continue;
-      if (auto *CI = dyn_cast<CallInst>(CB))
-        if (CI->isTailCall() && !CI->isMustTailCall())
-          CI->setTailCallKind(CallInst::TCK_None);
-      CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
+        if (CB->hasFnAttr("cheri-free-inner"))
+          continue;
+        if (const Function *Callee = CB->getCalledFunction())
+          if (Callee->isIntrinsic())
+            continue;
+        if (auto *CI = dyn_cast<CallInst>(CB)) {
+          if (CI->isMustTailCall())
+            continue;
+          if (CI->isTailCall())
+            CI->setTailCallKind(CallInst::TCK_None);
+        }
+        CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
+      }
     }
   }
   StringRef Mode = InvalidateOpt;

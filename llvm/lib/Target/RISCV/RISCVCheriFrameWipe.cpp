@@ -44,13 +44,6 @@ static cl::opt<Toggle> FrameWipeOpt(
     cl::values(clEnumValN(Toggle::Off, "off", "do not wipe"),
                clEnumValN(Toggle::On, "on", "wipe (default on purecap)")));
 
-static cl::opt<Toggle> FreeZeroOpt(
-    "cheri-free-zero-regs", cl::init(Toggle::On), cl::Hidden,
-    cl::desc("M7.1c: after a mem.free call, cmove dead caller-saved "
-             "capability registers to cnull (purecap)"),
-    cl::values(clEnumValN(Toggle::Off, "off", "do not zero"),
-               clEnumValN(Toggle::On, "on", "zero (default on purecap)")));
-
 namespace {
 
 class RISCVCheriFrameWipe : public MachineFunctionPass {
@@ -258,7 +251,9 @@ static const MCPhysReg CallerSavedCaps[] = {
 
 bool RISCVCheriFreeZeroRegs::runOnMachineFunction(MachineFunction &MF) {
   // Always drop the marker. Off (or a non-purecap target) leaves no cmoves.
-  bool Emit = FreeZeroOpt == Toggle::On && purecap(MF);
+  // The switch is the one the inliner reads. Off still drops a marker that
+  // an earlier, differently-flagged, compile left behind.
+  bool Emit = memannot::cheriFreeZeroRegsEnabled() && purecap(MF);
   const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
   const TargetRegisterInfo &TRI = *ST.getRegisterInfo();
   const TargetInstrInfo &TII = *ST.getInstrInfo();

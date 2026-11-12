@@ -1972,6 +1972,10 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
   // spaces to 200. Generic tests have neither a RISC-V triple nor those
   // spaces, so they do not grow a target attribute.
   auto FreeZeroTarget = [&]() {
+    // Same switch as the backend cmoves. Off plants nothing and adds no
+    // helper attribute, so the inlined call matches the pre-pass IR.
+    if (!memannot::cheriFreeZeroRegsEnabled())
+      return false;
     const Module *M = Caller->getParent();
     if (!M->getTargetTriple().isRISCV())
       return false;
