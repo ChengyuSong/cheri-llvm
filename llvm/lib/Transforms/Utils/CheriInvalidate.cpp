@@ -230,10 +230,11 @@ struct Inv {
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
-  // M7.1c-2a: allocas widened to whole-object words, words skipped because
-  // the alloca exceeds the byte cap, and own-null stores of widened words.
+  // M7.1c-2a: words nulled only at lifetime.end. They are not CapSlots, so
+  // free-log, free-site and scope range checks, and loan bookkeeping ignore
+  // them. A fixed-offset store stays in CapSlots and is not repeated here.
   unsigned WideAllocas = 0, WideSkippedLarge = 0, OwnNulledWide = 0;
-  DenseSet<std::pair<AllocaInst *, int64_t>> WideOffs;
+  MapVector<AllocaInst *, SmallVector<int64_t, 4>> WideByAlloca;
   struct LoanIntoScan {
     Instruction *At;
     Value *Slot; // slot address, or the buffer cap when Direct
@@ -318,10 +319,10 @@ struct Inv {
   }
 
   // Frame capability slots: (alloca, constant offset) written by a
-  // capability-typed store. With wide slots on, also every aligned word of a
-  // static alloca that is a memcpy/memmove destination or the target of a
-  // capability store at a variable index.
-  void addWide(AllocaInst *A, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+  // capability-typed store. memcpy/memmove destinations and variable-index
+  // capability stores are recorded separately and only own-nulled.
+  void addWide(AllocaInst *A,
+               const MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Fixed) {
     if (!A->isStaticAlloca())
       return;
     std::optional<TypeSize> Sz = A->getAllocationSize(DL);
@@ -334,31 +335,34 @@ struct Inv {
       ++WideSkippedLarge;
       return;
     }
+    const SmallVector<int64_t, 2> *Have = nullptr;
+    if (auto It = Fixed.find(A); It != Fixed.end())
+      Have = &It->second;
     bool Added = false;
-    auto &V = Out[A];
+    auto &V = WideByAlloca[A];
     for (uint64_t Off = 0; Off + 16 <= N; Off += 16) {
-      if (!is_contained(V, (int64_t)Off)) {
-        V.push_back((int64_t)Off);
-        Added = true;
-      }
-      // No constant store named this word's origin. Range checks stay
-      // conservative: an unknown provenance may point at a heap object, and
-      // at a frame object only when that object escapes.
-      Prov &Pv = SlotProv[{A, (int64_t)Off}];
-      if (Pv.Objs.empty())
-        Pv.Unknown = true;
-      WideOffs.insert({A, (int64_t)Off});
+      // A constant-offset store is already a normal slot. Leaving it there
+      // keeps free-log and range checks identical to the fixed-offset set.
+      if (Have && is_contained(*Have, (int64_t)Off))
+        continue;
+      if (is_contained(V, (int64_t)Off))
+        continue;
+      V.push_back((int64_t)Off);
+      Added = true;
     }
+    if (V.empty())
+      WideByAlloca.erase(A);
     if (Added)
       ++WideAllocas;
   }
-  void collectWide(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+  void collectWide(Function &F,
+                   const MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Fixed) {
     if (WideSlotsOpt != WideToggle::On)
       return;
     SmallPtrSet<AllocaInst *, 8> Seen;
     auto Consider = [&](AllocaInst *A) {
       if (Seen.insert(A).second)
-        addWide(A, Out);
+        addWide(A, Fixed);
     };
     for (Instruction &I : instructions(F)) {
       if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
@@ -378,7 +382,7 @@ struct Inv {
     }
   }
   void collectSlots(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
-    WideOffs.clear();
+    WideByAlloca.clear();
     for (Instruction &I : instructions(F)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
@@ -2120,7 +2124,8 @@ struct Inv {
     bool RegScope = InvCapReg && Scope;
     // M7.1b: a loan_into fact is scanned even when this function has no other
     // frame capability slot. A promoted marker is only counted.
-    if (CapSlots.empty() && !RegFree && !RegScope && !HasMove && !HasLoanInto)
+    if (CapSlots.empty() && WideByAlloca.empty() && !RegFree && !RegScope &&
+        !HasMove && !HasLoanInto)
       return;
     DominatorTree DT(F);
     buildCallReach(F);
@@ -2158,17 +2163,24 @@ struct Inv {
           std::optional<TypeSize> Sz = A->getAllocationSize(DL);
           if (Sz && !Sz->isScalable()) {
             ++ScopeEvents;
-            auto It = CapSlots.find(A);
-            if (It != CapSlots.end() && InvOwnNullEff)
-              for (int64_t Off : It->second) {
+            if (InvOwnNullEff) {
+              auto NullWord = [&](int64_t Off) {
                 Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
                 markClear(B.CreateAlignedStore(
                     ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
                     Align(16), InvVolatile), "cheri_inv_own");
                 ++OwnNulled;
-                if (WideOffs.count({A, Off}))
+              };
+              if (auto It = CapSlots.find(A); It != CapSlots.end())
+                for (int64_t Off : It->second)
+                  NullWord(Off);
+              // Widened words are own-nulled here and nowhere else.
+              if (auto W = WideByAlloca.find(A); W != WideByAlloca.end())
+                for (int64_t Off : W->second) {
+                  NullWord(Off);
                   ++OwnNulledWide;
-              }
+                }
+            }
             Value *Lo = nullptr;
             for (auto &[S, Offs] : CapSlots) {
               if (S == A || !liveAt(S, E, DT) || !readLater(S, E, DT))
