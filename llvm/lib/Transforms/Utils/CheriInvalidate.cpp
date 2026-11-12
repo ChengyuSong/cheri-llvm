@@ -2210,11 +2210,18 @@ bool memannot::cheriInvalidateFreeActive() {
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
-  // (a wipe inside an inlined allocator) is marked cheri.free.inner and is
+  // (a wipe inside an inlined allocator) carries "cheri-free-inner" and is
   // not that point; the inliner plants llvm.riscv.cheri.free.zero at the
   // inlined returns instead. The attribute survives strip and is visible to
   // LowerCall. !pcsections on the call is not: SelectionDAG asserts when the
   // call has no SDNode.
+  //
+  // A tail call never returns, so the zero after it would be dead. Clearing
+  // the tail marker (not musttail: lowering rejects a musttail that is not
+  // a tail call) makes this call return into the existing zero. That is
+  // local to the call that already carries the free. Zeroing in the callee's
+  // epilogue would need a new marker on every function that might sit at the
+  // end of a drop chain, including calls that are not frees.
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -2222,11 +2229,14 @@ bool memannot::runCheriInvalidate(Module &M) {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
         continue;
-      if (CB->hasMetadata("cheri.free.inner"))
+      if (CB->hasFnAttr("cheri-free-inner"))
         continue;
       if (const Function *Callee = CB->getCalledFunction())
         if (Callee->isIntrinsic())
           continue;
+      if (auto *CI = dyn_cast<CallInst>(CB))
+        if (CI->isTailCall() && !CI->isMustTailCall())
+          CI->setTailCallKind(CallInst::TCK_None);
       CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
     }
   }

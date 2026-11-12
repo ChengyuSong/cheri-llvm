@@ -1967,21 +1967,27 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
               }))
             Targets.push_back(C);
   }
-  // [LLM-generated] M7.1c. The free has finished at each return of the inlined
-  // body, after a free-list store. An out-of-line helper inside the body
-  // (a wipe) is not that point, even if it inherited the bundle. RISC-V only:
-  // the marker is a target intrinsic lowered to PseudoCheriFreeZero.
-  auto PlantFreeZero = [&]() {
-    if (Tag != memannot::TagFree)
-      return;
-    // The id lives in the RISCV intrinsic enum. Look it up by name so this
-    // generic pass does not include a target header. It only selects on
-    // HasCheri, so skip modules that are not CHERI.
+  // [LLM-generated] M7.1c. Purecap RISC-V. rustc spells the capability pointer
+  // spec "pfe200:", not "pf200:", but both set the program and alloca address
+  // spaces to 200. Generic tests have neither a RISC-V triple nor those
+  // spaces, so they do not grow a target attribute.
+  auto FreeZeroTarget = [&]() {
     const Module *M = Caller->getParent();
     if (!M->getTargetTriple().isRISCV())
+      return false;
+    const DataLayout &DL = M->getDataLayout();
+    return DL.getProgramAddressSpace() == 200 &&
+           DL.getAllocaAddrSpace() == 200;
+  };
+  // The free has finished at each return of the inlined body, after a
+  // free-list store. An out-of-line helper inside the body (a wipe) is not
+  // that point, even if it inherited the bundle. The marker is a RISC-V
+  // intrinsic lowered to PseudoCheriFreeZero.
+  auto PlantFreeZero = [&]() {
+    if (Tag != memannot::TagFree || !FreeZeroTarget())
       return;
-    if (!StringRef(M->getDataLayout().getStringRepresentation()).contains("-pf200:"))
-      return;
+    // Look the id up by name so this generic pass does not include a target
+    // header. It only selects on HasCheri.
     Intrinsic::ID ZID = Intrinsic::lookupIntrinsicID("llvm.riscv.cheri.free.zero");
     if (ZID == Intrinsic::not_intrinsic)
       return;
@@ -2023,10 +2029,11 @@ static void moveMemBundleIntoInlinedBody(CallBase &CB, StringRef Tag,
     // [LLM-generated] M7.1c. This call inherited "mem.free" from an inlined
     // caller. It is not the end of that free (a wipe may return, and the
     // free-list store is still ahead). Register zeroing uses the marker at
-    // the inlined return.
-    if (Tag == memannot::TagFree)
-      NewC->setMetadata("cheri.free.inner",
-                        MDNode::get(NewC->getContext(), {}));
+    // the inlined return. A call-site attribute survives DeadArgumentElimination
+    // and the other call rewriters, which keep function attributes and operand
+    // bundles but drop every metadata kind except prof and dbg.
+    if (Tag == memannot::TagFree && FreeZeroTarget())
+      NewC->addFnAttr(Attribute::get(NewC->getContext(), "cheri-free-inner"));
     C->replaceAllUsesWith(NewC);
     C->eraseFromParent();
   }

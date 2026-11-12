@@ -4,6 +4,7 @@
 ; free-list store that follows it.
 ;
 ; RUN: opt -S -passes=inline < %s | llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 | FileCheck %s
+; RUN: sed 's/^target datalayout = .*/target datalayout = "e-m:e-p:64:64-pfe200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"/' %s | opt -S -passes=inline | llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 | FileCheck %s
 ; RUN: rm -f %t.stats && opt -S -passes=inline < %s | llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -cheri-invalidate-stats-out=%t.stats -o /dev/null && FileCheck %s --check-prefix=STATS < %t.stats
 
 target triple = "riscv64-unknown-unknown"
