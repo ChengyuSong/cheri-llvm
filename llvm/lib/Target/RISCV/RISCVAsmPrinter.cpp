@@ -1391,7 +1391,8 @@ static MCOperand lowerSymbolOperand(const MachineOperand &MO, MCSymbol *Sym,
   MCContext &Ctx = AP.OutContext;
   RISCV::Specifier Kind;
 
-  switch (MO.getTargetFlags() & ~RISCVII::MO_JUMP_TABLE_BASE) {
+  switch (MO.getTargetFlags() &
+          ~(RISCVII::MO_JUMP_TABLE_BASE | RISCVII::MO_CHERI_MAYFREE)) {
   default:
     llvm_unreachable("Unknown target flag on GV operand");
   case RISCVII::MO_None:

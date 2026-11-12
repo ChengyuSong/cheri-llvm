@@ -2758,6 +2758,96 @@ bool memannot::cheriFreeZeroRegsEnabled() {
   return FreeZeroRegsOpt == FreeZeroToggle::On;
 }
 
+// [LLM-generated] M7.1c-2c-narrow. Bench was paying for a cmove at every dead
+// CSR, including fmt and base64, where the epilogue restore already drops the
+// capability. Default mayfree plants a clear only across a free.
+enum class DeadCapToggle { Off, MayFree, All };
+static cl::opt<DeadCapToggle> DeadCapOpt(
+    "cheri-invalidate-dead-csr", cl::init(DeadCapToggle::MayFree), cl::Hidden,
+    cl::desc("M7.1c-2c: null a dead callee-saved capability and a dead "
+             "capability spill slot"),
+    cl::values(clEnumValN(DeadCapToggle::Off, "off", "do not clear"),
+               clEnumValN(DeadCapToggle::MayFree, "mayfree",
+                          "only across a mem.free or moved-owner call (default)"),
+               clEnumValN(DeadCapToggle::All, "all",
+                          "across any later call or return")));
+
+memannot::CheriDeadCapMode memannot::cheriDeadCapMode() {
+  switch (DeadCapOpt) {
+  case DeadCapToggle::Off:
+    return CheriDeadCapMode::Off;
+  case DeadCapToggle::All:
+    return CheriDeadCapMode::All;
+  case DeadCapToggle::MayFree:
+    return CheriDeadCapMode::MayFree;
+  }
+  return CheriDeadCapMode::MayFree;
+}
+
+// [LLM-generated] M7.1c-2c-narrow. Tag may-free calls before ISel, on a
+// DominatorTree that lives only for this function. LowerCall reads the
+// attribute; it does not rebuild a tree. A process-wide cache here races
+// when rustc runs ISel on many codegen units at once.
+static void tagMayFreeCalls(Module &M) {
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    DominatorTree DT(F);
+    const DataLayout &DL = M.getDataLayout();
+    SmallVector<std::pair<const Instruction *, const Value *>, 4> Moves;
+    SmallVector<std::tuple<const Instruction *, const Value *, const Value *>, 4>
+        Xfers;
+    for (const Instruction &J : instructions(F)) {
+      if (memannot::isMemMoveFact(&J)) {
+        if (const Value *Slot = memannot::slotClobber(&J))
+          Moves.emplace_back(&J, getUnderlyingObject(Slot));
+      }
+      if (const auto *MT = dyn_cast<MemTransferInst>(&J))
+        Xfers.emplace_back(MT, getUnderlyingObject(MT->getRawDest()),
+                           getUnderlyingObject(MT->getRawSource()));
+    }
+    auto takesMoved = [&](const CallBase &CB) {
+      for (const Value *Arg : CB.args()) {
+        if (!DL.isFatPointer(Arg->getType()))
+          continue;
+        const Value *U = getUnderlyingObject(Arg);
+        for (auto [Fact, Mv] : Moves)
+          if (DT.dominates(Fact, &CB) && U == Mv)
+            return true;
+        for (auto [MT, Dest, Src] : Xfers) {
+          if (!DT.dominates(MT, &CB) || Dest != U)
+            continue;
+          for (auto [Fact, Mv] : Moves)
+            if (DT.dominates(Fact, &CB) && Src == Mv)
+              return true;
+        }
+      }
+      return false;
+    };
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      bool MayFree = false;
+      if (CB->getOperandBundle(memannot::TagFree))
+        MayFree = true;
+      else if (!CB->isInlineAsm()) {
+        if (const Function *CF = CB->getCalledFunction()) {
+          StringRef N = CF->getName();
+          if (N.contains("drop_in_place") || N.contains("drop_glue"))
+            MayFree = true;
+        }
+        if (!MayFree && memannot::isDeallocCall(*CB))
+          MayFree = true;
+        if (!MayFree && takesMoved(*CB))
+          MayFree = true;
+      }
+      if (MayFree)
+        CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-may-free"));
+    }
+  }
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -2804,11 +2894,15 @@ bool memannot::runCheriInvalidate(Module &M) {
   bool Free = All || Mode.contains("free");
   bool Loan = All || Mode.contains("loan");
   bool FLogOn = Mode.contains("flog");
-  if (!Scope && !Free && !Loan && !FLogOn && InvStatsOut.empty())
-    return false;
-  Inv I(M, Scope, Free, Loan);
-  I.FLog = FLogOn;
-  I.AFLog = Mode.contains("aflog");
-  I.run();
+  if (Scope || Free || Loan || FLogOn || !InvStatsOut.empty()) {
+    Inv I(M, Scope, Free, Loan);
+    I.FLog = FLogOn;
+    I.AFLog = Mode.contains("aflog");
+    I.run();
+  }
+  // After invalidation, before stripAnnotations drops mem.free bundles and
+  // mem.move facts. The attribute is copied when a bundled call is rebuilt.
+  if (cheriDeadCapMode() == CheriDeadCapMode::MayFree)
+    tagMayFreeCalls(M);
   return Scope || Free || Loan || FLogOn;
 }

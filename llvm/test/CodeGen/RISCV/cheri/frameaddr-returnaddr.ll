@@ -186,7 +186,6 @@ define i8 addrspace(200)* @test_returnaddress_0_alloca() nounwind {
 ; RV64IXCHERI-NEXT:    csetbounds a0, a0, 100
 ; RV64IXCHERI-NEXT:    ccall notdead
 ; RV64IXCHERI-NEXT:    cmove a0, s0
-; RV64IXCHERI-NEXT:    cmove s0, zero
 ; RV64IXCHERI-NEXT:    clc ra, 128(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 112(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    csc zero, 112(sp)

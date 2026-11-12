@@ -65,13 +65,10 @@ define void @realloc_same(ptr addrspace(200) %p) addrspace(200) {
 ; ASM-NEXT:    cmove a7, zero
 ; ASM-NEXT:    cmove s2, a0
 ; ASM-NEXT:    cmove a0, s0
-; ASM-NEXT:    cmove s0, zero
 ; ASM-NEXT:    ccall use
 ; ASM-NEXT:    cmove a0, s1
-; ASM-NEXT:    cmove s1, zero
 ; ASM-NEXT:    ccall use
 ; ASM-NEXT:    cmove a0, s2
-; ASM-NEXT:    cmove s2, zero
 ; ASM-NEXT:    ccall use
 ; ASM-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; ASM-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload

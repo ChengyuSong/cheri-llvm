@@ -2,7 +2,7 @@
 ; annotation (and values kept alive only by them) so codegen is unchanged.
 ; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s
 ; RUN: opt -S -passes=cheri-bounds-lowering %S/Inputs/strip-plain.ll -o %t.plain.ll
-; RUN: opt -S -passes=cheri-bounds-lowering < %s | sed -e 's/^source_filename.*//' -e 's/^; ModuleID.*//' -e 's/ #1$//' -e '/attributes #1 = { "cheri-free-regs" }/d' > %t.stripped.ll
+; RUN: opt -S -passes=cheri-bounds-lowering < %s | sed -e 's/^source_filename.*//' -e 's/^; ModuleID.*//' -e 's/"cheri-free-regs" //' -e 's/ "cheri-free-regs"//' > %t.stripped.ll
 ; RUN: sed -e 's/^source_filename.*//' -e 's/^; ModuleID.*//' %t.plain.ll | diff - %t.stripped.ll
 
 declare void @llvm.mem.fact()
