@@ -258,6 +258,14 @@ struct Inv {
   unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
   unsigned FreeDeadCallPlain = 0, FreeDeadCallChecked = 0;
   DenseMap<std::pair<AllocaInst *, int64_t>, SmallVector<Value *, 2>> SlotStored;
+  // Every pointer store into an alloca, any index. Unknown if a copy or too
+  // many stores hide the values. Used to see through a load from a local
+  // array such as s1's %array.i.
+  struct AllocaFill {
+    SmallVector<Value *, 4> Vals;
+    bool Unknown = false;
+  };
+  DenseMap<AllocaInst *, AllocaFill> Fills;
   MapVector<AllocaInst *, SmallVector<int64_t, 4>> WideByAlloca;
   struct LoanIntoScan {
     Instruction *At;
@@ -408,6 +416,7 @@ struct Inv {
   void collectSlots(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
     WideByAlloca.clear();
     SlotStored.clear();
+    Fills.clear();
     for (Instruction &I : instructions(F)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
@@ -436,6 +445,25 @@ struct Inv {
     collectWide(F, Out);
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
+    Fills.clear();
+    for (Instruction &I : instructions(F)) {
+      if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+        if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(MT->getRawDest())))
+          Fills[A].Unknown = true;
+        continue;
+      }
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
+        continue;
+      auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand()));
+      if (!A)
+        continue;
+      AllocaFill &Fill = Fills[A];
+      if (Fill.Vals.size() >= 32)
+        Fill.Unknown = true;
+      else
+        Fill.Vals.push_back(SI->getValueOperand());
+    }
   }
 
   static void lifetimeMarkers(AllocaInst *A, SmallVectorImpl<Instruction *> &Starts,
@@ -605,7 +633,7 @@ struct Inv {
   // *Heap is that load: its bounds are the freed allocation, not the Vec
   // header that drop_glue receives.
   bool derivedFrom(const Value *V, ArrayRef<const Value *> Aliases,
-                   const Value **Heap) {
+                   const Value **Heap, unsigned Depth = 0) {
     SmallVector<const Value *, 8> WL{V};
     SmallPtrSet<const Value *, 8> Seen;
     for (unsigned Steps = 0; Steps < 16 && !WL.empty(); ++Steps) {
@@ -624,11 +652,29 @@ struct Inv {
       }
       if (auto *LI = dyn_cast<LoadInst>(X)) {
         const Value *P = LI->getPointerOperand();
-        if (isAlias(P, Aliases) || isAlias(getUnderlyingObject(P), Aliases)) {
+        const Value *PU = getUnderlyingObject(P);
+        if (isAlias(P, Aliases) || isAlias(PU, Aliases)) {
           if (Heap && !*Heap)
             *Heap = LI;
           return true;
         }
+        // s1: rN = load %array.i, and %array.i was filled with gep(load %v).
+        // Follow every store, at any index. Give up if the array escapes, a
+        // store is unknown, or the chain is too deep.
+        auto *SrcA = dyn_cast<AllocaInst>(PU);
+        if (!SrcA || Depth >= 3 || escapes(SrcA))
+          continue;
+        auto Fit = Fills.find(SrcA);
+        if (Fit == Fills.end() || Fit->second.Unknown || Fit->second.Vals.empty())
+          continue;
+        bool All = true;
+        for (const Value *S : Fit->second.Vals)
+          if (!derivedFrom(S, Aliases, Heap, Depth + 1)) {
+            All = false;
+            break;
+          }
+        if (All)
+          return true;
         continue;
       }
       if (auto *PHI = dyn_cast<PHINode>(X)) {
@@ -709,12 +755,23 @@ struct Inv {
   bool slotHoldsOwner(AllocaInst *A, int64_t Off, ArrayRef<const Value *> Aliases,
                       const Value **Heap) {
     auto It = SlotStored.find({A, Off});
-    if (It == SlotStored.end())
+    if (It != SlotStored.end()) {
+      for (const Value *S : It->second)
+        if (derivedFrom(S, Aliases, Heap, 0))
+          return true;
       return false;
-    for (const Value *S : It->second)
-      if (derivedFrom(S, Aliases, Heap))
-        return true;
-    return false;
+    }
+    // No constant-offset store (s1's %array.i). If every pointer stored into
+    // it, at any index, is derived from the owner, the array itself is too.
+    if (escapes(A))
+      return false;
+    auto Fit = Fills.find(A);
+    if (Fit == Fills.end() || Fit->second.Unknown || Fit->second.Vals.empty())
+      return false;
+    for (const Value *S : Fit->second.Vals)
+      if (!derivedFrom(S, Aliases, Heap, 0))
+        return false;
+    return true;
   }
   static bool isOwnerFreeCall(const CallBase &CB) {
     if (CB.getOperandBundle(memannot::TagFree) || CB.isInlineAsm())

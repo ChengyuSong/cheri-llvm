@@ -263,14 +263,107 @@ define void @partial_copy(ptr addrspace(200) %v) {
 ; ON-NOT: store volatile
 ; ON: ret void
 
+; s1 at O2: a loop fills %array from gep(load %v), then slots are loaded
+; from that array. The drop still sees only the moved temporary.
+define void @s1_array_o2(ptr addrspace(200) %v) {
+entry:
+  %tmp = alloca [16 x i8], align 16, addrspace(200)
+  %array = alloca [4 x ptr addrspace(200)], align 16, addrspace(200)
+  %r0 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r1 = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %tmp, ptr addrspace(200) %v, i64 16, i1 false)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %v) ]
+  %buf = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %n, %loop ]
+  %elem = getelementptr i8, ptr addrspace(200) %buf, i64 %i
+  %slot = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 %i
+  store ptr addrspace(200) %elem, ptr addrspace(200) %slot, align 16
+  %n = add i64 %i, 1
+  %c = icmp ult i64 %n, 4
+  br i1 %c, label %loop, label %exit
+exit:
+  %p0 = load ptr addrspace(200), ptr addrspace(200) %array, align 16
+  %p1p = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 1
+  %p1 = load ptr addrspace(200), ptr addrspace(200) %p1p, align 16
+  store ptr addrspace(200) %p0, ptr addrspace(200) %r0, align 16
+  store ptr addrspace(200) %p1, ptr addrspace(200) %r1, align 16
+  call void asm sideeffect "", "r,~{memory}"(ptr addrspace(200) %r0)
+  call void @drop_glue(ptr addrspace(200) %tmp)
+  ret void
+}
+; ON-LABEL: define void @s1_array_o2(
+; ON: call {{.*}}@drop_glue(
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r0, align 16
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r1, align 16
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %array, align 16
+; ON-NOT: cheri.inv.cap
+; ON: ret void
+; OFF-LABEL: define void @s1_array_o2(
+; OFF: call {{.*}}@drop_glue(
+; OFF-NOT: store volatile
+; OFF: ret void
+; CALLSOFF-LABEL: define void @s1_array_o2(
+; CALLSOFF: call {{.*}}@drop_glue(
+; CALLSOFF-NOT: store volatile
+; CALLSOFF: ret void
+
+; s1 at O1: the same array, filled by straight-line stores, then five slots.
+define void @s1_array_o1(ptr addrspace(200) %v) {
+  %tmp = alloca [16 x i8], align 16, addrspace(200)
+  %array = alloca [5 x ptr addrspace(200)], align 16, addrspace(200)
+  %r0 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r1 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r2 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r3 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r4 = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %tmp, ptr addrspace(200) %v, i64 16, i1 false)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %v) ]
+  %buf = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  %e0 = getelementptr i8, ptr addrspace(200) %buf, i64 0
+  %e1 = getelementptr i8, ptr addrspace(200) %buf, i64 1
+  %e2 = getelementptr i8, ptr addrspace(200) %buf, i64 2
+  %e3 = getelementptr i8, ptr addrspace(200) %buf, i64 3
+  %e4 = getelementptr i8, ptr addrspace(200) %buf, i64 4
+  %a0 = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 0
+  %a1 = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 1
+  %a2 = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 2
+  %a3 = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 3
+  %a4 = getelementptr ptr addrspace(200), ptr addrspace(200) %array, i64 4
+  store ptr addrspace(200) %e0, ptr addrspace(200) %a0, align 16
+  store ptr addrspace(200) %e1, ptr addrspace(200) %a1, align 16
+  store ptr addrspace(200) %e2, ptr addrspace(200) %a2, align 16
+  store ptr addrspace(200) %e3, ptr addrspace(200) %a3, align 16
+  store ptr addrspace(200) %e4, ptr addrspace(200) %a4, align 16
+  %p0 = load ptr addrspace(200), ptr addrspace(200) %a0, align 16
+  %p1 = load ptr addrspace(200), ptr addrspace(200) %a1, align 16
+  %p2 = load ptr addrspace(200), ptr addrspace(200) %a2, align 16
+  %p3 = load ptr addrspace(200), ptr addrspace(200) %a3, align 16
+  %p4 = load ptr addrspace(200), ptr addrspace(200) %a4, align 16
+  store ptr addrspace(200) %p0, ptr addrspace(200) %r0, align 16
+  store ptr addrspace(200) %p1, ptr addrspace(200) %r1, align 16
+  store ptr addrspace(200) %p2, ptr addrspace(200) %r2, align 16
+  store ptr addrspace(200) %p3, ptr addrspace(200) %r3, align 16
+  store ptr addrspace(200) %p4, ptr addrspace(200) %r4, align 16
+  call void @drop_glue(ptr addrspace(200) %tmp)
+  ret void
+}
+; ON-LABEL: define void @s1_array_o1(
+; ON: call {{.*}}@drop_glue(
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %array, align 16
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r0, align 16
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r4, align 16
+; ON: ret void
+
 ; ON: [[DEAD]] = !{!"cheri_inv_free_dead"}
 
 ; Inline frees: plain 1 + wide 3, escaped wide 3 checks.
-; Drop calls: r1 1 + s1 2 + r1_o2 1 + s1_o2 2 plain, drop_escaped 1 + r1_escaped 1 check.
+; Drop calls add r1_o2 1, s1_o2 2, s1_o2 array 4, s1_o1 slots 5, s1_o1 array 5.
 ; STATS: range_checks=5
 ; STATS-SAME: flog_calls=0
 ; STATS-SAME: flog_loops=0
 ; STATS-SAME: free_dead_plain=4
 ; STATS-SAME: free_dead_checked=3
-; STATS-SAME: free_dead_call_plain=6
+; STATS-SAME: free_dead_call_plain=22
 ; STATS-SAME: free_dead_call_checked=2
