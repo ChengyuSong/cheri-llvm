@@ -26968,6 +26968,13 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
   // If the callee is a GlobalAddress/ExternalSymbol node, turn it into a
   // TargetGlobalAddress/TargetExternalSymbol node so that legalize won't
   // split it and then direct call can be matched by PseudoCALL.
+  // [LLM-generated] M7.1c-2c-narrow. The may-free bit rides on the existing
+  // call operand so the post-RA clear does not insert a scheduling barrier.
+  unsigned CallTF = RISCVII::MO_CALL;
+  if (CLI.CB &&
+      memannot::cheriDeadCapMode() == memannot::CheriDeadCapMode::MayFree &&
+      memannot::isCheriMayFreeCall(*CLI.CB))
+    CallTF |= RISCVII::MO_CHERI_MAYFREE;
   bool CalleeIsLargeExternalSymbol = false;
   if (getTargetMachine().getCodeModel() == CodeModel::Large) {
     if (auto *S = dyn_cast<GlobalAddressSDNode>(Callee))
@@ -26983,7 +26990,7 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
       Callee = getAddr(S, Callee.getValueType(), DAG, /*IsLocal=*/false,
                        /*CanDeriveFromPcc=*/true);
     } else {
-      Callee = DAG.getTargetGlobalAddress(GV, DL, PtrVT, 0, RISCVII::MO_CALL);
+      Callee = DAG.getTargetGlobalAddress(GV, DL, PtrVT, 0, CallTF);
     }
   } else if (ExternalSymbolSDNode *S = dyn_cast<ExternalSymbolSDNode>(Callee)) {
     if (RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI()) &&
@@ -26991,8 +26998,7 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
       Callee = getAddr(S, Callee.getValueType(), DAG, /*IsLocal=*/false,
                        /*CanDeriveFromPcc=*/true);
     } else {
-      Callee =
-          DAG.getTargetExternalFunctionSymbol(S->getSymbol(), RISCVII::MO_CALL);
+      Callee = DAG.getTargetExternalFunctionSymbol(S->getSymbol(), CallTF);
     }
   }
 

@@ -1,8 +1,6 @@
 # [LLM-generated] M6.1 D97/D98. A pseudo whose register is read again is
 # dropped. A dead register is cleared. A stack-colored address that is
-# later the input of csetbounds keeps the loan pseudo dropped. C1 nulls that
-# callee-saved cap after the csetbounds, once it is dead before the return.
-# A spill slot that is
+# later the input of csetbounds is left alone. A spill slot that is
 # reloaded after the clear is not nulled. A bounded cap that is live
 # around a loop is cleared on the exit edge, not inside the loop.
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
@@ -72,7 +70,7 @@ stack:
 # CHECK-LABEL: name: colored
 # CHECK: $x8_y = CIncOffsetImm %stack.0, 0
 # CHECK-NEXT: $x10_y = CSetBoundsImm $x8_y, 48
-# CHECK-NEXT: $x8_y = PseudoCheriCapClear killed $x8_y
+# CHECK-NOT: PseudoCheriCapClear $x8_y
 ---
 name:            compare
 alignment:       2

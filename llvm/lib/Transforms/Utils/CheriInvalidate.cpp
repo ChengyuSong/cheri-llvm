@@ -2758,6 +2758,90 @@ bool memannot::cheriFreeZeroRegsEnabled() {
   return FreeZeroRegsOpt == FreeZeroToggle::On;
 }
 
+// [LLM-generated] M7.1c-2c-narrow. Bench was paying for a cmove at every dead
+// CSR, including fmt and base64, where the epilogue restore already drops the
+// capability. Default mayfree plants a clear only across a free.
+enum class DeadCapToggle { Off, MayFree, All };
+static cl::opt<DeadCapToggle> DeadCapOpt(
+    "cheri-invalidate-dead-csr", cl::init(DeadCapToggle::MayFree), cl::Hidden,
+    cl::desc("M7.1c-2c: null a dead callee-saved capability and a dead "
+             "capability spill slot"),
+    cl::values(clEnumValN(DeadCapToggle::Off, "off", "do not clear"),
+               clEnumValN(DeadCapToggle::MayFree, "mayfree",
+                          "only across a mem.free or moved-owner call (default)"),
+               clEnumValN(DeadCapToggle::All, "all",
+                          "across any later call or return")));
+
+memannot::CheriDeadCapMode memannot::cheriDeadCapMode() {
+  switch (DeadCapOpt) {
+  case DeadCapToggle::Off:
+    return CheriDeadCapMode::Off;
+  case DeadCapToggle::All:
+    return CheriDeadCapMode::All;
+  case DeadCapToggle::MayFree:
+    return CheriDeadCapMode::MayFree;
+  }
+  return CheriDeadCapMode::MayFree;
+}
+
+bool memannot::isCheriMayFreeCall(const CallBase &CB) {
+  if (CB.getOperandBundle(TagFree))
+    return true;
+  if (CB.isInlineAsm())
+    return false;
+  if (const Function *CF = CB.getCalledFunction()) {
+    StringRef N = CF->getName();
+    if (N.contains("drop_in_place") || N.contains("drop_glue"))
+      return true;
+  }
+  if (isDeallocCall(CB))
+    return true;
+  const Function *Fn = CB.getFunction();
+  if (!Fn)
+    return false;
+  // One dominator tree per function. ISel asks once per call.
+  struct Cache {
+    const Function *F = nullptr;
+    DominatorTree DT;
+    SmallVector<std::pair<const Instruction *, const Value *>, 4> Moves;
+    SmallVector<std::tuple<const Instruction *, const Value *, const Value *>, 4>
+        Xfers;
+  };
+  static Cache C;
+  if (C.F != Fn) {
+    C.F = Fn;
+    C.DT.recalculate(*const_cast<Function *>(Fn));
+    C.Moves.clear();
+    C.Xfers.clear();
+    for (const Instruction &J : instructions(*Fn)) {
+      if (isMemMoveFact(&J)) {
+        if (const Value *Slot = slotClobber(&J))
+          C.Moves.emplace_back(&J, getUnderlyingObject(Slot));
+      }
+      if (const auto *MT = dyn_cast<MemTransferInst>(&J))
+        C.Xfers.emplace_back(MT, getUnderlyingObject(MT->getRawDest()),
+                             getUnderlyingObject(MT->getRawSource()));
+    }
+  }
+  const DataLayout &DL = Fn->getParent()->getDataLayout();
+  for (const Value *Arg : CB.args()) {
+    if (!DL.isFatPointer(Arg->getType()))
+      continue;
+    const Value *U = getUnderlyingObject(Arg);
+    for (auto [Fact, Mv] : C.Moves)
+      if (C.DT.dominates(Fact, &CB) && U == Mv)
+        return true;
+    for (auto [MT, Dest, Src] : C.Xfers) {
+      if (!C.DT.dominates(MT, &CB) || Dest != U)
+        continue;
+      for (auto [Fact, Mv] : C.Moves)
+        if (C.DT.dominates(Fact, &CB) && Src == Mv)
+          return true;
+    }
+  }
+  return false;
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle

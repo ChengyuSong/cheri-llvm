@@ -500,6 +500,10 @@ enum {
   MO_DIRECT_FLAG_MASK = 31,
 
   MO_JUMP_TABLE_BASE = 32,
+  // [LLM-generated] M7.1c-2c-narrow. On a call target: this call is a mem.free
+  // or takes a moved owner. Not a new instruction, so it does not reschedule
+  // the call. The asm printer ignores it.
+  MO_CHERI_MAYFREE = 64,
 };
 } // namespace RISCVII
 

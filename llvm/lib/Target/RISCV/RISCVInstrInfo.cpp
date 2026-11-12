@@ -3834,7 +3834,8 @@ ArrayRef<std::pair<unsigned, const char *>>
 RISCVInstrInfo::getSerializableBitmaskMachineOperandTargetFlags() const {
   using namespace RISCVII;
   static const std::pair<unsigned, const char *> TargetFlags[] = {
-      {MO_JUMP_TABLE_BASE, "riscv-jump-table-base"}};
+      {MO_JUMP_TABLE_BASE, "riscv-jump-table-base"},
+      {MO_CHERI_MAYFREE, "riscv-cheri-mayfree"}};
   return ArrayRef(TargetFlags);
 }
 

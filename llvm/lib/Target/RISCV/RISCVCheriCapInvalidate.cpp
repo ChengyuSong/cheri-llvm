@@ -35,13 +35,14 @@
 // D102 drops a repeated clear of the same register on one path.
 // D103: a loop backedge is not a spill-search abort.
 //
-// C1 (M7.1c-2c). -cheri-invalidate-dead-csr (default on) nulls a capability
-// in a callee-saved register at its last use when no path reads it again
-// before the next call or return, and nulls a capability spill slot after
-// its last reload or spill when no path reloads it and a call still follows.
-// The epilogue frame wipe covers slots at the return. The null store's
-// address is the frame index, so it resolves from sp or fp. Off skips this
-// scan, so the MIR this pass emits is the loan/free/scope path only.
+// C1 (M7.1c-2c). -cheri-invalidate-dead-csr. mayfree (default) nulls a
+// capability in a callee-saved register, or a capability spill slot, only
+// when that value would still be there across a mem.free or a moved-owner
+// call (riscv-cheri-mayfree on the call) before the next return. all keeps the wider
+// rule: any later call or return. off skips this scan, so the MIR this
+// pass emits is the loan/free/scope path only. The null store's address is
+// the frame index, so it resolves from sp or fp. The epilogue frame wipe
+// covers a slot that never crosses a free.
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
@@ -626,16 +627,12 @@ static bool isCalleeSavedSlot(const MachineFrameInfo &MFI, int FI) {
   return false;
 }
 
-// C1. Off emits nothing from this scan, so codegen matches the pass without it.
-enum class DeadCSRMode { Off, On };
-static cl::opt<DeadCSRMode> DeadCSROpt(
-    "cheri-invalidate-dead-csr", cl::init(DeadCSRMode::On), cl::Hidden,
-    cl::desc("M7.1c-2c: null a dead callee-saved capability at its last use, "
-             "and a capability spill slot after its last reload"),
-    cl::values(clEnumValN(DeadCSRMode::Off, "off", "do not clear"),
-               clEnumValN(DeadCSRMode::On, "on", "clear (default)")));
+// C1. Off emits nothing from this scan. The switch lives in CheriInvalidate
+// so isel and this pass read one value.
 static unsigned DeadCSRClears = 0;
 static unsigned DeadSpillClears = 0;
+static unsigned DeadCSRSkipped = 0;
+static unsigned DeadSpillSkipped = 0;
 
 static bool isCapSpillMem(unsigned Opc) {
   return Opc == RISCV::CLC_128 || Opc == RISCV::CLC_64 ||
@@ -766,6 +763,82 @@ static bool callBeforeSlotWrite(MachineBasicBlock &MBB,
   return Walk(Walk, MBB, It);
 }
 
+// A direct call LowerCall tagged because it is a mem.free or it takes a
+// moved owner. The bit is on the existing call operand.
+static bool isMayFreeCall(const MachineInstr &MI) {
+  if (!MI.isCall() || MI.isMetaInstruction() ||
+      MI.getOpcode() == RISCV::PseudoCheriCapInvalidate)
+    return false;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.getTargetFlags() & RISCVII::MO_CHERI_MAYFREE)
+      return true;
+  return false;
+}
+
+// mayfree. True when a may-free call is reached before R is redefined and
+// before a return. An ordinary call does not count: the epilogue restore
+// already drops a capability that never crosses a free.
+static bool mayFreeBeforeRedef(MachineInstr &MI, Register R,
+                               const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 4096;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    for (; It != BB.end(); ++It) {
+      if (Budget-- == 0)
+        return true;
+      if (It->isDebugInstr())
+        continue;
+      if (isMayFreeCall(*It))
+        return true;
+      if (It->isReturn())
+        return false;
+      if (definesOverlap(*It, R, TRI))
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, *MI.getParent(), std::next(MI.getIterator()));
+}
+
+// mayfree, spill slots. A later reload or store of FI, or a return with no
+// may-free marker, leaves the slot to the epilogue frame wipe.
+static bool mayFreeBeforeSlotWrite(MachineBasicBlock &MBB,
+                                   MachineBasicBlock::iterator It, int FI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 4096;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator I) -> bool {
+    for (; I != BB.end(); ++I) {
+      if (Budget-- == 0)
+        return true;
+      if (I->isDebugInstr())
+        continue;
+      if (isMayFreeCall(*I))
+        return true;
+      std::optional<int> Got = frameIndexOf(*I);
+      if (Got && *Got == FI && (I->mayLoad() || I->mayStore()))
+        return false;
+      if (I->isReturn())
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, MBB, It);
+}
+
 static bool isDeadCapCSR(Register R, const MachineFunction &MF,
                          const TargetRegisterInfo &TRI) {
   if (!R.isPhysical() || !RISCV::YGPRRegClass.contains(R))
@@ -790,8 +863,10 @@ static bool isDeadCapCSR(Register R, const MachineFunction &MF,
 
 // C1. Runs after the loan/free/scope rewrites. Off returns before any edit.
 static bool clearDeadCaps(MachineFunction &MF) {
-  if (DeadCSROpt != DeadCSRMode::On)
+  memannot::CheriDeadCapMode Mode = memannot::cheriDeadCapMode();
+  if (Mode == memannot::CheriDeadCapMode::Off)
     return false;
+  bool OnlyMayFree = Mode == memannot::CheriDeadCapMode::MayFree;
   const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
   const TargetRegisterInfo &TRI = *ST.getRegisterInfo();
   const TargetInstrInfo &TII = *ST.getInstrInfo();
@@ -809,14 +884,14 @@ static bool clearDeadCaps(MachineFunction &MF) {
     Register Reg;
   };
   struct SpillSite {
-    MachineBasicBlock *MBB;
-    MachineInstr *Before;
+    MachineInstr *Anchor;
     int FI;
     unsigned Opc;
     int64_t Imm;
   };
   SmallVector<CSRSite, 8> CSRs;
   SmallVector<SpillSite, 8> Spills;
+  unsigned SkipCSRCount = 0, SkipSpillCount = 0;
 
   if (!SkipCSR) {
     for (MachineBasicBlock &MBB : MF) {
@@ -839,8 +914,12 @@ static bool clearDeadCaps(MachineFunction &MF) {
             continue;
           if (deadCapReadLater(MI, R, TRI))
             continue;
-          if (!callOrRetBeforeRedef(MI, R, TRI))
+          bool Plant = OnlyMayFree ? mayFreeBeforeRedef(MI, R, TRI)
+                                   : callOrRetBeforeRedef(MI, R, TRI);
+          if (!Plant) {
+            ++SkipCSRCount;
             continue;
+          }
           CSRs.push_back({&MI, R});
         }
       }
@@ -868,15 +947,18 @@ static bool clearDeadCaps(MachineFunction &MF) {
       auto Next = std::next(MI.getIterator());
       if (reloadBeforeStore(MBB, Next, *FI))
         continue;
-      if (!callBeforeSlotWrite(MBB, Next, *FI))
+      bool Plant = OnlyMayFree ? mayFreeBeforeSlotWrite(MBB, Next, *FI)
+                               : callBeforeSlotWrite(MBB, Next, *FI);
+      if (!Plant) {
+        ++SkipSpillCount;
         continue;
+      }
       unsigned StoreOpc = MI.mayLoad() ? storeOpcForReload(MI.getOpcode())
                                        : MI.getOpcode();
       unsigned Bytes = StoreOpc == RISCV::CSC_64 ? 8 : 16;
       if (MFI.getObjectSize(*FI) < Bytes)
         continue;
-      Spills.push_back(
-          {&MBB, MI.getNextNode(), *FI, StoreOpc, memImm(MI)});
+      Spills.push_back({&MI, *FI, StoreOpc, memImm(MI)});
     }
   }
 
@@ -902,20 +984,21 @@ static bool clearDeadCaps(MachineFunction &MF) {
     Changed = true;
   }
   for (const SpillSite &S : Spills) {
-    MachineBasicBlock::iterator At =
-        S.Before ? S.Before->getIterator() : S.MBB->end();
+    MachineBasicBlock &MBB = *S.Anchor->getParent();
+    MachineInstr *Next = S.Anchor->getNextNode();
+    MachineBasicBlock::iterator At = Next ? Next->getIterator() : MBB.end();
     DebugLoc DL;
-    if (At != S.MBB->end())
+    if (At != MBB.end())
       DL = At->getDebugLoc();
-    else if (!S.MBB->empty())
-      DL = S.MBB->back().getDebugLoc();
+    else if (!MBB.empty())
+      DL = MBB.back().getDebugLoc();
     Align Alignment = MFI.getObjectAlign(S.FI);
     unsigned Bytes = S.Opc == RISCV::CSC_64 ? 8 : 16;
     MachineMemOperand *MMO = MF.getMachineMemOperand(
         MachinePointerInfo::getFixedStack(MF, S.FI, S.Imm),
         MachineMemOperand::MOStore | MachineMemOperand::MOVolatile, Bytes,
         Alignment);
-    BuildMI(*S.MBB, At, DL, TII.get(S.Opc))
+    BuildMI(MBB, At, DL, TII.get(S.Opc))
         .addReg(RISCV::X0_Y)
         .addFrameIndex(S.FI)
         .addImm(S.Imm)
@@ -923,27 +1006,34 @@ static bool clearDeadCaps(MachineFunction &MF) {
     Changed = true;
   }
 
-  if (!CSRs.empty() || !Spills.empty()) {
-    SmallString<128> Buf;
+  if (!CSRs.empty() || !Spills.empty() || SkipCSRCount || SkipSpillCount) {
+    SmallString<160> Buf;
     raw_svector_ostream OS(Buf);
     OS << "cheri-dead-cap: fn=" << MF.getName() << " csr=" << CSRs.size()
-       << " spill=" << Spills.size();
+       << " spill=" << Spills.size() << " skip_csr=" << SkipCSRCount
+       << " skip_spill=" << SkipSpillCount;
     memannot::appendInvalidateStatsLine(OS.str());
     DeadCSRClears += CSRs.size();
     DeadSpillClears += Spills.size();
+    DeadCSRSkipped += SkipCSRCount;
+    DeadSpillSkipped += SkipSpillCount;
   }
   return Changed;
 }
 
 static void flushDeadCapStats() {
-  if (!DeadCSRClears && !DeadSpillClears)
+  if (!DeadCSRClears && !DeadSpillClears && !DeadCSRSkipped &&
+      !DeadSpillSkipped)
     return;
-  SmallString<64> Buf;
+  SmallString<96> Buf;
   raw_svector_ostream OS(Buf);
-  OS << "cheri-dead-cap: csr=" << DeadCSRClears << " spill=" << DeadSpillClears;
+  OS << "cheri-dead-cap: csr=" << DeadCSRClears << " spill=" << DeadSpillClears
+     << " skip_csr=" << DeadCSRSkipped << " skip_spill=" << DeadSpillSkipped;
   memannot::appendInvalidateStatsLine(OS.str());
   DeadCSRClears = 0;
   DeadSpillClears = 0;
+  DeadCSRSkipped = 0;
+  DeadSpillSkipped = 0;
 }
 
 bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {

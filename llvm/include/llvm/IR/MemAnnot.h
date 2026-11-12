@@ -259,6 +259,16 @@ LLVM_ABI void appendInvalidateStatsLine(StringRef Line);
 /// [LLM-generated] M7.1c. -cheri-free-zero-regs (default on). The inliner, the
 /// free-site tail demotion, and the backend marker all read this one switch.
 LLVM_ABI bool cheriFreeZeroRegsEnabled();
+/// [LLM-generated] M7.1c-2c-narrow. -cheri-invalidate-dead-csr.
+/// Off: no C1 clears. MayFree (default): a dead CSR or spill slot is cleared
+/// only when it would still hold the capability across a mem.free or a call
+/// that takes a moved owner. All: the previous C1 rule, any call or return.
+enum class CheriDeadCapMode { Off, MayFree, All };
+LLVM_ABI CheriDeadCapMode cheriDeadCapMode();
+/// Same calls B1 treats as a free: a "mem.free" bundle, drop_in_place /
+/// drop_glue, a known dealloc, or any call whose pointer argument is a
+/// mem.move'd owner or the memcpy temporary copied from one.
+LLVM_ABI bool isCheriMayFreeCall(const CallBase &CB);
 } // namespace memannot
 } // namespace llvm
 #endif

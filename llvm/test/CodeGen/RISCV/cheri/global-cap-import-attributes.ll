@@ -143,7 +143,6 @@ entry:
   call void @_Z19doSomethingWithUartP4Uart(ptr addrspace(200) noundef @uart_RWcm)
 
 ; CHECK-NEXT:        	cmove	a0, s1
-; CHECK-NEXT:        	cmove	s1, zero
 ; CHECK-NEXT:        	ccall	_Z19doSomethingWithUartP4Uart
   call void @_Z19doSomethingWithUartP4Uart(ptr addrspace(200) noundef @uart_RWcm)
 
@@ -158,7 +157,6 @@ entry:
   call void @_Z19doSomethingWithUartP4Uart(ptr addrspace(200) noundef @uart_RWcm2)
 
 ; CHECK-NEXT:           cmove   a0, s1
-; CHECK-NEXT:           cmove   s1, zero
 ; CHECK-NEXT:        	ccall	_Z19doSomethingWithUartP4Uart
   call void @_Z19doSomethingWithUartP4Uart(ptr addrspace(200) noundef @uart_RWcm2)
 
