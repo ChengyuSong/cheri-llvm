@@ -47,6 +47,7 @@ define void @caller() addrspace(200) nounwind sspstrong {
 ; IL32PC64-NEXT:    ccall callee
 ; IL32PC64-NEXT:    clc a0, 12(sp)
 ; IL32PC64-NEXT:    clc a1, 0(s0)
+; IL32PC64-NEXT:    cmove s0, zero
 ; IL32PC64-NEXT:    bne a1, a0, .LBB0_2
 ; IL32PC64-NEXT:  # %bb.1:
 ; IL32PC64-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
@@ -72,6 +73,7 @@ define void @caller() addrspace(200) nounwind sspstrong {
 ; L64PC128-NEXT:    ccall callee
 ; L64PC128-NEXT:    clc a0, 8(sp)
 ; L64PC128-NEXT:    clc a1, 0(s0)
+; L64PC128-NEXT:    cmove s0, zero
 ; L64PC128-NEXT:    bne a1, a0, .LBB0_2
 ; L64PC128-NEXT:  # %bb.1:
 ; L64PC128-NEXT:    clc ra, 32(sp) # 16-byte Folded Reload

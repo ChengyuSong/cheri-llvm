@@ -1,0 +1,318 @@
+# [LLM-generated] M7.1c-2c. C1 nulls a dead callee-saved capability at its last
+# use, and a capability spill slot after its last reload or spill, when a
+# later call or (for a register) a return would otherwise observe it. A use
+# on a loop back edge or a landing pad is left alone. The null store names
+# the frame index. Off emits neither clear.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
+# RUN: FileCheck %s --check-prefix=STATS < %t.stats
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-dead-csr=off -o - %s | FileCheck %s --check-prefix=OFF
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @dead_csr() addrspace(200) { ret void }
+  define void @csr_used_after() addrspace(200) { ret void }
+  define void @csr_loop() addrspace(200) { ret void }
+  define void @csr_eh() addrspace(200) { ret void }
+  define void @csr_fp() addrspace(200) { ret void }
+  define void @csr_ret() addrspace(200) { ret void }
+  define void @spill_last() addrspace(200) { ret void }
+  define void @spill_store() addrspace(200) { ret void }
+  define void @spill_later() addrspace(200) { ret void }
+  define void @spill_eh() addrspace(200) { ret void }
+  define void @spill_loop() addrspace(200) { ret void }
+  declare void @later() addrspace(200)
+...
+---
+name:            dead_csr
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    $x11_y = COPY $x9_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+# The last use of s1 is the copy. The call that follows must not see it.
+# CHECK-LABEL: name: dead_csr
+# CHECK: $x11_y = COPY $x9_y
+# CHECK-NEXT: $x9_y = PseudoCheriCapClear killed $x9_y
+# CHECK-NEXT: PseudoCCALL
+# OFF-LABEL: name: dead_csr
+# OFF: $x11_y = COPY $x9_y
+# OFF-NEXT: PseudoCCALL
+# OFF-NOT: PseudoCheriCapClear
+---
+name:            csr_used_after
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    $x11_y = COPY $x9_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+# s1 is read after the first call, so that call is left alone. The second
+# call is the one that follows the last use.
+# CHECK-LABEL: name: csr_used_after
+# CHECK: $x9_y = COPY $x10_y
+# CHECK-NEXT: PseudoCCALL
+# CHECK-NEXT: $x11_y = COPY $x9_y
+# CHECK-NEXT: $x9_y = PseudoCheriCapClear killed $x9_y
+# CHECK-NEXT: PseudoCCALL
+---
+name:            csr_loop
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.1(0x80000000)
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    PseudoBR %bb.1
+
+  bb.1:
+    successors: %bb.1(0x40000000), %bb.2(0x40000000)
+    liveins: $x9_y
+    $x11_y = COPY $x9_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    BNE $x0, $x0, %bb.1
+    PseudoBR %bb.2
+
+  bb.2:
+    liveins: $x9_y
+    PseudoCRET implicit $x9_y
+
+# The back edge uses s1 on the next iteration, and the exit returns it.
+# CHECK-LABEL: name: csr_loop
+# CHECK: $x11_y = COPY $x9_y
+# CHECK-NOT: PseudoCheriCapClear
+---
+name:            csr_eh
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.1(0x80000000), %bb.2(0x00000000)
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    $x11_y = COPY $x9_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoBR %bb.1
+
+  bb.1:
+    PseudoCRET
+
+  bb.2 (landing-pad):
+    liveins: $x9_y
+    $x12_y = COPY $x9_y
+    PseudoCRET implicit $x12_y
+
+# The landing pad still reads s1, so the call is left alone. The pad's own
+# last use is cleared before its return.
+# CHECK-LABEL: name: csr_eh
+# CHECK: $x11_y = COPY $x9_y
+# CHECK-NEXT: PseudoCCALL
+# CHECK: bb.2 (landing-pad):
+# CHECK: $x12_y = COPY $x9_y
+# CHECK-NEXT: $x9_y = PseudoCheriCapClear killed $x9_y
+---
+name:            csr_fp
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+frameInfo:
+  isFrameAddressTaken: true
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x8_y = COPY $x10_y
+    $x11_y = COPY $x8_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+# s0 is the frame pointer. Leave it, even though this copy is its last use.
+# CHECK-LABEL: name: csr_fp
+# CHECK: $x11_y = COPY $x8_y
+# CHECK-NEXT: PseudoCCALL
+# CHECK-NOT: PseudoCheriCapClear
+---
+name:            csr_ret
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    $x11_y = COPY $x9_y
+    PseudoCRET
+
+# Dead before the return, with no later call. One cmove; PEI still restores
+# the caller's s1 because this register was already modified.
+# CHECK-LABEL: name: csr_ret
+# CHECK: $x11_y = COPY $x9_y
+# CHECK-NEXT: $x9_y = PseudoCheriCapClear killed $x9_y
+# CHECK-NEXT: PseudoCRET
+# OFF-LABEL: name: csr_ret
+# OFF: $x11_y = COPY $x9_y
+# OFF-NEXT: PseudoCRET
+# OFF-NOT: PseudoCheriCapClear
+---
+name:            spill_last
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# Last reload, then a call. The null address is the frame index, not a
+# register computed from a load.
+# CHECK-LABEL: name: spill_last
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NEXT: CSC_128 $x0_y, %stack.0, 0
+# CHECK-NEXT: PseudoCCALL
+# CHECK-NOT: CSC_128 $x0_y, $x
+# OFF-LABEL: name: spill_last
+# OFF: $x10_y = CLC_128 %stack.0, 0
+# OFF-NEXT: PseudoCCALL
+# OFF-NOT: CSC_128 $x0_y
+---
+name:            spill_store
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    CSC_128 $x10_y, %stack.0, 0
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# A regalloc spill that is never reloaded. Null it before the call.
+# CHECK-LABEL: name: spill_store
+# CHECK: CSC_128 $x10_y, %stack.0, 0
+# CHECK-NEXT: CSC_128 $x0_y, %stack.0, 0
+# CHECK-NEXT: PseudoCCALL
+---
+name:            spill_later
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    $x11_y = CLC_128 %stack.0, 0
+    PseudoCRET implicit $x11_y
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# Reloaded again after the call, so the first reload must not null the slot.
+# The second reload is only followed by a return; the frame wipe covers that.
+# CHECK-LABEL: name: spill_later
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NOT: CSC_128 $x0_y
+# CHECK: $x11_y = CLC_128 %stack.0, 0
+# CHECK-NOT: CSC_128 $x0_y
+---
+name:            spill_eh
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.1(0x80000000), %bb.2(0x00000000)
+    liveins: $x10_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    PseudoBR %bb.1
+
+  bb.1:
+    PseudoCRET
+
+  bb.2 (landing-pad):
+    $x11_y = CLC_128 %stack.0, 0
+    PseudoCRET implicit $x11_y
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# The landing pad reloads the slot. Leave it.
+# CHECK-LABEL: name: spill_eh
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NOT: CSC_128 $x0_y
+---
+name:            spill_loop
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    successors: %bb.0(0x40000000), %bb.1(0x40000000)
+    liveins: $x10_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    BNE $x0, $x0, %bb.0
+    PseudoBR %bb.1
+
+  bb.1:
+    PseudoCRET
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# The back edge reloads the slot.
+# CHECK-LABEL: name: spill_loop
+# CHECK: $x10_y = CLC_128 %stack.0, 0
+# CHECK-NOT: CSC_128 $x0_y
+# STATS: cheri-dead-cap: fn=dead_csr csr=1 spill=0
+# STATS: cheri-dead-cap: fn=csr_used_after csr=1 spill=0
+# STATS: cheri-dead-cap: fn=csr_eh csr=1 spill=0
+# STATS: cheri-dead-cap: fn=csr_ret csr=1 spill=0
+# STATS: cheri-dead-cap: fn=spill_last csr=0 spill=1
+# STATS: cheri-dead-cap: fn=spill_store csr=0 spill=1
+# STATS: cheri-dead-cap: csr=4 spill=2

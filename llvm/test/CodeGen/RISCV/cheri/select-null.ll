@@ -44,6 +44,7 @@ define i8 addrspace(200)* @eggs(i1 %cond) local_unnamed_addr addrspace(200) #0 {
 ; PURECAP-NEXT:    cmove a0, zero
 ; PURECAP-NEXT:    ccall barney
 ; PURECAP-NEXT:    cmove a0, s0
+; PURECAP-NEXT:    cmove s0, zero
 ; PURECAP-NEXT:    clc ra, 16(sp) # 16-byte Folded Reload
 ; PURECAP-NEXT:    clc s0, 0(sp) # 16-byte Folded Reload
 ; PURECAP-NEXT:    csc zero, 0(sp)

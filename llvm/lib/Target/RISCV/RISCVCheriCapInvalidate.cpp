@@ -34,6 +34,14 @@
 // D101 drops a scope clear overwritten within 8 straight-line instructions.
 // D102 drops a repeated clear of the same register on one path.
 // D103: a loop backedge is not a spill-search abort.
+//
+// C1 (M7.1c-2c). -cheri-invalidate-dead-csr (default on) nulls a capability
+// in a callee-saved register at its last use when no path reads it again
+// before the next call or return, and nulls a capability spill slot after
+// its last reload or spill when no path reloads it and a call still follows.
+// The epilogue frame wipe covers slots at the return. The null store's
+// address is the frame index, so it resolves from sp or fp. Off skips this
+// scan, so the MIR this pass emits is the loan/free/scope path only.
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
@@ -45,10 +53,13 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 #include <optional>
 
 using namespace llvm;
@@ -615,6 +626,326 @@ static bool isCalleeSavedSlot(const MachineFrameInfo &MFI, int FI) {
   return false;
 }
 
+// C1. Off emits nothing from this scan, so codegen matches the pass without it.
+enum class DeadCSRMode { Off, On };
+static cl::opt<DeadCSRMode> DeadCSROpt(
+    "cheri-invalidate-dead-csr", cl::init(DeadCSRMode::On), cl::Hidden,
+    cl::desc("M7.1c-2c: null a dead callee-saved capability at its last use, "
+             "and a capability spill slot after its last reload"),
+    cl::values(clEnumValN(DeadCSRMode::Off, "off", "do not clear"),
+               clEnumValN(DeadCSRMode::On, "on", "clear (default)")));
+static unsigned DeadCSRClears = 0;
+static unsigned DeadSpillClears = 0;
+
+static bool isCapSpillMem(unsigned Opc) {
+  return Opc == RISCV::CLC_128 || Opc == RISCV::CLC_64 ||
+         Opc == RISCV::CSC_128 || Opc == RISCV::CSC_64;
+}
+
+static int64_t memImm(const MachineInstr &MI) {
+  int64_t Imm = 0;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isImm())
+      Imm = MO.getImm();
+  return Imm;
+}
+
+// True when an EH pad reachable here may still read R. A tracked live-in is
+// a read even if the pad has no explicit use yet. An untracked pad is one too.
+static bool ehMayRead(MachineBasicBlock &BB, Register R,
+                      const TargetRegisterInfo &TRI) {
+  if (!BB.isEHPad())
+    return false;
+  if (!BB.getParent()->getRegInfo().tracksLiveness())
+    return true;
+  for (const MachineBasicBlock::RegisterMaskPair &LI : BB.getLiveIns())
+    if (TRI.regsOverlap(LI.PhysReg, R))
+      return true;
+  return false;
+}
+
+// True if any path reads R after MI before a def. A loop back edge is a
+// successor, so a use on the next iteration counts. Budget expiry counts as
+// a read: leave the register alone.
+static bool deadCapReadLater(MachineInstr &MI, Register R,
+                             const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 256;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    for (; It != BB.end(); ++It) {
+      if (Budget-- == 0)
+        return true;
+      if (It->isDebugInstr())
+        continue;
+      if (readsReg(*It, R, TRI))
+        return true;
+      if (definesOverlap(*It, R, TRI))
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (ehMayRead(*S, R, TRI))
+        return true;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, *MI.getParent(), std::next(MI.getIterator()));
+}
+
+// True when a call or a return is reached before R is redefined. The stale
+// capability would otherwise sit in the CSR until a callee saves it, or until
+// the epilogue restore.
+static bool callOrRetBeforeRedef(MachineInstr &MI, Register R,
+                                 const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 64;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    for (; It != BB.end(); ++It) {
+      if (Budget-- == 0)
+        return true;
+      if (It->isDebugInstr())
+        continue;
+      if (It->isReturn())
+        return true;
+      if (It->isCall() && It->getOpcode() != RISCV::PseudoCheriCapInvalidate &&
+          !It->isMetaInstruction())
+        return true;
+      if (definesOverlap(*It, R, TRI))
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, *MI.getParent(), std::next(MI.getIterator()));
+}
+
+// True when a call is reached before any later load or store of FI. A path
+// that only returns does not count: the epilogue frame wipe covers that slot.
+// Budget expiry reports a call so a slot the reload search already proved
+// dead is still cleared.
+static bool callBeforeSlotWrite(MachineBasicBlock &MBB,
+                                MachineBasicBlock::iterator It, int FI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 128;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator I) -> bool {
+    for (; I != BB.end(); ++I) {
+      if (Budget-- == 0)
+        return true;
+      if (I->isDebugInstr())
+        continue;
+      std::optional<int> Got = frameIndexOf(*I);
+      if (Got && *Got == FI && (I->mayLoad() || I->mayStore()))
+        return false;
+      // A tail call is both a call and a return. The call still observes the
+      // slot, so it is cleared first.
+      if (I->isCall() && I->getOpcode() != RISCV::PseudoCheriCapInvalidate &&
+          !I->isMetaInstruction())
+        return true;
+      if (I->isReturn())
+        return false;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (Self(Self, *S, S->begin()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, MBB, It);
+}
+
+static bool isDeadCapCSR(Register R, const MachineFunction &MF,
+                         const TargetRegisterInfo &TRI) {
+  if (!R.isPhysical() || !RISCV::YGPRRegClass.contains(R))
+    return false;
+  if (!isCalleeSavedReg(R, MF, TRI))
+    return false;
+  // ra and sp are not capability loans. The frame pointer and any other
+  // reserved register stay with the ABI.
+  if (TRI.regsOverlap(R, RISCV::X1_Y) || TRI.regsOverlap(R, RISCV::X2_Y))
+    return false;
+  if (MF.getRegInfo().isReserved(R))
+    return false;
+  if (MF.getSubtarget<RISCVSubtarget>().getFrameLowering()->hasFP(MF) &&
+      TRI.regsOverlap(R, RISCV::X8_Y))
+    return false;
+  // Only a register PEI will already save. A new def of an unmodified CSR
+  // would force a prologue spill plus this clear.
+  if (!MF.getRegInfo().isPhysRegModified(R))
+    return false;
+  return true;
+}
+
+// C1. Runs after the loan/free/scope rewrites. Off returns before any edit.
+static bool clearDeadCaps(MachineFunction &MF) {
+  if (DeadCSROpt != DeadCSRMode::On)
+    return false;
+  const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
+  const TargetRegisterInfo &TRI = *ST.getRegisterInfo();
+  const TargetInstrInfo &TII = *ST.getInstrInfo();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const Function &Fn = MF.getFunction();
+  // Naked and noreturn+nounwind functions do not restore CSRs. Nulling one
+  // would drop the caller's value. Spill slots are this frame's own memory.
+  bool SkipCSR = Fn.hasFnAttribute(Attribute::Naked) ||
+                 (Fn.hasFnAttribute(Attribute::NoReturn) &&
+                  Fn.hasFnAttribute(Attribute::NoUnwind) &&
+                  !Fn.hasFnAttribute(Attribute::UWTable));
+
+  struct CSRSite {
+    MachineInstr *Use;
+    Register Reg;
+  };
+  struct SpillSite {
+    MachineBasicBlock *MBB;
+    MachineInstr *Before;
+    int FI;
+    unsigned Opc;
+    int64_t Imm;
+  };
+  SmallVector<CSRSite, 8> CSRs;
+  SmallVector<SpillSite, 8> Spills;
+
+  if (!SkipCSR) {
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : MBB) {
+        if (MI.isDebugInstr() || MI.isTerminator())
+          continue;
+        unsigned Opc = MI.getOpcode();
+        if (Opc == RISCV::PseudoCheriCapClear ||
+            Opc == RISCV::PseudoCheriCapInvalidate)
+          continue;
+        if (MI.getFlag(MachineInstr::FrameSetup) ||
+            MI.getFlag(MachineInstr::FrameDestroy))
+          continue;
+        SmallSet<Register, 4> SeenReg;
+        for (const MachineOperand &MO : MI.operands()) {
+          if (!MO.isReg() || !MO.isUse() || MO.isUndef() || !MO.getReg())
+            continue;
+          Register R = MO.getReg();
+          if (!SeenReg.insert(R).second || !isDeadCapCSR(R, MF, TRI))
+            continue;
+          if (deadCapReadLater(MI, R, TRI))
+            continue;
+          if (!callOrRetBeforeRedef(MI, R, TRI))
+            continue;
+          CSRs.push_back({&MI, R});
+        }
+      }
+    }
+  }
+
+  auto spillOK = [&](int FI) {
+    return MFI.isSpillSlotObjectIndex(FI) && !isCalleeSavedSlot(MFI, FI) &&
+           !MFI.isCalleeSavedObjectIndex(FI);
+  };
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : MBB) {
+      if (!isCapSpillMem(MI.getOpcode()))
+        continue;
+      if (MI.getFlag(MachineInstr::FrameSetup) ||
+          MI.getFlag(MachineInstr::FrameDestroy))
+        continue;
+      std::optional<int> FI = frameIndexOf(MI);
+      // A register address is late-resolving. Never null through one.
+      if (!FI || !spillOK(*FI))
+        continue;
+      if (MI.mayStore() && MI.getOperand(0).isReg() &&
+          MI.getOperand(0).getReg() == RISCV::X0_Y)
+        continue;
+      auto Next = std::next(MI.getIterator());
+      if (reloadBeforeStore(MBB, Next, *FI))
+        continue;
+      if (!callBeforeSlotWrite(MBB, Next, *FI))
+        continue;
+      unsigned StoreOpc = MI.mayLoad() ? storeOpcForReload(MI.getOpcode())
+                                       : MI.getOpcode();
+      unsigned Bytes = StoreOpc == RISCV::CSC_64 ? 8 : 16;
+      if (MFI.getObjectSize(*FI) < Bytes)
+        continue;
+      Spills.push_back(
+          {&MBB, MI.getNextNode(), *FI, StoreOpc, memImm(MI)});
+    }
+  }
+
+  bool Changed = false;
+  for (const CSRSite &C : CSRs) {
+    // The last use may kill R. The clear reads that same value, so the kill
+    // moves to the clear. Leaving it on the use makes the clear read a dead
+    // register.
+    for (MachineOperand &MO : C.Use->operands())
+      if (MO.isReg() && MO.isUse() && MO.getReg() &&
+          TRI.regsOverlap(MO.getReg(), C.Reg))
+        MO.setIsKill(false);
+    MachineBasicBlock &MBB = *C.Use->getParent();
+    MachineInstr *Next = C.Use->getNextNode();
+    MachineBasicBlock::iterator At = Next ? Next->getIterator() : MBB.end();
+    DebugLoc DL;
+    if (At != MBB.end())
+      DL = At->getDebugLoc();
+    else if (!MBB.empty())
+      DL = MBB.back().getDebugLoc();
+    BuildMI(MBB, At, DL, TII.get(RISCV::PseudoCheriCapClear), C.Reg)
+        .addReg(C.Reg, RegState::Kill);
+    Changed = true;
+  }
+  for (const SpillSite &S : Spills) {
+    MachineBasicBlock::iterator At =
+        S.Before ? S.Before->getIterator() : S.MBB->end();
+    DebugLoc DL;
+    if (At != S.MBB->end())
+      DL = At->getDebugLoc();
+    else if (!S.MBB->empty())
+      DL = S.MBB->back().getDebugLoc();
+    Align Alignment = MFI.getObjectAlign(S.FI);
+    unsigned Bytes = S.Opc == RISCV::CSC_64 ? 8 : 16;
+    MachineMemOperand *MMO = MF.getMachineMemOperand(
+        MachinePointerInfo::getFixedStack(MF, S.FI, S.Imm),
+        MachineMemOperand::MOStore | MachineMemOperand::MOVolatile, Bytes,
+        Alignment);
+    BuildMI(*S.MBB, At, DL, TII.get(S.Opc))
+        .addReg(RISCV::X0_Y)
+        .addFrameIndex(S.FI)
+        .addImm(S.Imm)
+        .addMemOperand(MMO);
+    Changed = true;
+  }
+
+  if (!CSRs.empty() || !Spills.empty()) {
+    SmallString<128> Buf;
+    raw_svector_ostream OS(Buf);
+    OS << "cheri-dead-cap: fn=" << MF.getName() << " csr=" << CSRs.size()
+       << " spill=" << Spills.size();
+    memannot::appendInvalidateStatsLine(OS.str());
+    DeadCSRClears += CSRs.size();
+    DeadSpillClears += Spills.size();
+  }
+  return Changed;
+}
+
+static void flushDeadCapStats() {
+  if (!DeadCSRClears && !DeadSpillClears)
+    return;
+  SmallString<64> Buf;
+  raw_svector_ostream OS(Buf);
+  OS << "cheri-dead-cap: csr=" << DeadCSRClears << " spill=" << DeadSpillClears;
+  memannot::appendInvalidateStatsLine(OS.str());
+  DeadCSRClears = 0;
+  DeadSpillClears = 0;
+}
+
 bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
   const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
   if (!ST.hasVendorXCheri() && !ST.hasVendorXCheriot())
@@ -937,11 +1268,13 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
       Changed = true;
     }
   }
+  Changed |= clearDeadCaps(MF);
   return Changed;
 }
 
 bool RISCVCheriCapInvalidate::doFinalization(Module &) {
   memannot::flushSpillInvalidateStats();
+  flushDeadCapStats();
   return false;
 }
 
