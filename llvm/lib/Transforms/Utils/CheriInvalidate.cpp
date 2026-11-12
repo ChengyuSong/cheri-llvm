@@ -91,6 +91,26 @@ static cl::opt<WideToggle> WideSlotsOpt(
              "variable-index capability stores into a static alloca"),
     cl::values(clEnumValN(WideToggle::Off, "off", "fixed-offset stores only"),
                clEnumValN(WideToggle::On, "on", "widen (default)")));
+// [LLM-generated] M7.1c-2b. At a mem.free, null this function's live capability
+// slots that no path reads again. A non-escaping slot is a plain null. An
+// escaping one is a range check against the freed region. Off leaves the
+// free site as it was on 978c1f75.
+enum class FreeDeadToggle { Off, On };
+static cl::opt<FreeDeadToggle> FreeDeadOpt(
+    "cheri-invalidate-free-dead-slots", cl::init(FreeDeadToggle::On), cl::Hidden,
+    cl::desc("M7.1c-2b: at mem.free, clear live alloca capability slots that "
+             "are not read again"),
+    cl::values(clEnumValN(FreeDeadToggle::Off, "off", "do not clear"),
+               clEnumValN(FreeDeadToggle::On, "on", "clear (default)")));
+// Call-site half of B1. drop_in_place / drop_glue free the owner in the
+// callee, so the caller's dead slots never see an inline mem.free. Off keeps
+// only the inline mem.free triggers. The main switch off disables both.
+static cl::opt<FreeDeadToggle> FreeDeadCallsOpt(
+    "cheri-invalidate-free-dead-calls", cl::init(FreeDeadToggle::On), cl::Hidden,
+    cl::desc("M7.1c-2b: also clear dead slots after an out-of-line drop of "
+             "their owner"),
+    cl::values(clEnumValN(FreeDeadToggle::Off, "off", "inline mem.free only"),
+               clEnumValN(FreeDeadToggle::On, "on", "drop calls too (default)")));
 static cl::opt<unsigned> WideBytesOpt(
     "cheri-invalidate-wide-bytes", cl::init(512), cl::Hidden,
     cl::desc("M7.1c-2a: largest static alloca (bytes) widened into per-word "
@@ -234,6 +254,18 @@ struct Inv {
   // free-log, free-site and scope range checks, and loan bookkeeping ignore
   // them. A fixed-offset store stays in CapSlots and is not repeated here.
   unsigned WideAllocas = 0, WideSkippedLarge = 0, OwnNulledWide = 0;
+  // M7.1c-2b: plain nulls and range-checked clears of slots dead after a free.
+  unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
+  unsigned FreeDeadCallPlain = 0, FreeDeadCallChecked = 0;
+  DenseMap<std::pair<AllocaInst *, int64_t>, SmallVector<Value *, 2>> SlotStored;
+  // Every pointer store into an alloca, any index. Unknown if a copy or too
+  // many stores hide the values. Used to see through a load from a local
+  // array such as s1's %array.i.
+  struct AllocaFill {
+    SmallVector<Value *, 4> Vals;
+    bool Unknown = false;
+  };
+  DenseMap<AllocaInst *, AllocaFill> Fills;
   MapVector<AllocaInst *, SmallVector<int64_t, 4>> WideByAlloca;
   struct LoanIntoScan {
     Instruction *At;
@@ -383,6 +415,8 @@ struct Inv {
   }
   void collectSlots(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
     WideByAlloca.clear();
+    SlotStored.clear();
+    Fills.clear();
     for (Instruction &I : instructions(F)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
@@ -395,6 +429,9 @@ struct Inv {
       auto &V = Out[A];
       if (!is_contained(V, Off))
         V.push_back(Off);
+      auto &Stored = SlotStored[{A, Off}];
+      if (Stored.size() < 4)
+        Stored.push_back(SI->getValueOperand());
       Prov &Pv = SlotProv[{A, Off}];
       SmallVector<const Value *, 4> Objs;
       getUnderlyingObjects(SI->getValueOperand(), Objs);
@@ -408,6 +445,25 @@ struct Inv {
     collectWide(F, Out);
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
+    Fills.clear();
+    for (Instruction &I : instructions(F)) {
+      if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+        if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(MT->getRawDest())))
+          Fills[A].Unknown = true;
+        continue;
+      }
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
+        continue;
+      auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand()));
+      if (!A)
+        continue;
+      AllocaFill &Fill = Fills[A];
+      if (Fill.Vals.size() >= 32)
+        Fill.Unknown = true;
+      else
+        Fill.Vals.push_back(SI->getValueOperand());
+    }
   }
 
   static void lifetimeMarkers(AllocaInst *A, SmallVectorImpl<Instruction *> &Starts,
@@ -522,6 +578,246 @@ struct Inv {
     return R;
   }
   DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadLater;
+
+  // A real read of A's stored words reachable after At, including a load
+  // reached by a loop back edge. Escape alone is not a read: an address that
+  // was passed to an earlier call can still be dead from here on.
+  bool readAfter(AllocaInst *A, Instruction *At, DominatorTree &DT) {
+    auto It = ReadAfter.find({A, At});
+    if (It != ReadAfter.end())
+      return It->second;
+    bool R = false;
+    SmallVector<const Value *, 8> WL{A};
+    SmallPtrSet<const Value *, 16> Seen;
+    while (!WL.empty() && !R) {
+      const Value *V = WL.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (const User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||
+            isa<SelectInst>(I)) {
+          WL.push_back(I);
+          continue;
+        }
+        if (isa<StoreInst>(I) || I->isLifetimeStartOrEnd() ||
+            isa<DbgInfoIntrinsic>(I))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(I))
+          if (InvAsmNoEscape && isEmptyAsm(CB))
+            continue;
+        if (I != At && isPotentiallyReachable(At, I, nullptr, &DT)) {
+          R = true;
+          break;
+        }
+      }
+    }
+    ReadAfter[{A, At}] = R;
+    return R;
+  }
+  DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadAfter;
+
+  static bool isAlias(const Value *V, ArrayRef<const Value *> Aliases) {
+    if (!V)
+      return false;
+    for (const Value *A : Aliases)
+      if (V == A)
+        return true;
+    return false;
+  }
+  // Stored capability comes from one of Aliases: the pointer itself, a field
+  // or element, a load of it (Vec's heap buffer), or that value passed
+  // through black_box / empty asm. If the walk goes through such a load,
+  // *Heap is that load: its bounds are the freed allocation, not the Vec
+  // header that drop_glue receives.
+  bool derivedFrom(const Value *V, ArrayRef<const Value *> Aliases,
+                   const Value **Heap, unsigned Depth = 0) {
+    SmallVector<const Value *, 8> WL{V};
+    SmallPtrSet<const Value *, 8> Seen;
+    for (unsigned Steps = 0; Steps < 16 && !WL.empty(); ++Steps) {
+      const Value *X = WL.pop_back_val();
+      if (!X || !Seen.insert(X).second)
+        continue;
+      if (isAlias(X, Aliases) || isAlias(getUnderlyingObject(X), Aliases))
+        return true;
+      if (auto *GEP = dyn_cast<GEPOperator>(X)) {
+        WL.push_back(GEP->getPointerOperand());
+        continue;
+      }
+      if (auto *CI = dyn_cast<CastInst>(X)) {
+        WL.push_back(CI->getOperand(0));
+        continue;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(X)) {
+        const Value *P = LI->getPointerOperand();
+        const Value *PU = getUnderlyingObject(P);
+        if (isAlias(P, Aliases) || isAlias(PU, Aliases)) {
+          if (Heap && !*Heap)
+            *Heap = LI;
+          return true;
+        }
+        // s1: rN = load %array.i, and %array.i was filled with gep(load %v).
+        // Follow every store, at any index. Give up if the array escapes, a
+        // store is unknown, or the chain is too deep.
+        auto *SrcA = dyn_cast<AllocaInst>(PU);
+        if (!SrcA || Depth >= 3 || escapes(SrcA))
+          continue;
+        auto Fit = Fills.find(SrcA);
+        if (Fit == Fills.end() || Fit->second.Unknown || Fit->second.Vals.empty())
+          continue;
+        bool All = true;
+        for (const Value *S : Fit->second.Vals)
+          if (!derivedFrom(S, Aliases, Heap, Depth + 1)) {
+            All = false;
+            break;
+          }
+        if (All)
+          return true;
+        continue;
+      }
+      if (auto *PHI = dyn_cast<PHINode>(X)) {
+        for (const Value *Inc : PHI->incoming_values())
+          WL.push_back(Inc);
+        continue;
+      }
+      if (auto *Sel = dyn_cast<SelectInst>(X)) {
+        WL.push_back(Sel->getTrueValue());
+        WL.push_back(Sel->getFalseValue());
+        continue;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(X)) {
+        bool Through = isEmptyAsm(CB);
+        if (!Through)
+          if (const Function *CF = CB->getCalledFunction())
+            Through = CF->getName().contains("black_box");
+        if (!Through)
+          continue;
+        for (const Value *Arg : CB->args())
+          if (Arg->getType()->isPointerTy())
+            WL.push_back(Arg);
+      }
+    }
+    return false;
+  }
+  // drop(%tmp) after memcpy(%tmp, %src) + mem.move(%src): %tmp aliases %src,
+  // so a load of %src is a load of the dropped object. A whole-object copy
+  // before the drop aliases even without the fact. Chains stay short.
+  void ownerAliases(const Value *Owner, Instruction *Drop, DominatorTree &DT,
+                    SmallVectorImpl<const Value *> &Out) {
+    const Value *Root = getUnderlyingObject(Owner);
+    Out.push_back(Root);
+    SmallPtrSet<const Value *, 4> Seen;
+    Seen.insert(Root);
+    SmallVector<const Value *, 4> WL{Root};
+    Function *Fn = Drop->getFunction();
+    while (!WL.empty() && Out.size() < 4) {
+      const Value *Dest = WL.pop_back_val();
+      for (Instruction &I : instructions(*Fn)) {
+        auto *MT = dyn_cast<MemTransferInst>(&I);
+        if (!MT || !DT.dominates(MT, Drop))
+          continue;
+        if (getUnderlyingObject(MT->getRawDest()) != Dest)
+          continue;
+        const Value *Src = getUnderlyingObject(MT->getRawSource());
+        if (!Src || !Seen.insert(Src).second)
+          continue;
+        bool Moved = false;
+        for (Instruction &J : instructions(*Fn)) {
+          if (!memannot::isMemMoveFact(&J) || !DT.dominates(&J, Drop))
+            continue;
+          const Value *Slot = memannot::slotClobber(&J);
+          if (Slot && getUnderlyingObject(Slot) == Src)
+            Moved = true;
+        }
+        bool Whole = false;
+        if (auto *Len = dyn_cast<ConstantInt>(MT->getLength())) {
+          uint64_t N = Len->getZExtValue();
+          uint64_t Need = 0;
+          auto NeedOf = [&](const Value *Obj) {
+            if (auto *SA = dyn_cast<AllocaInst>(Obj))
+              if (auto Sz = SA->getAllocationSize(DL))
+                if (!Sz->isScalable())
+                  Need = std::max(Need, Sz->getFixedValue());
+          };
+          NeedOf(Src);
+          NeedOf(Dest);
+          Whole = Need && N >= Need && N >= 16;
+        }
+        if (!Moved && !Whole)
+          continue;
+        Out.push_back(Src);
+        WL.push_back(Src);
+      }
+    }
+  }
+  bool slotHoldsOwner(AllocaInst *A, int64_t Off, ArrayRef<const Value *> Aliases,
+                      const Value **Heap) {
+    auto It = SlotStored.find({A, Off});
+    if (It != SlotStored.end()) {
+      for (const Value *S : It->second)
+        if (derivedFrom(S, Aliases, Heap, 0))
+          return true;
+      return false;
+    }
+    // No constant-offset store (s1's %array.i). If every pointer stored into
+    // it, at any index, is derived from the owner, the array itself is too.
+    if (escapes(A))
+      return false;
+    auto Fit = Fills.find(A);
+    if (Fit == Fills.end() || Fit->second.Unknown || Fit->second.Vals.empty())
+      return false;
+    for (const Value *S : Fit->second.Vals)
+      if (!derivedFrom(S, Aliases, Heap, 0))
+        return false;
+    return true;
+  }
+  static bool isOwnerFreeCall(const CallBase &CB) {
+    if (CB.getOperandBundle(memannot::TagFree) || CB.isInlineAsm())
+      return false;
+    if (const Function *CF = CB.getCalledFunction()) {
+      StringRef N = CF->getName();
+      if (N.contains("drop_in_place") || N.contains("drop_glue"))
+        return true;
+    }
+    return memannot::isDeallocCall(CB);
+  }
+  // O1 inlines past drop_glue to RawVecInner::deallocate(%tmp). The callee
+  // name is not special: the argument is the mem.move'd owner, or the
+  // memcpy temp whose source that fact covers.
+  bool takesMovedOwner(const CallBase &CB, DominatorTree &DT) {
+    const Function *Fn = CB.getFunction();
+    SmallVector<const Value *, 4> Moved;
+    for (const Instruction &J : instructions(*Fn)) {
+      if (!memannot::isMemMoveFact(&J) || !DT.dominates(&J, &CB))
+        continue;
+      if (const Value *Slot = memannot::slotClobber(&J))
+        Moved.push_back(getUnderlyingObject(Slot));
+    }
+    if (Moved.empty())
+      return false;
+    for (const Value *Arg : CB.args()) {
+      if (!DL.isFatPointer(Arg->getType()))
+        continue;
+      const Value *U = getUnderlyingObject(Arg);
+      for (const Value *Mv : Moved)
+        if (U == Mv)
+          return true;
+      for (const Instruction &I : instructions(*Fn)) {
+        auto *MT = dyn_cast<MemTransferInst>(&I);
+        if (!MT || !DT.dominates(MT, &CB))
+          continue;
+        if (getUnderlyingObject(MT->getRawDest()) != U)
+          continue;
+        const Value *Src = getUnderlyingObject(MT->getRawSource());
+        for (const Value *Mv : Moved)
+          if (Src == Mv)
+            return true;
+      }
+    }
+    return false;
+  }
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
   void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len,
@@ -2239,6 +2535,43 @@ struct Inv {
             if (mayHoldHeap({S, Off}) && !loanCovered(S, Off, C))
               checkAndClear(B, {S, Off}, Lo, Len, "cheri_inv_free");
         }
+        // Slots not read again. Non-escaping: plain null. Escaping fixed
+        // slots are already range-checked above (escape counts as a later
+        // read there). Escaping widened words are not in that set.
+        if (FreeDeadOpt == FreeDeadToggle::On) {
+          SmallPtrSet<AllocaInst *, 8> SeenA;
+          auto ClearDead = [&](AllocaInst *A, ArrayRef<int64_t> Offs,
+                               bool WideOnly) {
+            if (!SeenA.insert(A).second && !WideOnly)
+              return;
+            if (!liveAt(A, C, DT) || readAfter(A, C, DT))
+              return;
+            bool Esc = escapes(A);
+            for (int64_t Off : Offs) {
+              if (loanCovered(A, Off, C))
+                continue;
+              if (Esc) {
+                if (!WideOnly)
+                  continue;
+                checkAndClear(B, {A, Off}, Lo, Len, "cheri_inv_free");
+                ++FreeDeadChecked;
+              } else {
+                Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off)
+                               : A;
+                markClear(B.CreateAlignedStore(
+                              ConstantPointerNull::get(
+                                  PointerType::get(M.getContext(), 200)),
+                              P, Align(16), InvVolatile),
+                          "cheri_inv_free_dead");
+                ++FreeDeadPlain;
+              }
+            }
+          };
+          for (auto &[A, Offs] : CapSlots)
+            ClearDead(A, Offs, false);
+          for (auto &[A, Offs] : WideByAlloca)
+            ClearDead(A, Offs, true);
+        }
         clearFreedReg(C, At);
       }
     else if (RegFree)
@@ -2250,6 +2583,100 @@ struct Inv {
             continue;
         clearFreedReg(C, C->getNextNode());
       }
+    // Out-of-line drop: the mem.free is in the callee. Slots that still hold
+    // a capability derived from the dropped owner, and are not read again,
+    // are cleared here. Same plain-null / range-check split as an inline free.
+    if (FreeDeadOpt == FreeDeadToggle::On &&
+        FreeDeadCallsOpt == FreeDeadToggle::On) {
+      for (Instruction &I : instructions(F)) {
+        auto *C = dyn_cast<CallBase>(&I);
+        if (!C || C->getOperandBundle(memannot::TagFree) || C->isInlineAsm())
+          continue;
+        if (!isOwnerFreeCall(*C) && !takesMovedOwner(*C, DT))
+          continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
+        Instruction *At = C->getNextNode();
+        if (!At)
+          continue;
+        struct DeadHit {
+          AllocaInst *A;
+          int64_t Off;
+          const Value *Bounds;
+        };
+        SmallVector<DeadHit, 8> Plain, Checked;
+        auto Consider = [&](AllocaInst *A, int64_t Off,
+                            ArrayRef<const Value *> Aliases, const Value *Owner) {
+          const Value *Heap = nullptr;
+          if (!slotHoldsOwner(A, Off, Aliases, &Heap))
+            return;
+          if (!liveAt(A, C, DT) || readAfter(A, C, DT) || loanCovered(A, Off, C))
+            return;
+          const Value *Bounds = Heap ? Heap : Owner;
+          if (escapes(A))
+            Checked.push_back({A, Off, Bounds});
+          else
+            Plain.push_back({A, Off, nullptr});
+        };
+        for (Value *Owner : C->args()) {
+          if (!DL.isFatPointer(Owner->getType()))
+            continue;
+          if (memannot::isDeallocCall(*C)) {
+            const Function *CF = C->getCalledFunction();
+            StringRef N = CF ? CF->getName() : "";
+            bool NamedDrop = N.contains("drop_in_place") || N.contains("drop_glue");
+            if (!NamedDrop) {
+              unsigned Idx = 0;
+              bool ND = false;
+              for (; Idx < C->arg_size(); ++Idx)
+                if (C->getArgOperand(Idx) == Owner &&
+                    C->paramHasAttr(Idx, Attribute::NoUndef))
+                  ND = true;
+              if (!ND)
+                continue;
+            }
+          }
+          SmallVector<const Value *, 4> Aliases;
+          ownerAliases(Owner, C, DT, Aliases);
+          Plain.clear();
+          Checked.clear();
+          for (auto &[A, Offs] : CapSlots)
+            for (int64_t Off : Offs)
+              Consider(A, Off, Aliases, Owner);
+          for (auto &[A, Offs] : WideByAlloca)
+            for (int64_t Off : Offs)
+              Consider(A, Off, Aliases, Owner);
+          B.SetInsertPoint(At);
+          for (const DeadHit &H : Plain) {
+            Value *P = H.Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), H.A, H.Off)
+                             : H.A;
+            markClear(B.CreateAlignedStore(
+                          ConstantPointerNull::get(
+                              PointerType::get(M.getContext(), 200)),
+                          P, Align(16), InvVolatile),
+                      "cheri_inv_free_dead");
+            ++FreeDeadCallPlain;
+          }
+          DenseMap<const Value *, std::pair<Value *, Value *>> Bounds;
+          for (const DeadHit &H : Checked) {
+            auto &BL = Bounds[H.Bounds];
+            if (!BL.first) {
+              B.SetInsertPoint(C);
+              BL.first = B.CreateCall(
+                  decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}),
+                  {const_cast<Value *>(H.Bounds)});
+              BL.second = B.CreateCall(
+                  decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}),
+                  {const_cast<Value *>(H.Bounds)});
+              B.SetInsertPoint(At);
+            }
+            checkAndClear(B, {H.A, H.Off}, BL.first, BL.second, "cheri_inv_free");
+            ++FreeDeadCallChecked;
+          }
+        }
+      }
+    }
     if (FLog && !CapSlots.empty())
       flogCalls(F, CapSlots, DT); // last DT user: it splits blocks
     if (Loan && !PendingLoanInto.empty())
@@ -2298,6 +2725,10 @@ struct Inv {
          << " wide_allocas=" << WideAllocas
          << " wide_skipped_large=" << WideSkippedLarge
          << " own_nulled_wide=" << OwnNulledWide
+         << " free_dead_plain=" << FreeDeadPlain
+         << " free_dead_checked=" << FreeDeadChecked
+         << " free_dead_call_plain=" << FreeDeadCallPlain
+         << " free_dead_call_checked=" << FreeDeadCallChecked
          << "\n";
     }
   }
