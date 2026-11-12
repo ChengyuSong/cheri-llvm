@@ -102,6 +102,15 @@ static cl::opt<FreeDeadToggle> FreeDeadOpt(
              "are not read again"),
     cl::values(clEnumValN(FreeDeadToggle::Off, "off", "do not clear"),
                clEnumValN(FreeDeadToggle::On, "on", "clear (default)")));
+// Call-site half of B1. drop_in_place / drop_glue free the owner in the
+// callee, so the caller's dead slots never see an inline mem.free. Off keeps
+// only the inline mem.free triggers. The main switch off disables both.
+static cl::opt<FreeDeadToggle> FreeDeadCallsOpt(
+    "cheri-invalidate-free-dead-calls", cl::init(FreeDeadToggle::On), cl::Hidden,
+    cl::desc("M7.1c-2b: also clear dead slots after an out-of-line drop of "
+             "their owner"),
+    cl::values(clEnumValN(FreeDeadToggle::Off, "off", "inline mem.free only"),
+               clEnumValN(FreeDeadToggle::On, "on", "drop calls too (default)")));
 static cl::opt<unsigned> WideBytesOpt(
     "cheri-invalidate-wide-bytes", cl::init(512), cl::Hidden,
     cl::desc("M7.1c-2a: largest static alloca (bytes) widened into per-word "
@@ -247,6 +256,8 @@ struct Inv {
   unsigned WideAllocas = 0, WideSkippedLarge = 0, OwnNulledWide = 0;
   // M7.1c-2b: plain nulls and range-checked clears of slots dead after a free.
   unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
+  unsigned FreeDeadCallPlain = 0, FreeDeadCallChecked = 0;
+  DenseMap<std::pair<AllocaInst *, int64_t>, SmallVector<Value *, 2>> SlotStored;
   MapVector<AllocaInst *, SmallVector<int64_t, 4>> WideByAlloca;
   struct LoanIntoScan {
     Instruction *At;
@@ -396,6 +407,7 @@ struct Inv {
   }
   void collectSlots(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
     WideByAlloca.clear();
+    SlotStored.clear();
     for (Instruction &I : instructions(F)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
@@ -408,6 +420,9 @@ struct Inv {
       auto &V = Out[A];
       if (!is_contained(V, Off))
         V.push_back(Off);
+      auto &Stored = SlotStored[{A, Off}];
+      if (Stored.size() < 4)
+        Stored.push_back(SI->getValueOperand());
       Prov &Pv = SlotProv[{A, Off}];
       SmallVector<const Value *, 4> Objs;
       getUnderlyingObjects(SI->getValueOperand(), Objs);
@@ -575,6 +590,84 @@ struct Inv {
     return R;
   }
   DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadAfter;
+
+  // Stored capability comes from Owner: the pointer itself, a field or
+  // element of it, a load from it (the heap buffer inside a Vec), or that
+  // value passed through black_box / empty asm.
+  bool derivedFrom(const Value *V, const Value *Owner) {
+    const Value *OU = getUnderlyingObject(Owner);
+    SmallVector<const Value *, 8> WL{V};
+    SmallPtrSet<const Value *, 8> Seen;
+    for (unsigned Steps = 0; Steps < 16 && !WL.empty(); ++Steps) {
+      const Value *X = WL.pop_back_val();
+      if (!X || !Seen.insert(X).second)
+        continue;
+      if (X == Owner || X == OU)
+        return true;
+      const Value *U = getUnderlyingObject(X);
+      if (U == Owner || U == OU)
+        return true;
+      if (auto *GEP = dyn_cast<GEPOperator>(X)) {
+        WL.push_back(GEP->getPointerOperand());
+        continue;
+      }
+      if (auto *CI = dyn_cast<CastInst>(X)) {
+        WL.push_back(CI->getOperand(0));
+        continue;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(X)) {
+        const Value *P = LI->getPointerOperand();
+        const Value *PU = getUnderlyingObject(P);
+        if (P == Owner || PU == Owner || PU == OU)
+          return true;
+        continue;
+      }
+      if (auto *PHI = dyn_cast<PHINode>(X)) {
+        for (const Value *Inc : PHI->incoming_values())
+          WL.push_back(Inc);
+        continue;
+      }
+      if (auto *Sel = dyn_cast<SelectInst>(X)) {
+        WL.push_back(Sel->getTrueValue());
+        WL.push_back(Sel->getFalseValue());
+        continue;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(X)) {
+        bool Through = isEmptyAsm(CB);
+        if (!Through)
+          if (const Function *CF = CB->getCalledFunction())
+            Through = CF->getName().contains("black_box");
+        if (!Through)
+          continue;
+        for (const Value *Arg : CB->args())
+          if (Arg->getType()->isPointerTy())
+            WL.push_back(Arg);
+      }
+    }
+    return false;
+  }
+  bool slotHoldsOwner(AllocaInst *A, int64_t Off, const Value *Owner) {
+    const Value *OU = getUnderlyingObject(Owner);
+    if (A == Owner || A == OU)
+      return true;
+    auto It = SlotStored.find({A, Off});
+    if (It == SlotStored.end())
+      return false;
+    for (const Value *S : It->second)
+      if (derivedFrom(S, Owner))
+        return true;
+    return false;
+  }
+  static bool isOwnerFreeCall(const CallBase &CB) {
+    if (CB.getOperandBundle(memannot::TagFree) || CB.isInlineAsm())
+      return false;
+    if (const Function *CF = CB.getCalledFunction()) {
+      StringRef N = CF->getName();
+      if (N.contains("drop_in_place") || N.contains("drop_glue"))
+        return true;
+    }
+    return memannot::isDeallocCall(CB);
+  }
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
   void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len,
@@ -2340,6 +2433,86 @@ struct Inv {
             continue;
         clearFreedReg(C, C->getNextNode());
       }
+    // Out-of-line drop: the mem.free is in the callee. Slots that still hold
+    // a capability derived from the dropped owner, and are not read again,
+    // are cleared here. Same plain-null / range-check split as an inline free.
+    if (FreeDeadOpt == FreeDeadToggle::On &&
+        FreeDeadCallsOpt == FreeDeadToggle::On) {
+      for (Instruction &I : instructions(F)) {
+        auto *C = dyn_cast<CallBase>(&I);
+        if (!C || !isOwnerFreeCall(*C))
+          continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
+        Instruction *At = C->getNextNode();
+        if (!At)
+          continue;
+        bool NeedBounds = false;
+        SmallVector<std::pair<AllocaInst *, int64_t>, 8> Plain, Checked;
+        auto Consider = [&](AllocaInst *A, int64_t Off, const Value *Owner) {
+          if (!slotHoldsOwner(A, Off, Owner))
+            return;
+          if (!liveAt(A, C, DT) || readAfter(A, C, DT) || loanCovered(A, Off, C))
+            return;
+          if (escapes(A)) {
+            Checked.push_back({A, Off});
+            NeedBounds = true;
+          } else
+            Plain.push_back({A, Off});
+        };
+        for (Value *Owner : C->args()) {
+          if (!DL.isFatPointer(Owner->getType()))
+            continue;
+          if (memannot::isDeallocCall(*C)) {
+            const Function *CF = C->getCalledFunction();
+            StringRef N = CF ? CF->getName() : "";
+            bool NamedDrop = N.contains("drop_in_place") || N.contains("drop_glue");
+            if (!NamedDrop) {
+              unsigned Idx = 0;
+              bool ND = false;
+              for (; Idx < C->arg_size(); ++Idx)
+                if (C->getArgOperand(Idx) == Owner &&
+                    C->paramHasAttr(Idx, Attribute::NoUndef))
+                  ND = true;
+              if (!ND)
+                continue;
+            }
+          }
+          Plain.clear();
+          Checked.clear();
+          NeedBounds = false;
+          for (auto &[A, Offs] : CapSlots)
+            for (int64_t Off : Offs)
+              Consider(A, Off, Owner);
+          for (auto &[A, Offs] : WideByAlloca)
+            for (int64_t Off : Offs)
+              Consider(A, Off, Owner);
+          Value *Lo = nullptr, *Len = nullptr;
+          if (NeedBounds) {
+            B.SetInsertPoint(C);
+            Lo = B.CreateCall(decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}),
+                              {Owner});
+            Len = B.CreateCall(decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}),
+                               {Owner});
+          }
+          B.SetInsertPoint(At);
+          for (auto [A, Off] : Plain) {
+            Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
+            markClear(B.CreateAlignedStore(
+                          ConstantPointerNull::get(
+                              PointerType::get(M.getContext(), 200)),
+                          P, Align(16), InvVolatile),
+                      "cheri_inv_free_dead");
+            ++FreeDeadCallPlain;
+          }
+          for (auto [A, Off] : Checked) {
+            checkAndClear(B, {A, Off}, Lo, Len, "cheri_inv_free");
+            ++FreeDeadCallChecked;
+          }
+        }
+      }
+    }
     if (FLog && !CapSlots.empty())
       flogCalls(F, CapSlots, DT); // last DT user: it splits blocks
     if (Loan && !PendingLoanInto.empty())
@@ -2390,6 +2563,8 @@ struct Inv {
          << " own_nulled_wide=" << OwnNulledWide
          << " free_dead_plain=" << FreeDeadPlain
          << " free_dead_checked=" << FreeDeadChecked
+         << " free_dead_call_plain=" << FreeDeadCallPlain
+         << " free_dead_call_checked=" << FreeDeadCallChecked
          << "\n";
     }
   }
