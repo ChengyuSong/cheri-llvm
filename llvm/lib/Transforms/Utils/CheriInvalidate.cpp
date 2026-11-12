@@ -1809,6 +1809,23 @@ struct Inv {
     }
     return false;
   }
+  // A mem.free between Fact and At of this buffer cap (or something that
+  // may be it). Used when the owner slot was moved, so freesThisBuffer on
+  // the source slot may not see a free of the SSA buffer pointer.
+  bool capFreedBetween(Value *Buf, Instruction *Fact, Instruction *At,
+                       ArrayRef<CallBase *> Frees, DominatorTree &DT) const {
+    if (!Buf)
+      return false;
+    for (CallBase *Fr : Frees) {
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      if (mayRunBetween(Fact, Fr, At, DT) &&
+          mayBeThisBuffer(FB->Inputs[0], Buf))
+        return true;
+    }
+    return false;
+  }
   // Buffer still live after moves of A+Off: not freed without a replacement,
   // and we can name the current carrier or a dominating buffer cap.
   // Only capability loans are scanned.
@@ -1845,16 +1862,20 @@ struct Inv {
         CurSlot = DstVal;
       }
     }
+    Value *CurBuf = lastCapFromSlot(CurA, CurOff, At, DT);
+    Value *SrcBuf = lastCapFromSlot(A, Off, At, DT);
+    if (capFreedBetween(CurBuf, Fact, At, Frees, DT) ||
+        capFreedBetween(SrcBuf, Fact, At, Frees, DT))
+      return false;
     if (slotHoldsLiveBuf(CurA, CurOff, At, DT)) {
       OutSlot = CurSlot;
       Direct = false;
       return true;
     }
-    Value *Buf = lastCapFromSlot(CurA, CurOff, At, DT);
-    if (!Buf)
-      Buf = lastCapFromSlot(A, Off, At, DT);
+    Value *Buf = CurBuf ? CurBuf : SrcBuf;
     if (!Buf || !loanValAvailable(Buf, At, DT) ||
-        !DL.isFatPointer(Buf->getType()))
+        !DL.isFatPointer(Buf->getType()) ||
+        capFreedBetween(Buf, Fact, At, Frees, DT))
       return false;
     OutSlot = Buf;
     Direct = true;
@@ -1925,6 +1946,11 @@ struct Inv {
             Moved = true;
         }
         if (Moved) {
+          // Off is the pre-1d-A skip, including the counter.
+          if (!InvLoanIntoMovedLive) {
+            ++LoanIntoSkippedMoved;
+            continue;
+          }
           if (loanIntoReestablished(Id, Fact, At, Moves, Facts, A, Off, DT)) {
             ++LoanIntoSkippedMoved;
             continue;
@@ -1937,7 +1963,11 @@ struct Inv {
             PendingLoanInto.push_back({At, Tgt, Loan, Direct});
             continue;
           }
-          ++LoanIntoSkippedMoved;
+          if (capFreedBetween(lastCapFromSlot(A, Off, At, DT), Fact, At, Frees,
+                              DT))
+            ++LoanIntoSkippedFreed;
+          else
+            ++LoanIntoSkippedMoved;
           continue;
         }
         bool Freed = false;

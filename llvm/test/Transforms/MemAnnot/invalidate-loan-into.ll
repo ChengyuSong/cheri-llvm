@@ -223,6 +223,25 @@ define void @moved_live_forget(ptr addrspace(200) %buf, ptr addrspace(200) %loan
 ; MOVEDOFF-NOT: @llvm.cheri.cap.equal.exact
 ; MOVEDOFF: ret void
 
+
+; mem.move then mem.free of the buffer. The leftover is in a freed object
+; (the as_ptr-then-drop shape). M7.1d A must still skip; that is slice B.
+define void @moved_then_freed(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
+  %s = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %s, align 16
+  call void @llvm.mem.fact() [ "mem.loan_into"(ptr addrspace(200) %s, ptr addrspace(200) %loan, i64 8) ]
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %s) ]
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  call void @use(ptr addrspace(200) %loan), !mem.last_use !8
+  ret void
+}
+; CHECK-LABEL: define void @moved_then_freed(
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: ret void
+; MOVEDOFF-LABEL: define void @moved_then_freed(
+; MOVEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; MOVEDOFF: ret void
+
 declare void @llvm.memcpy.p200.p200.i64(ptr addrspace(200), ptr addrspace(200), i64, i1)
 
 define void @none_end() {
@@ -232,20 +251,20 @@ define void @none_end() {
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; STATS: loan_into_facts=11
+; STATS: loan_into_facts=12
 ; STATS-SAME: loan_into_scans=7
 ; STATS-SAME: loan_into_nulls=7
-; STATS-SAME: loan_into_skipped_freed=1
+; STATS-SAME: loan_into_skipped_freed=2
 ; STATS-SAME: loan_into_skipped_moved=1
 ; STATS-SAME: loan_into_moved_live=3
 ; STATS-SAME: loan_into_skipped_promoted=0
 ; STATS-SAME: loan_into_skipped_noval=1
 
-; STATS-OFF: loan_into_facts=11
+; STATS-OFF: loan_into_facts=12
 ; STATS-OFF-SAME: loan_into_scans=4
 ; STATS-OFF-SAME: loan_into_nulls=4
 ; STATS-OFF-SAME: loan_into_skipped_freed=1
-; STATS-OFF-SAME: loan_into_skipped_moved=4
+; STATS-OFF-SAME: loan_into_skipped_moved=5
 ; STATS-OFF-SAME: loan_into_moved_live=0
 ; STATS-OFF-SAME: loan_into_skipped_promoted=0
 ; STATS-OFF-SAME: loan_into_skipped_noval=1
@@ -257,3 +276,4 @@ define void @none_end() {
 !5 = !{i64 5}
 !6 = !{i64 6}
 !7 = !{i64 7}
+!8 = !{i64 8}
