@@ -20,6 +20,10 @@
 //     marker and is counted, not scanned. Promotion that recovers the buffer
 //     pointer rewrites the fact to "mem.loan_into.val"(ptr buf, ptr loan, i64 id)
 //     and the scan uses that capability directly.
+//   * M7.1d A: a mem.move of the owner slot no longer drops the scan when
+//     the buffer is still live (clear/forget of a live Vec, or finish_grow).
+//     The scan uses the still-named carrier, or the buffer capability, and
+//     is off with -cheri-invalidate-loan-into-moved-live=false.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -165,6 +169,11 @@ static cl::opt<bool> InvLoanSkip(
     "cheri-invalidate-loan-skip", cl::init(true), cl::Hidden,
     cl::desc("R5 (D37): no range check at a scope/free event for a loan slot "
              "whose loan-end clear lies on every path from its stores"));
+static cl::opt<bool> InvLoanIntoMovedLive(
+    "cheri-invalidate-loan-into-moved-live", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d A: do not skip a mem.loan_into scan after mem.move when "
+             "the moved owner's buffer is still live (default on; false is "
+             "byte-identical to the pre-1d-A pass)"));
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -247,6 +256,7 @@ struct Inv {
   // scan loop), not the number of elements a run of the loop clears.
   unsigned LoanIntoFacts = 0, LoanIntoScans = 0, LoanIntoNulls = 0;
   unsigned LoanIntoSkippedFreed = 0, LoanIntoSkippedMoved = 0;
+  unsigned LoanIntoMovedLive = 0;
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
@@ -1594,6 +1604,10 @@ struct Inv {
   // ended, no mem.move of the slot sits between them, and the buffer currently
   // in the slot was not passed to mem.free without a later store. The scan
   // re-reads the slot (grow/realloc) and walks [base, base+length) by 16.
+  // M7.1d A: an intervening mem.move is not a skip when the buffer is still
+  // live, rustc did not re-establish the same id after the last move, and
+  // the loan is a capability. The scan then uses the still-named carrier
+  // (memcpy dest, or the slot if it was re-inited) or the buffer cap itself.
   bool dominatesBetween(Instruction *From, Instruction *Mid, Instruction *To,
                         DominatorTree &DT) const {
     return From != Mid && Mid != To && DT.dominates(From, Mid) &&
@@ -1655,6 +1669,219 @@ struct Inv {
       return DT.dominates(I, At);
     return true;
   }
+
+  bool isMemcpyLike(const Instruction *I, Value *&Dst, Value *&Src) const {
+    auto *CB = dyn_cast<CallBase>(I);
+    if (!CB)
+      return false;
+    Intrinsic::ID Id = CB->getIntrinsicID();
+    if (Id != Intrinsic::memcpy && Id != Intrinsic::memmove)
+      return false;
+    if (CB->arg_size() < 2)
+      return false;
+    Dst = CB->getArgOperand(0);
+    Src = CB->getArgOperand(1);
+    return true;
+  }
+  // The latest instruction that stores to or loads a fat pointer from this
+  // slot and dominates At. Same-block later wins; otherwise dominance.
+  Instruction *latestDominating(Instruction *Best, Instruction *I,
+                                Instruction *At, DominatorTree &DT) const {
+    if (!I || I == At || !DT.dominates(I, At))
+      return Best;
+    if (!Best)
+      return I;
+    if (DT.dominates(Best, I))
+      return I;
+    if (!DT.dominates(I, Best) && Best->getParent() == I->getParent() &&
+        Best->comesBefore(I))
+      return I;
+    return Best;
+  }
+  StoreInst *lastStoreToSlot(AllocaInst *A, int64_t Off, Instruction *At,
+                             DominatorTree &DT) const {
+    StoreInst *Best = nullptr;
+    for (Instruction &I : instructions(*At->getFunction())) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !isThisSlot(SI->getPointerOperand(), A, Off))
+        continue;
+      Best = dyn_cast_or_null<StoreInst>(latestDominating(Best, SI, At, DT));
+    }
+    return Best;
+  }
+  Value *lastCapFromSlot(AllocaInst *A, int64_t Off, Instruction *At,
+                         DominatorTree &DT) const {
+    Value *BestV = nullptr;
+    Instruction *BestI = nullptr;
+    for (Instruction &I : instructions(*At->getFunction())) {
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (!isThisSlot(LI->getPointerOperand(), A, Off))
+          continue;
+        if (!DL.isFatPointer(LI->getType()))
+          continue;
+        Instruction *N = latestDominating(BestI, LI, At, DT);
+        if (N == LI) {
+          BestI = LI;
+          BestV = LI;
+        }
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (!isThisSlot(SI->getPointerOperand(), A, Off))
+          continue;
+        Value *V = SI->getValueOperand();
+        if (!V->getType()->isPointerTy() || !DL.isFatPointer(V->getType()))
+          continue;
+        if (isa<ConstantPointerNull>(V))
+          continue;
+        Instruction *N = latestDominating(BestI, SI, At, DT);
+        if (N == SI) {
+          BestI = SI;
+          BestV = V;
+        }
+      }
+    }
+    return BestV;
+  }
+  // memcpy/memmove immediately before Move whose source is this slot.
+  bool memcpyDestBefore(Instruction *Move, AllocaInst *A, int64_t Off,
+                        AllocaInst *&DstA, int64_t &DstOff,
+                        Value *&DstVal) const {
+    for (Instruction *P = Move->getPrevNode(); P; P = P->getPrevNode()) {
+      if (P->isDebugOrPseudoInst())
+        continue;
+      if (auto *CB = dyn_cast<CallBase>(P))
+        if (memannot::isMemFact(CB))
+          continue;
+      Value *Dst = nullptr, *Src = nullptr;
+      if (!isMemcpyLike(P, Dst, Src))
+        return false;
+      if (isThisSlot(Src, A, Off) && frameSlot(Dst, DstA, DstOff)) {
+        DstVal = Dst;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+  bool slotHoldsLiveBuf(AllocaInst *A, int64_t Off, Instruction *At,
+                        DominatorTree &DT) {
+    if (!liveAt(A, At, DT))
+      return false;
+    StoreInst *S = lastStoreToSlot(A, Off, At, DT);
+    if (!S)
+      return true;
+    return !isa<ConstantPointerNull>(S->getValueOperand());
+  }
+  // rustc already re-emitted this id on a still-live slot after the last move.
+  bool loanIntoReestablished(uint64_t Id, Instruction *Fact, Instruction *At,
+                             ArrayRef<CallBase *> Moves,
+                             ArrayRef<CallBase *> Facts,
+                             AllocaInst *A, int64_t Off,
+                             DominatorTree &DT) {
+    CallBase *LastMv = nullptr;
+    for (CallBase *Mv : Moves) {
+      auto MB = Mv->getOperandBundle(memannot::TagMove);
+      if (!MB || MB->Inputs.empty() || !isThisSlot(MB->Inputs[0], A, Off))
+        continue;
+      if (dominatesBetween(Fact, Mv, At, DT))
+        LastMv = Mv;
+    }
+    if (!LastMv)
+      return false;
+    for (CallBase *F2 : Facts) {
+      if (F2 == Fact)
+        continue;
+      auto OB = F2->getOperandBundle(memannot::TagLoanInto);
+      if (!OB || OB->Inputs.size() < 3)
+        continue;
+      auto *IdC = dyn_cast<ConstantInt>(OB->Inputs[2]);
+      if (!IdC || IdC->getZExtValue() != Id)
+        continue;
+      if (!dominatesBetween(LastMv, F2, At, DT) && F2 != At)
+        continue;
+      if (!DT.dominates(F2, At) && F2 != At)
+        continue;
+      AllocaInst *A2 = nullptr;
+      int64_t Off2 = 0;
+      if (!frameSlot(OB->Inputs[0], A2, Off2))
+        continue;
+      if (slotHoldsLiveBuf(A2, Off2, At, DT))
+        return true;
+    }
+    return false;
+  }
+  // A mem.free between Fact and At of this buffer cap (or something that
+  // may be it). Used when the owner slot was moved, so freesThisBuffer on
+  // the source slot may not see a free of the SSA buffer pointer.
+  bool capFreedBetween(Value *Buf, Instruction *Fact, Instruction *At,
+                       ArrayRef<CallBase *> Frees, DominatorTree &DT) const {
+    if (!Buf)
+      return false;
+    for (CallBase *Fr : Frees) {
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      if (mayRunBetween(Fact, Fr, At, DT) &&
+          mayBeThisBuffer(FB->Inputs[0], Buf))
+        return true;
+    }
+    return false;
+  }
+  // Buffer still live after moves of A+Off: not freed without a replacement,
+  // and we can name the current carrier or a dominating buffer cap.
+  // Only capability loans are scanned.
+  bool loanIntoMovedLiveTarget(AllocaInst *A, int64_t Off, Value *Slot,
+                               Value *Loan, uint64_t Id, Instruction *Fact,
+                               Instruction *At, DominatorTree &DT,
+                               ArrayRef<CallBase *> Moves,
+                               ArrayRef<CallBase *> Frees,
+                               Value *&OutSlot, bool &Direct) {
+    if (!InvLoanIntoMovedLive)
+      return false;
+    if (!Loan || !DL.isFatPointer(Loan->getType()))
+      return false;
+    for (CallBase *Fr : Frees)
+      if (dominatesBetween(Fact, Fr, At, DT) &&
+          freesThisBuffer(Fr, A, Off, At, DT))
+        return false;
+    AllocaInst *CurA = A;
+    int64_t CurOff = Off;
+    Value *CurSlot = Slot;
+    for (CallBase *Mv : Moves) {
+      auto MB = Mv->getOperandBundle(memannot::TagMove);
+      if (!MB || MB->Inputs.empty() ||
+          !isThisSlot(MB->Inputs[0], CurA, CurOff))
+        continue;
+      if (!dominatesBetween(Fact, Mv, At, DT))
+        continue;
+      AllocaInst *DstA = nullptr;
+      int64_t DstOff = 0;
+      Value *DstVal = nullptr;
+      if (memcpyDestBefore(Mv, CurA, CurOff, DstA, DstOff, DstVal)) {
+        CurA = DstA;
+        CurOff = DstOff;
+        CurSlot = DstVal;
+      }
+    }
+    Value *CurBuf = lastCapFromSlot(CurA, CurOff, At, DT);
+    Value *SrcBuf = lastCapFromSlot(A, Off, At, DT);
+    if (capFreedBetween(CurBuf, Fact, At, Frees, DT) ||
+        capFreedBetween(SrcBuf, Fact, At, Frees, DT))
+      return false;
+    if (slotHoldsLiveBuf(CurA, CurOff, At, DT)) {
+      OutSlot = CurSlot;
+      Direct = false;
+      return true;
+    }
+    Value *Buf = CurBuf ? CurBuf : SrcBuf;
+    if (!Buf || !loanValAvailable(Buf, At, DT) ||
+        !DL.isFatPointer(Buf->getType()) ||
+        capFreedBetween(Buf, Fact, At, Frees, DT))
+      return false;
+    OutSlot = Buf;
+    Direct = true;
+    return true;
+  }
+
   void loanIntoPlan(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     SmallVector<Instruction *, 8> Carriers;
@@ -1719,7 +1946,28 @@ struct Inv {
             Moved = true;
         }
         if (Moved) {
-          ++LoanIntoSkippedMoved;
+          // Off is the pre-1d-A skip, including the counter.
+          if (!InvLoanIntoMovedLive) {
+            ++LoanIntoSkippedMoved;
+            continue;
+          }
+          if (loanIntoReestablished(Id, Fact, At, Moves, Facts, A, Off, DT)) {
+            ++LoanIntoSkippedMoved;
+            continue;
+          }
+          Value *Tgt = nullptr;
+          bool Direct = false;
+          if (loanIntoMovedLiveTarget(A, Off, Slot, Loan, Id, Fact, At, DT,
+                                      Moves, Frees, Tgt, Direct)) {
+            ++LoanIntoMovedLive;
+            PendingLoanInto.push_back({At, Tgt, Loan, Direct});
+            continue;
+          }
+          if (capFreedBetween(lastCapFromSlot(A, Off, At, DT), Fact, At, Frees,
+                              DT))
+            ++LoanIntoSkippedFreed;
+          else
+            ++LoanIntoSkippedMoved;
           continue;
         }
         bool Freed = false;
@@ -2717,6 +2965,7 @@ struct Inv {
          << " loan_into_nulls=" << LoanIntoNulls
          << " loan_into_skipped_freed=" << LoanIntoSkippedFreed
          << " loan_into_skipped_moved=" << LoanIntoSkippedMoved
+         << " loan_into_moved_live=" << LoanIntoMovedLive
          << " loan_into_skipped_promoted=" << LoanIntoSkippedPromoted
          << " loan_into_skipped_noval=" << LoanIntoSkippedNoval
          << " loan_into_val_facts=" << LoanIntoValFacts
