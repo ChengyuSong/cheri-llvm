@@ -249,6 +249,10 @@ void initializeRISCVCheriHwSubsumePass(PassRegistry &);
 
 FunctionPass *createRISCVCheriCapInvalidatePass();
 void initializeRISCVCheriCapInvalidatePass(PassRegistry &);
+FunctionPass *createRISCVCheriFrameWipePass();
+void initializeRISCVCheriFrameWipePass(PassRegistry &);
+FunctionPass *createRISCVCheriFreeZeroRegsPass();
+void initializeRISCVCheriFreeZeroRegsPass(PassRegistry &);
 FunctionPass *createRISCVCheriCapInvalidateExpandPass();
 void initializeRISCVCheriCapInvalidateExpandPass(PassRegistry &);
 

@@ -724,6 +724,9 @@ bool memannot::stripAnnotations(Module &M) {
     }
     NoteOps(CB, false);
     CallBase *New = CallBase::Create(CB, Keep, CB->getIterator());
+    // [LLM-generated] M7.1c: Create() drops metadata. !pcsections "cheri_free_regs"
+    // has to reach the call MI so the late pass can see the free.
+    New->copyMetadata(*CB);
     New->takeName(CB);
     CB->replaceAllUsesWith(New);
     CB->eraseFromParent();

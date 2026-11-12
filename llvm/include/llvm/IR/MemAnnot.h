@@ -254,6 +254,11 @@ LLVM_ABI void noteCapRegSkippedSoonRedef();
 LLVM_ABI void noteCapRegSkippedEdge();
 LLVM_ABI void noteCapRegSkippedDup();
 LLVM_ABI void flushSpillInvalidateStats();
+/// [LLM-generated] M7.1c. Append one line to -cheri-invalidate-stats-out.
+LLVM_ABI void appendInvalidateStatsLine(StringRef Line);
+/// [LLM-generated] M7.1c. -cheri-free-zero-regs (default on). The inliner, the
+/// free-site tail demotion, and the backend marker all read this one switch.
+LLVM_ABI bool cheriFreeZeroRegsEnabled();
 } // namespace memannot
 } // namespace llvm
 #endif

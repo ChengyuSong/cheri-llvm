@@ -1574,6 +1574,14 @@ def PseudoCheriCapClear
     : Pseudo<(outs YGPR:$rd), (ins YGPR:$rs), [], "cheri.cap.clear", "$rd, $rs">;
 def : Pat<(int_cheri_cap_invalidate YGPR:$rs, timm:$kind),
           (PseudoCheriCapInvalidate YGPR:$rs, timm:$kind)>;
+// [LLM-generated] M7.1c. LowerCall emits this after an out-of-line "mem.free"
+// call. llvm.riscv.cheri.free.zero is the same marker at the return of an
+// inlined free. The late pass replaces it with cmove of each dead
+// caller-saved capability.
+// mayStore keeps the marker from sliding past the free-list store.
+let hasSideEffects = 1, mayLoad = 0, mayStore = 1, isCodeGenOnly = 1 in
+def PseudoCheriFreeZero : Pseudo<(outs), (ins), [], "cheri.free.zero", "">;
+def : Pat<(int_riscv_cheri_free_zero), (PseudoCheriFreeZero)>;
 }
 def : PatYGPRYGPR<int_cheri_cap_build, CBuildCap>;
 def : PatYGPRYGPR<int_cheri_cap_type_copy, CCopyType>;

@@ -38,8 +38,11 @@ define i32 @caller(i32 zeroext %n) nounwind {
 ; RV32IXCHERI-NEXT:    cincoffset sp, s0, -64
 ; RV32IXCHERI-NEXT:    clc ra, 56(sp) # 8-byte Folded Reload
 ; RV32IXCHERI-NEXT:    clc s0, 48(sp) # 8-byte Folded Reload
+; RV32IXCHERI-NEXT:    csc zero, 48(sp)
 ; RV32IXCHERI-NEXT:    clc s1, 40(sp) # 8-byte Folded Reload
+; RV32IXCHERI-NEXT:    csc zero, 40(sp)
 ; RV32IXCHERI-NEXT:    clc s2, 32(sp) # 8-byte Folded Reload
+; RV32IXCHERI-NEXT:    csc zero, 32(sp)
 ; RV32IXCHERI-NEXT:    cincoffset sp, sp, 64
 ; RV32IXCHERI-NEXT:    cret
 ;
@@ -72,8 +75,11 @@ define i32 @caller(i32 zeroext %n) nounwind {
 ; RV64IXCHERI-NEXT:    cincoffset sp, s0, -128
 ; RV64IXCHERI-NEXT:    clc ra, 112(sp) # 16-byte Folded Reload
 ; RV64IXCHERI-NEXT:    clc s0, 96(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 96(sp)
 ; RV64IXCHERI-NEXT:    clc s1, 80(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 80(sp)
 ; RV64IXCHERI-NEXT:    clc s2, 64(sp) # 16-byte Folded Reload
+; RV64IXCHERI-NEXT:    csc zero, 64(sp)
 ; RV64IXCHERI-NEXT:    cincoffset sp, sp, 128
 ; RV64IXCHERI-NEXT:    cret
   %1 = alloca i8, align 64, addrspace(200)

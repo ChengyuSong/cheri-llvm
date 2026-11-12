@@ -146,6 +146,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVCheriHwSubsumePass(*PR);
   initializeRISCVCheriCapInvalidatePass(*PR);
   initializeRISCVCheriCapInvalidateExpandPass(*PR);
+  initializeRISCVCheriFrameWipePass(*PR);
+  initializeRISCVCheriFreeZeroRegsPass(*PR);
   initializeRISCVPostRAExpandPseudoPass(*PR);
   initializeRISCVMergeBaseOffsetOptPass(*PR);
   initializeRISCVOptWInstrsPass(*PR);
@@ -620,6 +622,10 @@ void RISCVPassConfig::addPreEmitPass() {
 }
 
 void RISCVPassConfig::addPreEmitPass2() {
+  // After PEI, before push/pop folds the restore and the stack adjust into
+  // one instruction. Spill nulls use the still-live frame; CSR slots are
+  // nulled after their restores.
+  addPass(createRISCVCheriFrameWipePass());
   if (TM->getOptLevel() != CodeGenOptLevel::None) {
     addPass(createRISCVMoveMergePass());
     // Schedule PushPop Optimization before expansion of Pseudo instruction,
@@ -631,6 +637,8 @@ void RISCVPassConfig::addPreEmitPass2() {
   // After pre-emit copy-prop, so clearing a callee-saved register is not
   // dropped as a dead move before a later call.
   addPass(createRISCVCheriCapInvalidateExpandPass());
+  // After copy-prop as well: a cmove into a dead a/t reg must not be deleted.
+  addPass(createRISCVCheriFreeZeroRegsPass());
 
   // Add QC Relaxation Markers as late as possible, and only for RV32
   if (TM->getOptLevel() != CodeGenOptLevel::None &&

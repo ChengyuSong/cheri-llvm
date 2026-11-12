@@ -127,8 +127,11 @@ define void @test_clc_tls_gd(i32 signext %n) nounwind {
 ; RV32I-NEXT:  # %bb.2: # %ret
 ; RV32I-NEXT:    clc ra, 24(sp) # 8-byte Folded Reload
 ; RV32I-NEXT:    clc s0, 16(sp) # 8-byte Folded Reload
+; RV32I-NEXT:    csc zero, 16(sp)
 ; RV32I-NEXT:    clc s1, 8(sp) # 8-byte Folded Reload
+; RV32I-NEXT:    csc zero, 8(sp)
 ; RV32I-NEXT:    clc s2, 0(sp) # 8-byte Folded Reload
+; RV32I-NEXT:    csc zero, 0(sp)
 ; RV32I-NEXT:    cincoffset sp, sp, 32
 ; RV32I-NEXT:    cret
 ;
@@ -155,8 +158,11 @@ define void @test_clc_tls_gd(i32 signext %n) nounwind {
 ; RV64I-NEXT:  # %bb.2: # %ret
 ; RV64I-NEXT:    clc ra, 48(sp) # 16-byte Folded Reload
 ; RV64I-NEXT:    clc s0, 32(sp) # 16-byte Folded Reload
+; RV64I-NEXT:    csc zero, 32(sp)
 ; RV64I-NEXT:    clc s1, 16(sp) # 16-byte Folded Reload
+; RV64I-NEXT:    csc zero, 16(sp)
 ; RV64I-NEXT:    clc s2, 0(sp) # 16-byte Folded Reload
+; RV64I-NEXT:    csc zero, 0(sp)
 ; RV64I-NEXT:    cincoffset sp, sp, 64
 ; RV64I-NEXT:    cret
 entry:

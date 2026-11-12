@@ -1,8 +1,9 @@
 ; [LLM-generated] M6.0 D88. The clear is before LIFETIME_END. After stack
 ; coloring merges the two slots, that clear still runs before the second
 ; object's first store.
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -stop-before=stack-coloring < %s | FileCheck %s --check-prefix=BEFORE
-; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -stop-after=stack-coloring < %s | FileCheck %s --check-prefix=AFTER
+; Own-slot nulls are off here (slite) so the only pcsections are the loan clears.
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -cheri-invalidate=loan+free+slite+aflog -stop-before=stack-coloring < %s | FileCheck %s --check-prefix=BEFORE
+; RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -O2 -cheri-invalidate=loan+free+slite+aflog -stop-after=stack-coloring < %s | FileCheck %s --check-prefix=AFTER
 
 target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 

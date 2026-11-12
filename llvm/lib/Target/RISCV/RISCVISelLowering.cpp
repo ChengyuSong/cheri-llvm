@@ -41,6 +41,7 @@
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
 #include "llvm/MC/MCCodeEmitter.h"
@@ -27130,6 +27131,13 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
     InVals.push_back(RetValue);
   }
 
+  // [LLM-generated] M7.1c. After the result copies, so a used return value has
+  // already left ca0 when it is still live. The late pass deletes this marker.
+  if (CLI.CB && CLI.CB->hasFnAttr("cheri-free-regs") &&
+      memannot::cheriFreeZeroRegsEnabled())
+    Chain = SDValue(DAG.getMachineNode(RISCV::PseudoCheriFreeZero, DL,
+                                       MVT::Other, Chain),
+                    0);
   return Chain;
 }
 

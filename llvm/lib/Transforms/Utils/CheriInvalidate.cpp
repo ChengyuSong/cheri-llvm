@@ -21,8 +21,8 @@
 //     pointer rewrites the fact to "mem.loan_into.val"(ptr buf, ptr loan, i64 id)
 //     and the scan uses that capability directly.
 // Only capabilities into dead storage (or of an ended loan) are touched
-// (fail-safe). Off by default: -cheri-invalidate=none|scope|free|loan|all,
-// or a '+'-list (e.g. scope+free, the R4 "all").
+// (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
+// '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
 //===----------------------------------------------------------------------===//
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -50,14 +50,15 @@
 using namespace llvm;
 
 static cl::opt<std::string> InvalidateOpt(
-    "cheri-invalidate", cl::init("loan+free+slite+aflog"), cl::Hidden,
+    "cheri-invalidate", cl::init("loan+free+scope+aflog"), cl::Hidden,
     cl::desc("M5r Track B: none, scope, slite (scope range checks without "
              "own-slot nulls, R10 D73), free, loan, flog (R10 D72 free log, "
-             "opt-in), aflog (R12 D80 argument free log), loan+free+slite+aflog "
-             "(default since R14 D83, owner OK 2026-11-05; R10-R13: "
+             "opt-in), aflog (R12 D80 argument free log), "
+             "loan+free+scope+aflog (default since M7.1c, own-slot nulls on; "
+             "R14 D83 through M7.1b: loan+free+slite+aflog; R10-R13: "
              "loan+free+slite, which disables aflog; R9 D69: "
              "loan+free; R8 D57: loan), all, or a "
-             "'+'-list (scope+free = R4 all)"));
+             "'+'-list (scope+free = R4 all). slite remains selectable."));
 // [LLM-generated] R5 (D40): a clear of a slot that is about to die (own slot
 // before lifetime.end, or a loan clear) is a dead store to codegen:
 // SelectionDAG drops stores to a frame object before its LIFETIME_END, so the
@@ -153,6 +154,15 @@ void llvm::memannot::noteCapRegSkippedCSR() { ++CapRegSkippedCSR; }
 void llvm::memannot::noteCapRegSkippedSoonRedef() { ++CapRegSkippedSoon; }
 void llvm::memannot::noteCapRegSkippedEdge() { ++CapRegSkippedEdge; }
 void llvm::memannot::noteCapRegSkippedDup() { ++CapRegSkippedDup; }
+void llvm::memannot::appendInvalidateStatsLine(StringRef Line) {
+  if (InvStatsOut.empty() || Line.empty())
+    return;
+  std::error_code EC;
+  raw_fd_ostream OS(InvStatsOut, EC, sys::fs::OF_Append | sys::fs::OF_Text);
+  if (!EC)
+    OS << Line << "\n";
+}
+
 void llvm::memannot::flushSpillInvalidateStats() {
   if (InvStatsOut.empty())
     return;
@@ -2113,8 +2123,13 @@ struct Inv {
     };
     if (Free)
       for (CallBase *C : Frees) {
+        // A musttail must be the instruction before the return. Inserting
+        // the free clear after it is invalid IR, and it is not a zero site.
         if (isa<InvokeInst>(C))
           continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
         Value *P = C->getOperandBundle(memannot::TagFree)->Inputs[0];
         if (!DL.isFatPointer(P->getType()))
           continue;
@@ -2137,6 +2152,9 @@ struct Inv {
       for (CallBase *C : Frees) {
         if (isa<InvokeInst>(C))
           continue;
+        if (auto *CI = dyn_cast<CallInst>(C))
+          if (CI->isMustTailCall())
+            continue;
         clearFreedReg(C, C->getNextNode());
       }
     if (FLog && !CapSlots.empty())
@@ -2197,7 +2215,59 @@ bool memannot::cheriInvalidateFreeActive() {
   return Mode == "all" || Mode.contains("free");
 }
 
+// [LLM-generated] M7.1c. One switch for the IR planting, the helper attribute,
+// the tail-call demotion, and the backend cmoves. Off leaves those calls as
+// they were before this pass.
+enum class FreeZeroToggle { Off, On };
+static cl::opt<FreeZeroToggle> FreeZeroRegsOpt(
+    "cheri-free-zero-regs", cl::init(FreeZeroToggle::On), cl::Hidden,
+    cl::desc("M7.1c: after a mem.free call, cmove dead caller-saved "
+             "capability registers to cnull (purecap)"),
+    cl::values(clEnumValN(FreeZeroToggle::Off, "off", "do not zero"),
+               clEnumValN(FreeZeroToggle::On, "on",
+                          "zero (default on purecap)")));
+
+bool memannot::cheriFreeZeroRegsEnabled() {
+  return FreeZeroRegsOpt == FreeZeroToggle::On;
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
+  // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
+  // free: zero after it returns. A helper that only inherited the bundle
+  // (a wipe inside an inlined allocator) carries "cheri-free-inner" and is
+  // not that point; the inliner plants llvm.riscv.cheri.free.zero at the
+  // inlined returns instead. The attribute survives strip and is visible to
+  // LowerCall. !pcsections on the call is not: SelectionDAG asserts when the
+  // call has no SDNode.
+  //
+  // A tail call never returns, so the zero after it would be dead. Clearing
+  // the tail marker makes this call return into the existing zero. musttail
+  // is left alone: lowering rejects a musttail that is not a tail call, and
+  // nothing may be placed after it, so it gets no zero either. Off skips
+  // this whole loop, so the call stays a tail call and gains no attribute.
+  if (memannot::cheriFreeZeroRegsEnabled()) {
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm() || !CB->getOperandBundle(memannot::TagFree))
+          continue;
+        if (CB->hasFnAttr("cheri-free-inner"))
+          continue;
+        if (const Function *Callee = CB->getCalledFunction())
+          if (Callee->isIntrinsic())
+            continue;
+        if (auto *CI = dyn_cast<CallInst>(CB)) {
+          if (CI->isMustTailCall())
+            continue;
+          if (CI->isTailCall())
+            CI->setTailCallKind(CallInst::TCK_None);
+        }
+        CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-free-regs"));
+      }
+    }
+  }
   StringRef Mode = InvalidateOpt;
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.

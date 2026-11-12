@@ -46,6 +46,7 @@ entry:
   ;; Usual callee epilogue.
   ;; CHECK-NEXT:  	ct.clc	ra, 8(sp)                     # 8-byte Folded Reload
   ;; CHECK-NEXT:  	ct.clc	s0, 0(sp)                     # 8-byte Folded Reload
+  ;; CHECK-NEXT:  	ct.csc	zero, 0(sp)
   ;; CHECK-NEXT:  	ct.cincoffset	sp, sp, 16
   ;; CHECK-NEXT:  	ct.cret
   ret [2 x i32] %.fca.1.insert

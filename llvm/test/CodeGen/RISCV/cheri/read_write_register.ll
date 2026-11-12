@@ -34,6 +34,7 @@ define void @set_tp(i64 %value) local_unnamed_addr #2 {
 ; CHECK-L64PC128-NEXT:    csc tp, 0(sp) # 16-byte Folded Spill
 ; CHECK-L64PC128-NEXT:    mv tp, a0
 ; CHECK-L64PC128-NEXT:    clc tp, 0(sp) # 16-byte Folded Reload
+; CHECK-L64PC128-NEXT:    csc zero, 0(sp)
 ; CHECK-L64PC128-NEXT:    cincoffset sp, sp, 16
 ; CHECK-L64PC128-NEXT:    cret
 ;
@@ -77,6 +78,7 @@ define void @set_ctp(i8 addrspace(200)* %value) local_unnamed_addr #2 {
 ; CHECK-L64PC128-NEXT:    csc tp, 0(sp) # 16-byte Folded Spill
 ; CHECK-L64PC128-NEXT:    cmove tp, a0
 ; CHECK-L64PC128-NEXT:    clc tp, 0(sp) # 16-byte Folded Reload
+; CHECK-L64PC128-NEXT:    csc zero, 0(sp)
 ; CHECK-L64PC128-NEXT:    cincoffset sp, sp, 16
 ; CHECK-L64PC128-NEXT:    cret
 ;
@@ -155,6 +157,7 @@ define void @set_gp_addr(i64 %value) local_unnamed_addr #2 {
 ; CHECK-L64PC128-NEXT:    csc gp, 0(sp) # 16-byte Folded Spill
 ; CHECK-L64PC128-NEXT:    cincoffset gp, zero, a0
 ; CHECK-L64PC128-NEXT:    clc gp, 0(sp) # 16-byte Folded Reload
+; CHECK-L64PC128-NEXT:    csc zero, 0(sp)
 ; CHECK-L64PC128-NEXT:    cincoffset sp, sp, 16
 ; CHECK-L64PC128-NEXT:    cret
 ;
