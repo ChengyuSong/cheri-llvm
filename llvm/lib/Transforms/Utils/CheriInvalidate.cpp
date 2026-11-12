@@ -783,6 +783,41 @@ struct Inv {
     }
     return memannot::isDeallocCall(CB);
   }
+  // O1 inlines past drop_glue to RawVecInner::deallocate(%tmp). The callee
+  // name is not special: the argument is the mem.move'd owner, or the
+  // memcpy temp whose source that fact covers.
+  bool takesMovedOwner(const CallBase &CB, DominatorTree &DT) {
+    const Function *Fn = CB.getFunction();
+    SmallVector<const Value *, 4> Moved;
+    for (const Instruction &J : instructions(*Fn)) {
+      if (!memannot::isMemMoveFact(&J) || !DT.dominates(&J, &CB))
+        continue;
+      if (const Value *Slot = memannot::slotClobber(&J))
+        Moved.push_back(getUnderlyingObject(Slot));
+    }
+    if (Moved.empty())
+      return false;
+    for (const Value *Arg : CB.args()) {
+      if (!DL.isFatPointer(Arg->getType()))
+        continue;
+      const Value *U = getUnderlyingObject(Arg);
+      for (const Value *Mv : Moved)
+        if (U == Mv)
+          return true;
+      for (const Instruction &I : instructions(*Fn)) {
+        auto *MT = dyn_cast<MemTransferInst>(&I);
+        if (!MT || !DT.dominates(MT, &CB))
+          continue;
+        if (getUnderlyingObject(MT->getRawDest()) != U)
+          continue;
+        const Value *Src = getUnderlyingObject(MT->getRawSource());
+        for (const Value *Mv : Moved)
+          if (Src == Mv)
+            return true;
+      }
+    }
+    return false;
+  }
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
   void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len,
@@ -2555,7 +2590,9 @@ struct Inv {
         FreeDeadCallsOpt == FreeDeadToggle::On) {
       for (Instruction &I : instructions(F)) {
         auto *C = dyn_cast<CallBase>(&I);
-        if (!C || !isOwnerFreeCall(*C))
+        if (!C || C->getOperandBundle(memannot::TagFree) || C->isInlineAsm())
+          continue;
+        if (!isOwnerFreeCall(*C) && !takesMovedOwner(*C, DT))
           continue;
         if (auto *CI = dyn_cast<CallInst>(C))
           if (CI->isMustTailCall())

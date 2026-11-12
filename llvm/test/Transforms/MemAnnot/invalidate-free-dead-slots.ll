@@ -15,6 +15,7 @@ declare void @llvm.lifetime.end.p200(ptr addrspace(200))
 declare void @llvm.memcpy.p200.p200.i64(ptr addrspace(200), ptr addrspace(200), i64, i1)
 declare void @llvm.mem.fact()
 declare void @drop_glue(ptr addrspace(200))
+declare void @RawVecInner_deallocate(ptr addrspace(200))
 declare void @dealloc(ptr addrspace(200))
 declare void @drop_in_place(ptr addrspace(200))
 declare void @opaque(ptr addrspace(200))
@@ -356,14 +357,71 @@ define void @s1_array_o1(ptr addrspace(200) %v) {
 ; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r4, align 16
 ; ON: ret void
 
+; s1 at O1: drop_glue was inlined. The call is RawVecInner::deallocate of the
+; moved temporary. The name is not a trigger; the mem.move alias is.
+define void @s1_o1_rawvec(ptr addrspace(200) %v) {
+  %tmp = alloca [16 x i8], align 16, addrspace(200)
+  %r0 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r1 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r2 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r3 = alloca ptr addrspace(200), align 16, addrspace(200)
+  %r4 = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %tmp, ptr addrspace(200) %v, i64 16, i1 false)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %v) ]
+  %buf = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  %e0 = getelementptr i8, ptr addrspace(200) %buf, i64 0
+  %e1 = getelementptr i8, ptr addrspace(200) %buf, i64 1
+  %e2 = getelementptr i8, ptr addrspace(200) %buf, i64 2
+  %e3 = getelementptr i8, ptr addrspace(200) %buf, i64 3
+  %e4 = getelementptr i8, ptr addrspace(200) %buf, i64 4
+  store ptr addrspace(200) %e0, ptr addrspace(200) %r0, align 16
+  store ptr addrspace(200) %e1, ptr addrspace(200) %r1, align 16
+  store ptr addrspace(200) %e2, ptr addrspace(200) %r2, align 16
+  store ptr addrspace(200) %e3, ptr addrspace(200) %r3, align 16
+  store ptr addrspace(200) %e4, ptr addrspace(200) %r4, align 16
+  call void @RawVecInner_deallocate(ptr addrspace(200) %tmp)
+  ret void
+}
+; ON-LABEL: define void @s1_o1_rawvec(
+; ON: call {{.*}}@RawVecInner_deallocate(
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r0, align 16
+; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %r4, align 16
+; ON-NOT: cheri.inv.cap
+; ON: ret void
+; OFF-LABEL: define void @s1_o1_rawvec(
+; OFF: call {{.*}}@RawVecInner_deallocate(
+; OFF-NOT: store volatile
+; OFF: ret void
+; CALLSOFF-LABEL: define void @s1_o1_rawvec(
+; CALLSOFF: call {{.*}}@RawVecInner_deallocate(
+; CALLSOFF-NOT: store volatile
+; CALLSOFF: ret void
+
+define void @moved_read_after(ptr addrspace(200) %v) {
+  %tmp = alloca [16 x i8], align 16, addrspace(200)
+  %r = alloca ptr addrspace(200), align 16, addrspace(200)
+  call void @llvm.memcpy.p200.p200.i64(ptr addrspace(200) %tmp, ptr addrspace(200) %v, i64 16, i1 false)
+  call void @llvm.mem.fact() [ "mem.move"(ptr addrspace(200) %v) ]
+  %buf = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  store ptr addrspace(200) %buf, ptr addrspace(200) %r, align 16
+  call void @RawVecInner_deallocate(ptr addrspace(200) %tmp)
+  %x = load ptr addrspace(200), ptr addrspace(200) %r, align 16
+  call void @use(ptr addrspace(200) %x)
+  ret void
+}
+; ON-LABEL: define void @moved_read_after(
+; ON: call {{.*}}@RawVecInner_deallocate(
+; ON-NOT: store volatile
+; ON: load ptr addrspace(200), ptr addrspace(200) %r
+
 ; ON: [[DEAD]] = !{!"cheri_inv_free_dead"}
 
 ; Inline frees: plain 1 + wide 3, escaped wide 3 checks.
-; Drop calls add r1_o2 1, s1_o2 2, s1_o2 array 4, s1_o1 slots 5, s1_o1 array 5.
+; Call-site plain adds s1_array_o2 6, s1_array_o1 10, s1_o1_rawvec 5.
 ; STATS: range_checks=5
 ; STATS-SAME: flog_calls=0
 ; STATS-SAME: flog_loops=0
 ; STATS-SAME: free_dead_plain=4
 ; STATS-SAME: free_dead_checked=3
-; STATS-SAME: free_dead_call_plain=22
+; STATS-SAME: free_dead_call_plain=27
 ; STATS-SAME: free_dead_call_checked=2
