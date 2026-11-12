@@ -26971,9 +26971,11 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
   // [LLM-generated] M7.1c-2c-narrow. The may-free bit rides on the existing
   // call operand so the post-RA clear does not insert a scheduling barrier.
   unsigned CallTF = RISCVII::MO_CALL;
+  // The late IR pass already decided this. Reading the attribute keeps ISel
+  // free of a DominatorTree, so parallel codegen units do not share one.
   if (CLI.CB &&
       memannot::cheriDeadCapMode() == memannot::CheriDeadCapMode::MayFree &&
-      memannot::isCheriMayFreeCall(*CLI.CB))
+      CLI.CB->hasFnAttr("cheri-may-free"))
     CallTF |= RISCVII::MO_CHERI_MAYFREE;
   bool CalleeIsLargeExternalSymbol = false;
   if (getTargetMachine().getCodeModel() == CodeModel::Large) {

@@ -265,10 +265,6 @@ LLVM_ABI bool cheriFreeZeroRegsEnabled();
 /// that takes a moved owner. All: the previous C1 rule, any call or return.
 enum class CheriDeadCapMode { Off, MayFree, All };
 LLVM_ABI CheriDeadCapMode cheriDeadCapMode();
-/// Same calls B1 treats as a free: a "mem.free" bundle, drop_in_place /
-/// drop_glue, a known dealloc, or any call whose pointer argument is a
-/// mem.move'd owner or the memcpy temporary copied from one.
-LLVM_ABI bool isCheriMayFreeCall(const CallBase &CB);
 } // namespace memannot
 } // namespace llvm
 #endif

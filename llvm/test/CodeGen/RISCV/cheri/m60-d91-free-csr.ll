@@ -87,3 +87,6 @@ define void @freed(ptr addrspace(200) %p) addrspace(200) {
 ; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p,
 ; IR: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %pinned,
 ; IR: call {{.*}}@later()
+; The may-free bit is a call-site attribute from the IR pass, not a
+; DominatorTree rebuilt in ISel. The attribute group is printed after the body.
+; IR: "cheri-may-free"
