@@ -591,21 +591,28 @@ struct Inv {
   }
   DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadAfter;
 
-  // Stored capability comes from Owner: the pointer itself, a field or
-  // element of it, a load from it (the heap buffer inside a Vec), or that
-  // value passed through black_box / empty asm.
-  bool derivedFrom(const Value *V, const Value *Owner) {
-    const Value *OU = getUnderlyingObject(Owner);
+  static bool isAlias(const Value *V, ArrayRef<const Value *> Aliases) {
+    if (!V)
+      return false;
+    for (const Value *A : Aliases)
+      if (V == A)
+        return true;
+    return false;
+  }
+  // Stored capability comes from one of Aliases: the pointer itself, a field
+  // or element, a load of it (Vec's heap buffer), or that value passed
+  // through black_box / empty asm. If the walk goes through such a load,
+  // *Heap is that load: its bounds are the freed allocation, not the Vec
+  // header that drop_glue receives.
+  bool derivedFrom(const Value *V, ArrayRef<const Value *> Aliases,
+                   const Value **Heap) {
     SmallVector<const Value *, 8> WL{V};
     SmallPtrSet<const Value *, 8> Seen;
     for (unsigned Steps = 0; Steps < 16 && !WL.empty(); ++Steps) {
       const Value *X = WL.pop_back_val();
       if (!X || !Seen.insert(X).second)
         continue;
-      if (X == Owner || X == OU)
-        return true;
-      const Value *U = getUnderlyingObject(X);
-      if (U == Owner || U == OU)
+      if (isAlias(X, Aliases) || isAlias(getUnderlyingObject(X), Aliases))
         return true;
       if (auto *GEP = dyn_cast<GEPOperator>(X)) {
         WL.push_back(GEP->getPointerOperand());
@@ -617,9 +624,11 @@ struct Inv {
       }
       if (auto *LI = dyn_cast<LoadInst>(X)) {
         const Value *P = LI->getPointerOperand();
-        const Value *PU = getUnderlyingObject(P);
-        if (P == Owner || PU == Owner || PU == OU)
+        if (isAlias(P, Aliases) || isAlias(getUnderlyingObject(P), Aliases)) {
+          if (Heap && !*Heap)
+            *Heap = LI;
           return true;
+        }
         continue;
       }
       if (auto *PHI = dyn_cast<PHINode>(X)) {
@@ -646,15 +655,64 @@ struct Inv {
     }
     return false;
   }
-  bool slotHoldsOwner(AllocaInst *A, int64_t Off, const Value *Owner) {
-    const Value *OU = getUnderlyingObject(Owner);
-    if (A == Owner || A == OU)
-      return true;
+  // drop(%tmp) after memcpy(%tmp, %src) + mem.move(%src): %tmp aliases %src,
+  // so a load of %src is a load of the dropped object. A whole-object copy
+  // before the drop aliases even without the fact. Chains stay short.
+  void ownerAliases(const Value *Owner, Instruction *Drop, DominatorTree &DT,
+                    SmallVectorImpl<const Value *> &Out) {
+    const Value *Root = getUnderlyingObject(Owner);
+    Out.push_back(Root);
+    SmallPtrSet<const Value *, 4> Seen;
+    Seen.insert(Root);
+    SmallVector<const Value *, 4> WL{Root};
+    Function *Fn = Drop->getFunction();
+    while (!WL.empty() && Out.size() < 4) {
+      const Value *Dest = WL.pop_back_val();
+      for (Instruction &I : instructions(*Fn)) {
+        auto *MT = dyn_cast<MemTransferInst>(&I);
+        if (!MT || !DT.dominates(MT, Drop))
+          continue;
+        if (getUnderlyingObject(MT->getRawDest()) != Dest)
+          continue;
+        const Value *Src = getUnderlyingObject(MT->getRawSource());
+        if (!Src || !Seen.insert(Src).second)
+          continue;
+        bool Moved = false;
+        for (Instruction &J : instructions(*Fn)) {
+          if (!memannot::isMemMoveFact(&J) || !DT.dominates(&J, Drop))
+            continue;
+          const Value *Slot = memannot::slotClobber(&J);
+          if (Slot && getUnderlyingObject(Slot) == Src)
+            Moved = true;
+        }
+        bool Whole = false;
+        if (auto *Len = dyn_cast<ConstantInt>(MT->getLength())) {
+          uint64_t N = Len->getZExtValue();
+          uint64_t Need = 0;
+          auto NeedOf = [&](const Value *Obj) {
+            if (auto *SA = dyn_cast<AllocaInst>(Obj))
+              if (auto Sz = SA->getAllocationSize(DL))
+                if (!Sz->isScalable())
+                  Need = std::max(Need, Sz->getFixedValue());
+          };
+          NeedOf(Src);
+          NeedOf(Dest);
+          Whole = Need && N >= Need && N >= 16;
+        }
+        if (!Moved && !Whole)
+          continue;
+        Out.push_back(Src);
+        WL.push_back(Src);
+      }
+    }
+  }
+  bool slotHoldsOwner(AllocaInst *A, int64_t Off, ArrayRef<const Value *> Aliases,
+                      const Value **Heap) {
     auto It = SlotStored.find({A, Off});
     if (It == SlotStored.end())
       return false;
     for (const Value *S : It->second)
-      if (derivedFrom(S, Owner))
+      if (derivedFrom(S, Aliases, Heap))
         return true;
     return false;
   }
@@ -2448,18 +2506,24 @@ struct Inv {
         Instruction *At = C->getNextNode();
         if (!At)
           continue;
-        bool NeedBounds = false;
-        SmallVector<std::pair<AllocaInst *, int64_t>, 8> Plain, Checked;
-        auto Consider = [&](AllocaInst *A, int64_t Off, const Value *Owner) {
-          if (!slotHoldsOwner(A, Off, Owner))
+        struct DeadHit {
+          AllocaInst *A;
+          int64_t Off;
+          const Value *Bounds;
+        };
+        SmallVector<DeadHit, 8> Plain, Checked;
+        auto Consider = [&](AllocaInst *A, int64_t Off,
+                            ArrayRef<const Value *> Aliases, const Value *Owner) {
+          const Value *Heap = nullptr;
+          if (!slotHoldsOwner(A, Off, Aliases, &Heap))
             return;
           if (!liveAt(A, C, DT) || readAfter(A, C, DT) || loanCovered(A, Off, C))
             return;
-          if (escapes(A)) {
-            Checked.push_back({A, Off});
-            NeedBounds = true;
-          } else
-            Plain.push_back({A, Off});
+          const Value *Bounds = Heap ? Heap : Owner;
+          if (escapes(A))
+            Checked.push_back({A, Off, Bounds});
+          else
+            Plain.push_back({A, Off, nullptr});
         };
         for (Value *Owner : C->args()) {
           if (!DL.isFatPointer(Owner->getType()))
@@ -2479,26 +2543,20 @@ struct Inv {
                 continue;
             }
           }
+          SmallVector<const Value *, 4> Aliases;
+          ownerAliases(Owner, C, DT, Aliases);
           Plain.clear();
           Checked.clear();
-          NeedBounds = false;
           for (auto &[A, Offs] : CapSlots)
             for (int64_t Off : Offs)
-              Consider(A, Off, Owner);
+              Consider(A, Off, Aliases, Owner);
           for (auto &[A, Offs] : WideByAlloca)
             for (int64_t Off : Offs)
-              Consider(A, Off, Owner);
-          Value *Lo = nullptr, *Len = nullptr;
-          if (NeedBounds) {
-            B.SetInsertPoint(C);
-            Lo = B.CreateCall(decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}),
-                              {Owner});
-            Len = B.CreateCall(decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}),
-                               {Owner});
-          }
+              Consider(A, Off, Aliases, Owner);
           B.SetInsertPoint(At);
-          for (auto [A, Off] : Plain) {
-            Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off) : A;
+          for (const DeadHit &H : Plain) {
+            Value *P = H.Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), H.A, H.Off)
+                             : H.A;
             markClear(B.CreateAlignedStore(
                           ConstantPointerNull::get(
                               PointerType::get(M.getContext(), 200)),
@@ -2506,8 +2564,20 @@ struct Inv {
                       "cheri_inv_free_dead");
             ++FreeDeadCallPlain;
           }
-          for (auto [A, Off] : Checked) {
-            checkAndClear(B, {A, Off}, Lo, Len, "cheri_inv_free");
+          DenseMap<const Value *, std::pair<Value *, Value *>> Bounds;
+          for (const DeadHit &H : Checked) {
+            auto &BL = Bounds[H.Bounds];
+            if (!BL.first) {
+              B.SetInsertPoint(C);
+              BL.first = B.CreateCall(
+                  decl(Intrinsic::cheri_cap_base_get, {B.getInt64Ty()}),
+                  {const_cast<Value *>(H.Bounds)});
+              BL.second = B.CreateCall(
+                  decl(Intrinsic::cheri_cap_length_get, {B.getInt64Ty()}),
+                  {const_cast<Value *>(H.Bounds)});
+              B.SetInsertPoint(At);
+            }
+            checkAndClear(B, {H.A, H.Off}, BL.first, BL.second, "cheri_inv_free");
             ++FreeDeadCallChecked;
           }
         }
