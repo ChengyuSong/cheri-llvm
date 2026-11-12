@@ -91,6 +91,17 @@ static cl::opt<WideToggle> WideSlotsOpt(
              "variable-index capability stores into a static alloca"),
     cl::values(clEnumValN(WideToggle::Off, "off", "fixed-offset stores only"),
                clEnumValN(WideToggle::On, "on", "widen (default)")));
+// [LLM-generated] M7.1c-2b. At a mem.free, null this function's live capability
+// slots that no path reads again. A non-escaping slot is a plain null. An
+// escaping one is a range check against the freed region. Off leaves the
+// free site as it was on 978c1f75.
+enum class FreeDeadToggle { Off, On };
+static cl::opt<FreeDeadToggle> FreeDeadOpt(
+    "cheri-invalidate-free-dead-slots", cl::init(FreeDeadToggle::On), cl::Hidden,
+    cl::desc("M7.1c-2b: at mem.free, clear live alloca capability slots that "
+             "are not read again"),
+    cl::values(clEnumValN(FreeDeadToggle::Off, "off", "do not clear"),
+               clEnumValN(FreeDeadToggle::On, "on", "clear (default)")));
 static cl::opt<unsigned> WideBytesOpt(
     "cheri-invalidate-wide-bytes", cl::init(512), cl::Hidden,
     cl::desc("M7.1c-2a: largest static alloca (bytes) widened into per-word "
@@ -234,6 +245,8 @@ struct Inv {
   // free-log, free-site and scope range checks, and loan bookkeeping ignore
   // them. A fixed-offset store stays in CapSlots and is not repeated here.
   unsigned WideAllocas = 0, WideSkippedLarge = 0, OwnNulledWide = 0;
+  // M7.1c-2b: plain nulls and range-checked clears of slots dead after a free.
+  unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
   MapVector<AllocaInst *, SmallVector<int64_t, 4>> WideByAlloca;
   struct LoanIntoScan {
     Instruction *At;
@@ -522,6 +535,46 @@ struct Inv {
     return R;
   }
   DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadLater;
+
+  // A real read of A's stored words reachable after At, including a load
+  // reached by a loop back edge. Escape alone is not a read: an address that
+  // was passed to an earlier call can still be dead from here on.
+  bool readAfter(AllocaInst *A, Instruction *At, DominatorTree &DT) {
+    auto It = ReadAfter.find({A, At});
+    if (It != ReadAfter.end())
+      return It->second;
+    bool R = false;
+    SmallVector<const Value *, 8> WL{A};
+    SmallPtrSet<const Value *, 16> Seen;
+    while (!WL.empty() && !R) {
+      const Value *V = WL.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (const User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I)
+          continue;
+        if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||
+            isa<SelectInst>(I)) {
+          WL.push_back(I);
+          continue;
+        }
+        if (isa<StoreInst>(I) || I->isLifetimeStartOrEnd() ||
+            isa<DbgInfoIntrinsic>(I))
+          continue;
+        if (auto *CB = dyn_cast<CallBase>(I))
+          if (InvAsmNoEscape && isEmptyAsm(CB))
+            continue;
+        if (I != At && isPotentiallyReachable(At, I, nullptr, &DT)) {
+          R = true;
+          break;
+        }
+      }
+    }
+    ReadAfter[{A, At}] = R;
+    return R;
+  }
+  DenseMap<std::pair<AllocaInst *, Instruction *>, bool> ReadAfter;
 
   // if (tag(c) && base(c) - Lo <u Len) slot = cleartag(c)
   void checkAndClear(IRBuilder<> &B, Slot S, Value *Lo, Value *Len,
@@ -2239,6 +2292,43 @@ struct Inv {
             if (mayHoldHeap({S, Off}) && !loanCovered(S, Off, C))
               checkAndClear(B, {S, Off}, Lo, Len, "cheri_inv_free");
         }
+        // Slots not read again. Non-escaping: plain null. Escaping fixed
+        // slots are already range-checked above (escape counts as a later
+        // read there). Escaping widened words are not in that set.
+        if (FreeDeadOpt == FreeDeadToggle::On) {
+          SmallPtrSet<AllocaInst *, 8> SeenA;
+          auto ClearDead = [&](AllocaInst *A, ArrayRef<int64_t> Offs,
+                               bool WideOnly) {
+            if (!SeenA.insert(A).second && !WideOnly)
+              return;
+            if (!liveAt(A, C, DT) || readAfter(A, C, DT))
+              return;
+            bool Esc = escapes(A);
+            for (int64_t Off : Offs) {
+              if (loanCovered(A, Off, C))
+                continue;
+              if (Esc) {
+                if (!WideOnly)
+                  continue;
+                checkAndClear(B, {A, Off}, Lo, Len, "cheri_inv_free");
+                ++FreeDeadChecked;
+              } else {
+                Value *P = Off ? B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), A, Off)
+                               : A;
+                markClear(B.CreateAlignedStore(
+                              ConstantPointerNull::get(
+                                  PointerType::get(M.getContext(), 200)),
+                              P, Align(16), InvVolatile),
+                          "cheri_inv_free_dead");
+                ++FreeDeadPlain;
+              }
+            }
+          };
+          for (auto &[A, Offs] : CapSlots)
+            ClearDead(A, Offs, false);
+          for (auto &[A, Offs] : WideByAlloca)
+            ClearDead(A, Offs, true);
+        }
         clearFreedReg(C, At);
       }
     else if (RegFree)
@@ -2298,6 +2388,8 @@ struct Inv {
          << " wide_allocas=" << WideAllocas
          << " wide_skipped_large=" << WideSkippedLarge
          << " own_nulled_wide=" << OwnNulledWide
+         << " free_dead_plain=" << FreeDeadPlain
+         << " free_dead_checked=" << FreeDeadChecked
          << "\n";
     }
   }
