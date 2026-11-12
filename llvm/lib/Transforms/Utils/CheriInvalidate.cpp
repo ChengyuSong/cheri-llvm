@@ -80,6 +80,21 @@ static void markClear(Instruction *I, StringRef Sec) {
 }
 // [LLM-generated] R10 (D73): scope mode without the own-slot nulls (the
 // range checks of other slots into the dying object stay: u2).
+// [LLM-generated] M7.1c-2a. A static alloca filled by memcpy/memmove, or
+// written by a capability store at a variable index, has no constant-offset
+// slot, so own-null at lifetime.end never sees it. Widen it to every aligned
+// word, up to a byte cap. Off is the pre-A1 slot set.
+enum class WideToggle { Off, On };
+static cl::opt<WideToggle> WideSlotsOpt(
+    "cheri-invalidate-wide-slots", cl::init(WideToggle::On), cl::Hidden,
+    cl::desc("M7.1c-2a: capability slots for memcpy/memmove destinations and "
+             "variable-index capability stores into a static alloca"),
+    cl::values(clEnumValN(WideToggle::Off, "off", "fixed-offset stores only"),
+               clEnumValN(WideToggle::On, "on", "widen (default)")));
+static cl::opt<unsigned> WideBytesOpt(
+    "cheri-invalidate-wide-bytes", cl::init(512), cl::Hidden,
+    cl::desc("M7.1c-2a: largest static alloca (bytes) widened into per-word "
+             "nulls. 512 is 32 words. Larger allocas are skipped."));
 static cl::opt<bool> InvOwnNull(
     "cheri-invalidate-own-null", cl::init(true), cl::Hidden,
     cl::desc("M5r R10 (D73): at a lifetime.end, null the dying object's own "
@@ -215,6 +230,10 @@ struct Inv {
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
+  // M7.1c-2a: allocas widened to whole-object words, words skipped because
+  // the alloca exceeds the byte cap, and own-null stores of widened words.
+  unsigned WideAllocas = 0, WideSkippedLarge = 0, OwnNulledWide = 0;
+  DenseSet<std::pair<AllocaInst *, int64_t>> WideOffs;
   struct LoanIntoScan {
     Instruction *At;
     Value *Slot; // slot address, or the buffer cap when Direct
@@ -299,8 +318,67 @@ struct Inv {
   }
 
   // Frame capability slots: (alloca, constant offset) written by a
-  // capability-typed store.
+  // capability-typed store. With wide slots on, also every aligned word of a
+  // static alloca that is a memcpy/memmove destination or the target of a
+  // capability store at a variable index.
+  void addWide(AllocaInst *A, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    if (!A->isStaticAlloca())
+      return;
+    std::optional<TypeSize> Sz = A->getAllocationSize(DL);
+    if (!Sz || Sz->isScalable())
+      return;
+    uint64_t N = Sz->getFixedValue();
+    if (A->getAlign().value() < 16 || N < 16)
+      return;
+    if (N > WideBytesOpt) {
+      ++WideSkippedLarge;
+      return;
+    }
+    bool Added = false;
+    auto &V = Out[A];
+    for (uint64_t Off = 0; Off + 16 <= N; Off += 16) {
+      if (!is_contained(V, (int64_t)Off)) {
+        V.push_back((int64_t)Off);
+        Added = true;
+      }
+      // No constant store named this word's origin. Range checks stay
+      // conservative: an unknown provenance may point at a heap object, and
+      // at a frame object only when that object escapes.
+      Prov &Pv = SlotProv[{A, (int64_t)Off}];
+      if (Pv.Objs.empty())
+        Pv.Unknown = true;
+      WideOffs.insert({A, (int64_t)Off});
+    }
+    if (Added)
+      ++WideAllocas;
+  }
+  void collectWide(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    if (WideSlotsOpt != WideToggle::On)
+      return;
+    SmallPtrSet<AllocaInst *, 8> Seen;
+    auto Consider = [&](AllocaInst *A) {
+      if (Seen.insert(A).second)
+        addWide(A, Out);
+    };
+    for (Instruction &I : instructions(F)) {
+      if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+        if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(MT->getDest())))
+          Consider(A);
+        continue;
+      }
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
+        continue;
+      int64_t Off = 0;
+      Value *Base = GetPointerBaseWithConstantOffset(SI->getPointerOperand(), Off, DL);
+      if (isa<AllocaInst>(Base) && Off >= 0 && (Off % 16) == 0)
+        continue;
+      if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand())))
+        Consider(A);
+    }
+  }
   void collectSlots(Function &F, MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    WideOffs.clear();
     for (Instruction &I : instructions(F)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !DL.isFatPointer(SI->getValueOperand()->getType()))
@@ -323,6 +401,7 @@ struct Inv {
           Pv.Unknown = true;
       }
     }
+    collectWide(F, Out);
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
   }
@@ -2087,6 +2166,8 @@ struct Inv {
                     ConstantPointerNull::get(PointerType::get(M.getContext(), 200)), P,
                     Align(16), InvVolatile), "cheri_inv_own");
                 ++OwnNulled;
+                if (WideOffs.count({A, Off}))
+                  ++OwnNulledWide;
               }
             Value *Lo = nullptr;
             for (auto &[S, Offs] : CapSlots) {
@@ -2202,6 +2283,9 @@ struct Inv {
          << " loan_into_val_facts=" << LoanIntoValFacts
          << " loan_into_skipped_val_freed=" << LoanIntoSkippedValFreed
          << " loan_into_skipped_val_reassigned=" << LoanIntoSkippedValReassigned
+         << " wide_allocas=" << WideAllocas
+         << " wide_skipped_large=" << WideSkippedLarge
+         << " own_nulled_wide=" << OwnNulledWide
          << "\n";
     }
   }
