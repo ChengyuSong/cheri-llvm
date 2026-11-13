@@ -161,15 +161,34 @@ define void @copy_local(ptr addrspace(200) %buf) {
 ; FLAGOFF: call {{.*}}@eat_box(
 ; FLAGOFF: ret void
 
+; A facted sibling cap (the still-live dummy) must not be treated as the
+; consumed box just because both may come from the same allocator.
+define void @sibling_consume(ptr addrspace(200) %buf, ptr addrspace(200) %dummy) {
+  %hold = alloca [2 x ptr addrspace(200)], align 16, addrspace(200)
+  %raw = getelementptr inbounds [2 x ptr addrspace(200)], ptr addrspace(200) %hold, i64 0, i64 0
+  %sib = getelementptr inbounds [2 x ptr addrspace(200)], ptr addrspace(200) %hold, i64 0, i64 1
+  store ptr addrspace(200) %dummy, ptr addrspace(200) %sib, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %sib, ptr addrspace(200) %dummy) ]
+  store ptr addrspace(200) %buf, ptr addrspace(200) %raw, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %raw, ptr addrspace(200) %buf) ]
+  call void @eat_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  ret void
+}
+; CHECK-LABEL: define void @sibling_consume(
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %raw, align 16
+; CHECK-NOT: store volatile ptr addrspace(200) null, ptr addrspace(200) %sib
+; CHECK: call {{.*}}@eat_box(
+; CHECK: ret void
+
 define void @none_end() {
   ret void
 }
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; STATS: store_into_facts=7
-; STATS-SAME: store_into_nulls=4
+; STATS: store_into_facts=9
+; STATS-SAME: store_into_nulls=5
 ; STATS-SAME: store_into_skipped_unready=2
 ; STATS-SAME: store_into_skipped_reassigned=1
-; STATS-OFF: store_into_facts=7
+; STATS-OFF: store_into_facts=9
 ; STATS-OFF-SAME: store_into_nulls=0

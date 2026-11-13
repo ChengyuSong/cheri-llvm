@@ -2310,35 +2310,26 @@ struct Inv {
     if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
       return true;
     SmallPtrSet<const Value *, 8> FromCap, FromFree;
-    auto PeelCap = [](Value *V) -> Value * {
-      // mem.claim is lowered to cheri.cap.bounds.set before this walk.
-      while (V) {
-        V = V->stripPointerCasts();
-        auto *C = dyn_cast<CallBase>(V);
-        if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
-          break;
-        if (memannot::isMemClaim(C)) {
-          V = C->getArgOperand(0);
-          continue;
-        }
-        Function *Fn = C->getCalledFunction();
-        if (!Fn || !Fn->isIntrinsic())
-          break;
-        StringRef N = Fn->getName();
-        if (N.starts_with("llvm.mem.claim") ||
-            N.starts_with("llvm.cheri.cap.bounds.set") ||
-            N.starts_with("llvm.cheri.cap.address.set") ||
-            N.starts_with("llvm.cheri.cap.perms.and"))
-          V = C->getArgOperand(0);
-        else
-          break;
-      }
+    auto OnePeelRepresent = [](Value *V) -> Value * {
+      if (!V)
+        return V;
+      V = V->stripPointerCasts();
+      auto *C = dyn_cast<CallBase>(V);
+      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+        return V;
+      Function *Fn = C->getCalledFunction();
+      StringRef N = Fn ? Fn->getName() : StringRef();
+      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+          N.starts_with("llvm.cheri.cap.bounds.set") ||
+          N.starts_with("llvm.cheri.cap.address.set") ||
+          N.starts_with("llvm.cheri.cap.perms.and"))
+        return C->getArgOperand(0)->stripPointerCasts();
       return V;
     };
     auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
       SmallVector<Value *, 8> Work{Start};
       while (!Work.empty()) {
-        Value *X = PeelCap(Work.pop_back_val());
+        Value *X = Work.pop_back_val()->stripPointerCasts();
         if (!X || !Out.insert(X).second)
           continue;
         if (auto *G = dyn_cast<GetElementPtrInst>(X))
@@ -2346,11 +2337,14 @@ struct Inv {
         else if (auto *LI = dyn_cast<LoadInst>(X)) {
           Work.push_back(LI->getPointerOperand());
           // Store-to-load: a ptr::read dest holds a copy of a cap stored
-          // to the same slot. Peel claims so vec GEP + mem.claim match.
+          // to the same slot. Peel one represent layer (claim/bounds.set)
+          // of the stored value so claim(%b) still refers to %b, but do
+          // not walk the box's own allocating claim down to the arena
+          // (that would alias every bump-allocated sibling).
           if (Function *Fn = LI->getFunction()) {
             int64_t LOff = 0;
             Value *LBase = GetPointerBaseWithConstantOffset(
-                PeelCap(LI->getPointerOperand()), LOff, DL);
+                LI->getPointerOperand()->stripPointerCasts(), LOff, DL);
             if (LBase) {
               for (Instruction &I : instructions(*Fn)) {
                 auto *SI = dyn_cast<StoreInst>(&I);
@@ -2358,9 +2352,12 @@ struct Inv {
                   continue;
                 int64_t SOff = 0;
                 Value *SBase = GetPointerBaseWithConstantOffset(
-                    PeelCap(SI->getPointerOperand()), SOff, DL);
-                if (SBase && SBase == LBase && SOff == LOff)
-                  Work.push_back(SI->getValueOperand());
+                    SI->getPointerOperand()->stripPointerCasts(), SOff, DL);
+                if (SBase && SBase == LBase && SOff == LOff) {
+                  Value *SV = SI->getValueOperand();
+                  Work.push_back(SV);
+                  Work.push_back(OnePeelRepresent(SV));
+                }
               }
             }
           }
@@ -2373,7 +2370,7 @@ struct Inv {
         }
       }
     };
-    Collect(Cap, FromCap);
+        Collect(Cap, FromCap);
     Collect(FreeBuf, FromFree);
     for (const Value *X : FromCap)
       if (FromFree.contains(X))
@@ -2415,9 +2412,32 @@ struct Inv {
         break;
       }
     }
+    // A ptr::write dest is often mem.claim / bounds.set of a GEP of the
+    // local. Peel those represent layers, but the base must still be an
+    // alloca (not a heap cell or a static).
+    Value *P = Dest;
+    for (int I = 0; I < 2 && P; ++I) {
+      AllocaInst *Slot = nullptr;
+      int64_t Off = 0;
+      if (frameSlot(P, Slot, Off))
+        return true;
+      P = P->stripPointerCasts();
+      auto *C = dyn_cast<CallBase>(P);
+      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+        break;
+      Function *Fn = C->getCalledFunction();
+      StringRef N = Fn ? Fn->getName() : StringRef();
+      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+          N.starts_with("llvm.cheri.cap.bounds.set") ||
+          N.starts_with("llvm.cheri.cap.address.set") ||
+          N.starts_with("llvm.cheri.cap.perms.and"))
+        P = C->getArgOperand(0);
+      else
+        break;
+    }
     AllocaInst *Slot = nullptr;
     int64_t Off = 0;
-    return frameSlot(Dest, Slot, Off);
+    return P && frameSlot(P, Slot, Off);
   }
 
   bool destReassignedBetween(Value *Dest, Instruction *From, Instruction *To,
