@@ -24,6 +24,10 @@
 //     the buffer is still live (clear/forget of a live Vec, or finish_grow).
 //     The scan uses the still-named carrier, or the buffer capability, and
 //     is off with -cheri-invalidate-loan-into-moved-live=false.
+//   * M7.1d B1: a loan_into the pass would skip as skipped_freed (or
+//     skipped_val_freed) instead scans the still-live buffer through the
+//     ready dealloc capability immediately before mem.free, when the loan
+//     is a capability. Off with -cheri-invalidate-loan-into-freed-wipe=false.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -174,6 +178,11 @@ static cl::opt<bool> InvLoanIntoMovedLive(
     cl::desc("M7.1d A: do not skip a mem.loan_into scan after mem.move when "
              "the moved owner's buffer is still live (default on; false is "
              "byte-identical to the pre-1d-A pass)"));
+static cl::opt<bool> InvLoanIntoFreedWipe(
+    "cheri-invalidate-loan-into-freed-wipe", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d B1: wipe capability slots of a buffer a mem.loan_into "
+             "would skip as freed, through the ready dealloc cap before "
+             "mem.free (default on; false is byte-identical to 94303ea2)"));
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -257,6 +266,7 @@ struct Inv {
   unsigned LoanIntoFacts = 0, LoanIntoScans = 0, LoanIntoNulls = 0;
   unsigned LoanIntoSkippedFreed = 0, LoanIntoSkippedMoved = 0;
   unsigned LoanIntoMovedLive = 0;
+  unsigned LoanIntoFreedWipe = 0;
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
@@ -1882,6 +1892,54 @@ struct Inv {
     return true;
   }
 
+  // Dealloc cap of a mem.free of this slot's buffer between Fact and At.
+  CallBase *freeOfSlotBetween(AllocaInst *A, int64_t Off, Instruction *Fact,
+                              Instruction *At, ArrayRef<CallBase *> Frees,
+                              DominatorTree &DT) const {
+    CallBase *Found = nullptr;
+    for (CallBase *Fr : Frees)
+      if (dominatesBetween(Fact, Fr, At, DT) &&
+          freesThisBuffer(Fr, A, Off, At, DT))
+        Found = Fr;
+    return Found;
+  }
+  CallBase *freeOfCapBetween(Value *Buf, Instruction *Fact, Instruction *At,
+                             ArrayRef<CallBase *> Frees,
+                             DominatorTree &DT) const {
+    if (!Buf)
+      return nullptr;
+    CallBase *Found = nullptr;
+    for (CallBase *Fr : Frees) {
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      if (mayRunBetween(Fact, Fr, At, DT) &&
+          mayBeThisBuffer(FB->Inputs[0], Buf))
+        Found = Fr;
+    }
+    return Found;
+  }
+  // Ready dealloc cap to scan before Fr. Only capability loans, and only
+  // when both the loan and the dealloc cap dominate the free.
+  bool loanIntoFreedWipeTarget(Value *Loan, CallBase *Fr, DominatorTree &DT,
+                               Value *&OutBuf) const {
+    if (!InvLoanIntoFreedWipe || !Fr)
+      return false;
+    if (!Loan || !DL.isFatPointer(Loan->getType()))
+      return false;
+    auto FB = Fr->getOperandBundle(memannot::TagFree);
+    if (!FB || FB->Inputs.empty())
+      return false;
+    Value *Buf = FB->Inputs[0];
+    if (!Buf || !Buf->getType()->isPointerTy() ||
+        !DL.isFatPointer(Buf->getType()))
+      return false;
+    if (!loanValAvailable(Loan, Fr, DT) || !loanValAvailable(Buf, Fr, DT))
+      return false;
+    OutBuf = Buf;
+    return true;
+  }
+
   void loanIntoPlan(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     SmallVector<Instruction *, 8> Carriers;
@@ -1963,11 +2021,20 @@ struct Inv {
             PendingLoanInto.push_back({At, Tgt, Loan, Direct});
             continue;
           }
-          if (capFreedBetween(lastCapFromSlot(A, Off, At, DT), Fact, At, Frees,
-                              DT))
-            ++LoanIntoSkippedFreed;
-          else
-            ++LoanIntoSkippedMoved;
+          {
+            Value *WBuf = nullptr;
+            CallBase *Fr = freeOfCapBetween(lastCapFromSlot(A, Off, At, DT),
+                                            Fact, At, Frees, DT);
+            if (!Fr)
+              Fr = freeOfSlotBetween(A, Off, Fact, At, Frees, DT);
+            if (Fr && loanIntoFreedWipeTarget(Loan, Fr, DT, WBuf)) {
+              ++LoanIntoFreedWipe;
+              PendingLoanInto.push_back({Fr, WBuf, Loan, true});
+            } else if (Fr)
+              ++LoanIntoSkippedFreed;
+            else
+              ++LoanIntoSkippedMoved;
+          }
           continue;
         }
         bool Freed = false;
@@ -1976,7 +2043,13 @@ struct Inv {
               freesThisBuffer(Fr, A, Off, At, DT))
             Freed = true;
         if (Freed) {
-          ++LoanIntoSkippedFreed;
+          Value *WBuf = nullptr;
+          CallBase *Fr = freeOfSlotBetween(A, Off, Fact, At, Frees, DT);
+          if (Fr && loanIntoFreedWipeTarget(Loan, Fr, DT, WBuf)) {
+            ++LoanIntoFreedWipe;
+            PendingLoanInto.push_back({Fr, WBuf, Loan, true});
+          } else
+            ++LoanIntoSkippedFreed;
           continue;
         }
         if (!loanValAvailable(Loan, At, DT)) {
@@ -2132,7 +2205,13 @@ struct Inv {
             Freed = true;
         }
         if (Freed) {
-          ++LoanIntoSkippedValFreed;
+          Value *WBuf = nullptr;
+          CallBase *Fr = freeOfCapBetween(Buf, Fact, At, Frees, DT);
+          if (Fr && loanIntoFreedWipeTarget(Loan, Fr, DT, WBuf)) {
+            ++LoanIntoFreedWipe;
+            PendingLoanInto.push_back({Fr, WBuf, Loan, true});
+          } else
+            ++LoanIntoSkippedValFreed;
           continue;
         }
         PendingLoanInto.push_back({At, Buf, Loan, true});
@@ -2966,6 +3045,7 @@ struct Inv {
          << " loan_into_skipped_freed=" << LoanIntoSkippedFreed
          << " loan_into_skipped_moved=" << LoanIntoSkippedMoved
          << " loan_into_moved_live=" << LoanIntoMovedLive
+         << " loan_into_freed_wipe=" << LoanIntoFreedWipe
          << " loan_into_skipped_promoted=" << LoanIntoSkippedPromoted
          << " loan_into_skipped_noval=" << LoanIntoSkippedNoval
          << " loan_into_val_facts=" << LoanIntoValFacts

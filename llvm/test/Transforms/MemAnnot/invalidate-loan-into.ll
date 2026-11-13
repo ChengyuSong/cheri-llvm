@@ -6,7 +6,9 @@
 ; the function. No fact, a freed buffer, a dead slot, or a missing loan value
 ; produces no scan. M7.1d A: a mem.move of the owner no longer suppresses the
 ; scan when the buffer is still live; -cheri-invalidate-loan-into-moved-live=false
-; restores the old skip.
+; restores the old skip. M7.1d B1: a loan_into that would be skipped_freed is
+; instead scanned through the ready dealloc cap immediately before mem.free;
+; -cheri-invalidate-loan-into-freed-wipe=false restores the old skip.
 ;
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONE
@@ -14,6 +16,8 @@
 ; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-into-moved-live=false < %s | FileCheck %s --check-prefix=MOVEDOFF
 ; RUN: rm -f %t.stats-off && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-into-moved-live=false -cheri-invalidate-stats-out=%t.stats-off < %s && FileCheck %s --check-prefix=STATS-OFF < %t.stats-off
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-into-freed-wipe=false < %s | FileCheck %s --check-prefix=FREEDOFF
+; RUN: rm -f %t.stats-fwipe-off && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-into-freed-wipe=false -cheri-invalidate-stats-out=%t.stats-fwipe-off < %s && FileCheck %s --check-prefix=STATS-FREEDOFF < %t.stats-fwipe-off
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
 declare void @use(ptr addrspace(200))
@@ -94,9 +98,19 @@ define void @skip_free(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   call void @use(ptr addrspace(200) %loan), !mem.last_use !1
   ret void
 }
+; The buffer is freed before last use. M7.1d B1 scans it through the ready
+; dealloc cap (%p) immediately before the free, not after last use.
 ; CHECK-LABEL: define void @skip_free(
+; CHECK: load ptr addrspace(200), ptr addrspace(200) %s, align 16
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(
+; CHECK: call {{.*}}@use(ptr addrspace(200) %loan)
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
 ; CHECK: ret void
+; FREEDOFF-LABEL: define void @skip_free(
+; FREEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; FREEDOFF: ret void
 
 define void @skip_life(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   %s = alloca ptr addrspace(200), align 16, addrspace(200)
@@ -224,8 +238,8 @@ define void @moved_live_forget(ptr addrspace(200) %buf, ptr addrspace(200) %loan
 ; MOVEDOFF: ret void
 
 
-; mem.move then mem.free of the buffer. The leftover is in a freed object
-; (the as_ptr-then-drop shape). M7.1d A must still skip; that is slice B.
+; mem.move then mem.free of the buffer (the as_ptr-then-drop shape). M7.1d B1
+; scans through the ready dealloc cap (%buf) immediately before the free.
 define void @moved_then_freed(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   %s = alloca ptr addrspace(200), align 16, addrspace(200)
   store ptr addrspace(200) %buf, ptr addrspace(200) %s, align 16
@@ -236,11 +250,36 @@ define void @moved_then_freed(ptr addrspace(200) %buf, ptr addrspace(200) %loan)
   ret void
 }
 ; CHECK-LABEL: define void @moved_then_freed(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK: call {{.*}}@use(ptr addrspace(200) %loan)
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
 ; CHECK: ret void
 ; MOVEDOFF-LABEL: define void @moved_then_freed(
 ; MOVEDOFF-NOT: @llvm.cheri.cap.equal.exact
 ; MOVEDOFF: ret void
+; FREEDOFF-LABEL: define void @moved_then_freed(
+; FREEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; FREEDOFF: ret void
+
+; Promoted loan_into.val, then mem.free of that buffer. Same B1 wipe.
+define void @skip_free_val(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
+  call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr addrspace(200) %buf, ptr addrspace(200) %loan, i64 9) ]
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  call void @use(ptr addrspace(200) %loan), !mem.last_use !9
+  ret void
+}
+; CHECK-LABEL: define void @skip_free_val(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK: call {{.*}}@use(ptr addrspace(200) %loan)
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: ret void
+; FREEDOFF-LABEL: define void @skip_free_val(
+; FREEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; FREEDOFF: ret void
 
 declare void @llvm.memcpy.p200.p200.i64(ptr addrspace(200), ptr addrspace(200), i64, i1)
 
@@ -252,22 +291,43 @@ define void @none_end() {
 ; NONE: define void @none_end(
 
 ; STATS: loan_into_facts=12
-; STATS-SAME: loan_into_scans=7
-; STATS-SAME: loan_into_nulls=7
-; STATS-SAME: loan_into_skipped_freed=2
+; STATS-SAME: loan_into_scans=10
+; STATS-SAME: loan_into_nulls=10
+; STATS-SAME: loan_into_skipped_freed=0
 ; STATS-SAME: loan_into_skipped_moved=1
 ; STATS-SAME: loan_into_moved_live=3
+; STATS-SAME: loan_into_freed_wipe=3
 ; STATS-SAME: loan_into_skipped_promoted=0
 ; STATS-SAME: loan_into_skipped_noval=1
+; STATS-SAME: loan_into_val_facts=1
+; STATS-SAME: loan_into_skipped_val_freed=0
 
+; STATS-OFF (moved-live=false, freed-wipe default on): skip_free and
+; skip_free_val still wipe; moved_then_freed stays skipped_moved.
 ; STATS-OFF: loan_into_facts=12
-; STATS-OFF-SAME: loan_into_scans=4
-; STATS-OFF-SAME: loan_into_nulls=4
-; STATS-OFF-SAME: loan_into_skipped_freed=1
+; STATS-OFF-SAME: loan_into_scans=6
+; STATS-OFF-SAME: loan_into_nulls=6
+; STATS-OFF-SAME: loan_into_skipped_freed=0
 ; STATS-OFF-SAME: loan_into_skipped_moved=5
 ; STATS-OFF-SAME: loan_into_moved_live=0
+; STATS-OFF-SAME: loan_into_freed_wipe=2
 ; STATS-OFF-SAME: loan_into_skipped_promoted=0
 ; STATS-OFF-SAME: loan_into_skipped_noval=1
+; STATS-OFF-SAME: loan_into_val_facts=1
+; STATS-OFF-SAME: loan_into_skipped_val_freed=0
+
+; STATS-FREEDOFF is the 94303ea2 / flag-off identity (moved-live default on).
+; STATS-FREEDOFF: loan_into_facts=12
+; STATS-FREEDOFF-SAME: loan_into_scans=7
+; STATS-FREEDOFF-SAME: loan_into_nulls=7
+; STATS-FREEDOFF-SAME: loan_into_skipped_freed=2
+; STATS-FREEDOFF-SAME: loan_into_skipped_moved=1
+; STATS-FREEDOFF-SAME: loan_into_moved_live=3
+; STATS-FREEDOFF-SAME: loan_into_freed_wipe=0
+; STATS-FREEDOFF-SAME: loan_into_skipped_promoted=0
+; STATS-FREEDOFF-SAME: loan_into_skipped_noval=1
+; STATS-FREEDOFF-SAME: loan_into_val_facts=1
+; STATS-FREEDOFF-SAME: loan_into_skipped_val_freed=1
 
 !1 = !{i64 1}
 !2 = !{i64 2}
@@ -277,3 +337,4 @@ define void @none_end() {
 !6 = !{i64 6}
 !7 = !{i64 7}
 !8 = !{i64 8}
+!9 = !{i64 9}

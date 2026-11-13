@@ -1,13 +1,16 @@
 ; [LLM-generated] M7.1b. After the owner slot is promoted, the fact is
 ;   call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr %buf, ptr %loan, i64 id) ]
 ; The scan uses %buf itself: tag and non-null, address set to base, then
-; length>>4 steps of cap.equal.exact. A mem.free of %buf (or a pointer derived
-; from it) before the last use skips the scan. A call that takes %buf and
-; returns a new pointer is a grow/realloc; that pointer is not provably the
-; same allocation, so the scan is skipped. The slot form is unchanged.
+; length>>4 steps of cap.equal.exact. M7.1d B1: a mem.free of %buf (or a
+; pointer derived from it) before the last use scans through the ready
+; dealloc cap immediately before the free, instead of skipping as
+; skipped_val_freed. A call that takes %buf and returns a new pointer is a
+; grow/realloc; that pointer is not provably the same allocation, so the
+; scan is skipped. The slot form is unchanged.
 ;
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s
 ; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-loan-into-freed-wipe=false < %s | FileCheck %s --check-prefix=FREEDOFF
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
 declare void @use(ptr addrspace(200))
@@ -37,8 +40,15 @@ define void @val_free(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   ret void
 }
 ; CHECK-LABEL: define void @val_free(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK: call {{.*}}@use(ptr addrspace(200) %loan)
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
 ; CHECK: ret void
+; FREEDOFF-LABEL: define void @val_free(
+; FREEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; FREEDOFF: ret void
 
 define void @val_free_derived(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr addrspace(200) %buf, ptr addrspace(200) %loan, i64 2) ]
@@ -48,8 +58,15 @@ define void @val_free_derived(ptr addrspace(200) %buf, ptr addrspace(200) %loan)
   ret void
 }
 ; CHECK-LABEL: define void @val_free_derived(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(ptr addrspace(200) %q)
+; CHECK: call {{.*}}@use(ptr addrspace(200) %loan)
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
 ; CHECK: ret void
+; FREEDOFF-LABEL: define void @val_free_derived(
+; FREEDOFF-NOT: @llvm.cheri.cap.equal.exact
+; FREEDOFF: ret void
 
 define void @val_reassign(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
   call void @llvm.mem.fact() [ "mem.loan_into.val"(ptr addrspace(200) %buf, ptr addrspace(200) %loan, i64 3) ]
@@ -63,10 +80,11 @@ define void @val_reassign(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
 ; CHECK: ret void
 
 ; STATS: loan_into_facts=0
-; STATS-SAME: loan_into_scans=1
-; STATS-SAME: loan_into_nulls=1
+; STATS-SAME: loan_into_scans=3
+; STATS-SAME: loan_into_nulls=3
+; STATS-SAME: loan_into_freed_wipe=2
 ; STATS-SAME: loan_into_val_facts=4
-; STATS-SAME: loan_into_skipped_val_freed=2
+; STATS-SAME: loan_into_skipped_val_freed=0
 ; STATS-SAME: loan_into_skipped_val_reassigned=1
 
 !1 = !{i64 1}
