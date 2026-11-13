@@ -2313,9 +2313,15 @@ struct Inv {
     auto PeelClaim = [](Value *V) -> Value * {
       while (V) {
         V = V->stripPointerCasts();
-        if (!memannot::isMemClaim(V))
+        auto *C = dyn_cast<CallBase>(V);
+        if (!C || !C->arg_size())
           break;
-        V = cast<CallBase>(V)->getArgOperand(0);
+        if (memannot::isMemClaim(C) ||
+            (C->getCalledFunction() &&
+             C->getCalledFunction()->getName().starts_with("llvm.mem.claim")))
+          V = C->getArgOperand(0);
+        else
+          break;
       }
       return V;
     };

@@ -123,7 +123,7 @@ define void @consume_box(ptr addrspace(200) %buf) {
 ; FLAGOFF: call {{.*}}@eat_box(
 ; FLAGOFF: ret void
 
-declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64)
+declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64 immarg)
 
 ; Heap dest (Box::new payload / Vec buffer): ready but not a named local.
 ; B2a must not wipe it, even at a consume of the referent.
