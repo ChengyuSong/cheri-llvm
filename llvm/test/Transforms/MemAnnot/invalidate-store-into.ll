@@ -188,7 +188,7 @@ define void @none_end() {
 
 ; STATS: store_into_facts=9
 ; STATS-SAME: store_into_nulls=5
-; STATS-SAME: store_into_skipped_unready=2
+; STATS-SAME: store_into_skipped_unready=3
 ; STATS-SAME: store_into_skipped_reassigned=1
 ; STATS-OFF: store_into_facts=9
 ; STATS-OFF-SAME: store_into_nulls=0

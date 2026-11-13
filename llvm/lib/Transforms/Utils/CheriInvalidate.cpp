@@ -2309,23 +2309,67 @@ struct Inv {
       return true;
     if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
       return true;
-    SmallPtrSet<const Value *, 8> FromCap, FromFree;
-    auto OnePeelRepresent = [](Value *V) -> Value * {
-      if (!V)
-        return V;
-      V = V->stripPointerCasts();
-      auto *C = dyn_cast<CallBase>(V);
-      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
-        return V;
-      Function *Fn = C->getCalledFunction();
-      StringRef N = Fn ? Fn->getName() : StringRef();
-      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
-          N.starts_with("llvm.cheri.cap.bounds.set") ||
-          N.starts_with("llvm.cheri.cap.address.set") ||
-          N.starts_with("llvm.cheri.cap.perms.and"))
-        return C->getArgOperand(0)->stripPointerCasts();
+    // Peel every represent layer (mem.claim wrapping a bounds.set already
+    // lowered from an inner claim). Applied only to a stored *copy*, never
+    // to the box cap itself, so we do not walk an allocating claim to the
+    // arena and alias bump-allocated siblings.
+    auto PeelRepresent = [](Value *V) -> Value * {
+      while (V) {
+        V = V->stripPointerCasts();
+        auto *C = dyn_cast<CallBase>(V);
+        if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+          break;
+        Function *Fn = C->getCalledFunction();
+        StringRef N = Fn ? Fn->getName() : StringRef();
+        if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+            N.starts_with("llvm.cheri.cap.bounds.set") ||
+            N.starts_with("llvm.cheri.cap.address.set") ||
+            N.starts_with("llvm.cheri.cap.perms.and"))
+          V = C->getArgOperand(0);
+        else
+          break;
+      }
       return V;
     };
+    auto SameSlot = [&](Value *A, Value *B) -> bool {
+      if (!A || !B)
+        return false;
+      A = A->stripPointerCasts();
+      B = B->stripPointerCasts();
+      if (A == B)
+        return true;
+      // Peel a represent claim on the *address* (claim of a GEP / alloca),
+      // not on the stored cap.
+      Value *PA = PeelRepresent(A);
+      Value *PB = PeelRepresent(B);
+      if (PA == PB)
+        return true;
+      int64_t OA = 0, OB = 0;
+      Value *BA = GetPointerBaseWithConstantOffset(PA, OA, DL);
+      Value *BB = GetPointerBaseWithConstantOffset(PB, OB, DL);
+      return BA && BB && BA == BB && OA == OB;
+    };
+// ptr::read dest: Cap is a load of a slot that stored this referent
+    // (or a claim/bounds.set of it). Do not walk the box's allocating
+    // claim down to the arena.
+    if (auto *LI = dyn_cast<LoadInst>(Cap)) {
+      if (Function *Fn = LI->getFunction()) {
+        for (Instruction &I : instructions(*Fn)) {
+          auto *SI = dyn_cast<StoreInst>(&I);
+          if (!SI || !SameSlot(SI->getPointerOperand(), LI->getPointerOperand()))
+            continue;
+          Value *SV = SI->getValueOperand();
+          Value *Peeled = PeelRepresent(SV);
+          if (SV == FreeBuf || Peeled == FreeBuf)
+            return true;
+          if (mayBeThisBuffer(Peeled, FreeBuf) || mayBeThisBuffer(FreeBuf, Peeled))
+            return true;
+          if (mayBeThisBuffer(SV, FreeBuf) || mayBeThisBuffer(FreeBuf, SV))
+            return true;
+        }
+      }
+    }
+    SmallPtrSet<const Value *, 8> FromCap, FromFree;
     auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
       SmallVector<Value *, 8> Work{Start};
       while (!Work.empty()) {
@@ -2356,7 +2400,7 @@ struct Inv {
                 if (SBase && SBase == LBase && SOff == LOff) {
                   Value *SV = SI->getValueOperand();
                   Work.push_back(SV);
-                  Work.push_back(OnePeelRepresent(SV));
+                  Work.push_back(PeelRepresent(SV));
                 }
               }
             }
