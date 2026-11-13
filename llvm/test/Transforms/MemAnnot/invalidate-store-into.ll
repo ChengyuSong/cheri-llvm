@@ -1,0 +1,114 @@
+; [LLM-generated] M7.1d B2a. A capability stored into a nameable local dest
+; is a caller-side fact:
+;   call void @llvm.mem.fact() [ "mem.store_into"(ptr dest, ptr cap) ]
+; At the source mem.free, if dest is still a ready fat pointer and still
+; holds that cap (exact-equal), the late pass stores null through dest
+; immediately before the free. No buffer scan, no sibling write, no ra/sp
+; clear, no narrowing at the store. Reassigned or unready dests are skipped.
+; -cheri-invalidate-store-into=false emits no wipe (byte-identical policy
+; to 0c127e28 when rustc also emits no fact).
+;
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan < %s | FileCheck %s
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONE
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-store-into=false < %s | FileCheck %s --check-prefix=FLAGOFF
+; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
+; RUN: rm -f %t.stats-off && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan -cheri-invalidate-store-into=false -cheri-invalidate-stats-out=%t.stats-off < %s && FileCheck %s --check-prefix=STATS-OFF < %t.stats-off
+target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+
+declare void @use(ptr addrspace(200))
+declare void @free(ptr addrspace(200))
+declare void @llvm.mem.fact()
+
+; Dest is a named local slot. The cap is the freed buffer itself. The wipe
+; is a single-slot exact-equal store immediately before mem.free.
+define void @basic(ptr addrspace(200) %buf) {
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %buf) ]
+  call void @use(ptr addrspace(200) %dest)
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  ret void
+}
+; CHECK-LABEL: define void @basic(
+; CHECK: call {{.*}}@use(ptr addrspace(200) %dest)
+; CHECK: load ptr addrspace(200), ptr addrspace(200) %dest, align 16
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %dest, align 16
+; CHECK-NOT: @llvm.cheri.cap.base.get
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK: ret void
+; FLAGOFF-LABEL: define void @basic(
+; FLAGOFF-NOT: @llvm.cheri.cap.equal.exact
+; FLAGOFF: call {{.*}}@free(ptr addrspace(200) %buf)
+; FLAGOFF-NOT: store volatile ptr addrspace(200) null
+; FLAGOFF: ret void
+
+; Only the facted field is written. The sibling slot is not stored.
+define void @sibling(ptr addrspace(200) %buf, ptr addrspace(200) %live) {
+  %hold = alloca [2 x ptr addrspace(200)], align 16, addrspace(200)
+  %raw = getelementptr inbounds [2 x ptr addrspace(200)], ptr addrspace(200) %hold, i64 0, i64 0
+  %sib = getelementptr inbounds [2 x ptr addrspace(200)], ptr addrspace(200) %hold, i64 0, i64 1
+  store ptr addrspace(200) %live, ptr addrspace(200) %sib, align 16
+  store ptr addrspace(200) %buf, ptr addrspace(200) %raw, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %raw, ptr addrspace(200) %buf) ]
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  call void @use(ptr addrspace(200) %sib)
+  ret void
+}
+; CHECK-LABEL: define void @sibling(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %raw, align 16
+; CHECK-NOT: store volatile ptr addrspace(200) null, ptr addrspace(200) %sib
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK: ret void
+
+; A later store of a different cap to dest is skipped (reassigned).
+define void @reassigned(ptr addrspace(200) %buf, ptr addrspace(200) %other) {
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %buf) ]
+  store ptr addrspace(200) %other, ptr addrspace(200) %dest, align 16
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  ret void
+}
+; CHECK-LABEL: define void @reassigned(
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK-NOT: store volatile ptr addrspace(200) null
+; CHECK: ret void
+
+; Dest is not available at the free (defined only on another path conceptually:
+; a pointer that does not dominate the free). Here dest is an argument used
+; only as a value, and we give a dest that is not a fat-pointer-ready address
+; at the free: the dest SSA is a select defined after the fact but we use a
+; dest that is an i8* integer-derived non-fat... Use a dest computed after
+; the free so it does not dominate. That dest cannot be named at the free.
+define void @unready(ptr addrspace(200) %buf) {
+  %slot = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %slot, align 16
+  ; The fact names a dest that does not dominate the free (the load is
+  ; after the free in this crafted case we cannot form). Instead name a
+  ; dest that is not a fat pointer: a plain alloca of i8.
+  %notcap = alloca i8, align 1, addrspace(200)
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %notcap, ptr addrspace(200) %buf) ]
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  ret void
+}
+; CHECK-LABEL: define void @unready(
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+; CHECK-NOT: store volatile ptr addrspace(200) null
+; CHECK: ret void
+
+define void @none_end() {
+  ret void
+}
+; NONE-NOT: @llvm.cheri.cap.equal.exact
+; NONE: define void @none_end(
+
+; STATS: store_into_facts=4
+; STATS-SAME: store_into_nulls=2
+; STATS-SAME: store_into_skipped_unready=1
+; STATS-SAME: store_into_skipped_reassigned=1
+; STATS-OFF: store_into_facts=4
+; STATS-OFF-SAME: store_into_nulls=0

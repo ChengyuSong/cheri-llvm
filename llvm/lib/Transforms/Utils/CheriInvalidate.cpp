@@ -183,6 +183,11 @@ static cl::opt<bool> InvLoanIntoFreedWipe(
     cl::desc("M7.1d B1: wipe capability slots of a buffer a mem.loan_into "
              "would skip as freed, through the ready dealloc cap before "
              "mem.free (default on; false is byte-identical to 94303ea2)"));
+static cl::opt<bool> InvStoreInto(
+    "cheri-invalidate-store-into", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d B2a: null a mem.store_into dest at the source mem.free "
+             "when dest is a ready fat pointer still holding that cap "
+             "(default on; false is byte-identical to 0c127e28)"));
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -270,6 +275,10 @@ struct Inv {
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
+  // M7.1d B2a: store_into facts, dests nulled at the source free, and dests
+  // skipped because the address was not ready or was reassigned.
+  unsigned StoreIntoFacts = 0, StoreIntoNulls = 0;
+  unsigned StoreIntoSkippedUnready = 0, StoreIntoSkippedReassigned = 0;
   // M7.1c-2a: words nulled only at lifetime.end. They are not CapSlots, so
   // free-log, free-site and scope range checks, and loan bookkeeping ignore
   // them. A fixed-offset store stays in CapSlots and is not repeated here.
@@ -294,6 +303,12 @@ struct Inv {
     bool Direct = false;
   };
   SmallVector<LoanIntoScan, 4> PendingLoanInto;
+  struct StoreIntoWipe {
+    Instruction *Free = nullptr;
+    Value *Dest = nullptr;
+    Value *Cap = nullptr;
+  };
+  SmallVector<StoreIntoWipe, 4> PendingStoreInto;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -2284,6 +2299,171 @@ struct Inv {
     PendingLoanInto.clear();
   }
 
+  // Cap is a copy of a pointer into the buffer being freed (or is that
+  // buffer): walk GEP/PHI/select and one load so a payload GEP of a Box
+  // matches the dealloc pointer loaded from the same slot.
+  bool capRefersToFreed(Value *Cap, Value *FreeBuf) const {
+    if (!Cap || !FreeBuf)
+      return false;
+    if (mayBeThisBuffer(Cap, FreeBuf) || mayBeThisBuffer(FreeBuf, Cap))
+      return true;
+    if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
+      return true;
+    SmallPtrSet<const Value *, 8> FromCap, FromFree;
+    auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
+      SmallVector<Value *, 8> Work{Start};
+      while (!Work.empty()) {
+        Value *X = Work.pop_back_val()->stripPointerCasts();
+        if (!Out.insert(X).second)
+          continue;
+        if (auto *G = dyn_cast<GetElementPtrInst>(X))
+          Work.push_back(G->getPointerOperand());
+        else if (auto *LI = dyn_cast<LoadInst>(X))
+          Work.push_back(LI->getPointerOperand());
+        else if (auto *PN = dyn_cast<PHINode>(X))
+          for (Value *In : PN->incoming_values())
+            Work.push_back(In);
+        else if (auto *Sel = dyn_cast<SelectInst>(X)) {
+          Work.push_back(Sel->getTrueValue());
+          Work.push_back(Sel->getFalseValue());
+        }
+      }
+    };
+    Collect(Cap, FromCap);
+    Collect(FreeBuf, FromFree);
+    for (const Value *X : FromCap)
+      if (FromFree.contains(X))
+        return true;
+    return false;
+  }
+
+  bool destReadyAt(Value *Dest, Instruction *At, DominatorTree &DT) const {
+    if (!Dest || !Dest->getType()->isPointerTy() ||
+        !DL.isFatPointer(Dest->getType()))
+      return false;
+    if (!loanValAvailable(Dest, At, DT))
+      return false;
+    // No ra/sp register clears. A store through a ready alloca/GEP/named
+    // SSA (csc zero, 0(reg) or off(sp) of a slot) is the approved shape.
+    if (auto *II = dyn_cast<IntrinsicInst>(Dest)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::returnaddress:
+      case Intrinsic::addressofreturnaddress:
+      case Intrinsic::sponentry:
+        return false;
+      default:
+        break;
+      }
+    }
+    return true;
+  }
+
+  bool destReassignedBetween(Value *Dest, Instruction *From, Instruction *To,
+                             DominatorTree &DT) const {
+    AllocaInst *A = nullptr;
+    int64_t Off = 0;
+    bool Slot = frameSlot(Dest, A, Off);
+    int64_t DestOff = 0;
+    Value *DestBase = GetPointerBaseWithConstantOffset(Dest, DestOff, DL);
+    Function *Fn = To->getFunction();
+    for (Instruction &I : instructions(*Fn)) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI)
+        continue;
+      if (!dominatesBetween(From, SI, To, DT))
+        continue;
+      Value *P = SI->getPointerOperand();
+      if (Slot && isThisSlot(P, A, Off))
+        return true;
+      int64_t PO = 0;
+      Value *PB = GetPointerBaseWithConstantOffset(P, PO, DL);
+      if (PB && DestBase && PB == DestBase && PO == DestOff)
+        return true;
+    }
+    return false;
+  }
+
+  void storeIntoPlan(Function &F, DominatorTree &DT) {
+    if (!InvStoreInto)
+      return;
+    SmallVector<CallBase *, 4> Facts, Frees;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (memannot::isMemStoreIntoFact(CB))
+        Facts.push_back(CB);
+      if (CB->getOperandBundle(memannot::TagFree))
+        Frees.push_back(CB);
+    }
+    for (CallBase *Fact : Facts) {
+      auto OB = Fact->getOperandBundle(memannot::TagStoreInto);
+      if (!OB || OB->Inputs.size() < 2)
+        continue;
+      Value *Dest = OB->Inputs[0];
+      Value *Cap = OB->Inputs[1];
+      if (!Dest || !Cap)
+        continue;
+      bool AnyFree = false;
+      for (CallBase *Fr : Frees) {
+        auto FB = Fr->getOperandBundle(memannot::TagFree);
+        if (!FB || FB->Inputs.empty())
+          continue;
+        Value *Buf = FB->Inputs[0];
+        if (!DT.dominates(Fact, Fr))
+          continue;
+        if (!capRefersToFreed(Cap, Buf))
+          continue;
+        AnyFree = true;
+        if (!destReadyAt(Dest, Fr, DT) || !loanValAvailable(Cap, Fr, DT)) {
+          ++StoreIntoSkippedUnready;
+          continue;
+        }
+        if (destReassignedBetween(Dest, Fact, Fr, DT)) {
+          ++StoreIntoSkippedReassigned;
+          continue;
+        }
+        PendingStoreInto.push_back({Fr, Dest, Cap});
+      }
+      if (!AnyFree)
+        ++StoreIntoSkippedUnready;
+    }
+  }
+
+  // Single-slot wipe immediately before mem.free: load dest, exact-equal to
+  // cap, store null through the ready dest pointer. Not a buffer scan.
+  void storeIntoEmit() {
+    Type *CapTy = PointerType::get(M.getContext(), 200);
+    for (const StoreIntoWipe &S : PendingStoreInto) {
+      Instruction *At = S.Free;
+      if (!At || !At->getParent() || !S.Dest || !S.Cap)
+        continue;
+      BasicBlock *Cont =
+          SplitBlock(At->getParent(), At->getIterator(),
+                     static_cast<DominatorTree *>(nullptr), nullptr, nullptr,
+                     "storeinto.cont");
+      BasicBlock *Pre = Cont->getSinglePredecessor();
+      Pre->getTerminator()->eraseFromParent();
+      LLVMContext &Ctx = M.getContext();
+      Function *Fn = Cont->getParent();
+      auto *NullBB = BasicBlock::Create(Ctx, "storeinto.null", Fn, Cont);
+      IRBuilder<> B(Pre);
+      Value *Got =
+          B.CreateAlignedLoad(CapTy, S.Dest, Align(16), "storeinto.got");
+      Value *Eq =
+          B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact), {Got, S.Cap});
+      B.CreateCondBr(Eq, NullBB, Cont);
+      B.SetInsertPoint(NullBB);
+      auto *St = B.CreateAlignedStore(
+          ConstantPointerNull::get(cast<PointerType>(CapTy)), S.Dest, Align(16),
+          InvVolatile);
+      markClear(St, "cheri_inv_store_into");
+      B.CreateBr(Cont);
+      ++StoreIntoNulls;
+    }
+    PendingStoreInto.clear();
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -2728,27 +2908,33 @@ struct Inv {
     // capability slot for the range checks.
     bool HasMove = false;
     bool HasLoanInto = false;
-    if (Loan)
-      for (Instruction &I : instructions(F)) {
-        if (memannot::isMemMoveFact(&I))
-          HasMove = true;
-        if (memannot::isMemLoanIntoFact(&I)) {
-          ++LoanIntoFacts;
-          HasLoanInto = true;
-        } else if (memannot::isMemLoanIntoValFact(&I)) {
-          ++LoanIntoValFacts;
-          HasLoanInto = true;
-        } else if (auto *CB = dyn_cast<CallBase>(&I))
-          if (memannot::isMemFact(CB) &&
-              CB->getOperandBundle(memannot::TagLoanIntoPromoted))
-            ++LoanIntoSkippedPromoted;
+    bool HasStoreInto = false;
+    for (Instruction &I : instructions(F)) {
+      if (memannot::isMemStoreIntoFact(&I)) {
+        ++StoreIntoFacts;
+        HasStoreInto = true;
       }
+      if (!Loan)
+        continue;
+      if (memannot::isMemMoveFact(&I))
+        HasMove = true;
+      if (memannot::isMemLoanIntoFact(&I)) {
+        ++LoanIntoFacts;
+        HasLoanInto = true;
+      } else if (memannot::isMemLoanIntoValFact(&I)) {
+        ++LoanIntoValFacts;
+        HasLoanInto = true;
+      } else if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB) &&
+            CB->getOperandBundle(memannot::TagLoanIntoPromoted))
+          ++LoanIntoSkippedPromoted;
+    }
     bool RegFree = InvCapReg && (Free || AFLog);
     bool RegScope = InvCapReg && Scope;
     // M7.1b: a loan_into fact is scanned even when this function has no other
     // frame capability slot. A promoted marker is only counted.
     if (CapSlots.empty() && WideByAlloca.empty() && !RegFree && !RegScope &&
-        !HasMove && !HasLoanInto)
+        !HasMove && !HasLoanInto && !HasStoreInto)
       return;
     DominatorTree DT(F);
     buildCallReach(F);
@@ -2766,6 +2952,8 @@ struct Inv {
       loanIntoPlan(F, DT);
       loanIntoValPlan(F, DT);
     }
+    if (HasStoreInto && (Loan || Free))
+      storeIntoPlan(F, DT);
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -3008,6 +3196,8 @@ struct Inv {
       flogCalls(F, CapSlots, DT); // last DT user: it splits blocks
     if (Loan && !PendingLoanInto.empty())
       loanIntoEmit();
+    if (!PendingStoreInto.empty())
+      storeIntoEmit();
   }
 
   void run() {
@@ -3058,6 +3248,10 @@ struct Inv {
          << " free_dead_checked=" << FreeDeadChecked
          << " free_dead_call_plain=" << FreeDeadCallPlain
          << " free_dead_call_checked=" << FreeDeadCallChecked
+         << " store_into_facts=" << StoreIntoFacts
+         << " store_into_nulls=" << StoreIntoNulls
+         << " store_into_skipped_unready=" << StoreIntoSkippedUnready
+         << " store_into_skipped_reassigned=" << StoreIntoSkippedReassigned
          << "\n";
     }
   }
