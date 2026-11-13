@@ -2310,15 +2310,25 @@ struct Inv {
     if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
       return true;
     SmallPtrSet<const Value *, 8> FromCap, FromFree;
-    auto PeelClaim = [](Value *V) -> Value * {
+    auto PeelCap = [](Value *V) -> Value * {
+      // mem.claim is lowered to cheri.cap.bounds.set before this walk.
       while (V) {
         V = V->stripPointerCasts();
         auto *C = dyn_cast<CallBase>(V);
-        if (!C || !C->arg_size())
+        if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
           break;
-        if (memannot::isMemClaim(C) ||
-            (C->getCalledFunction() &&
-             C->getCalledFunction()->getName().starts_with("llvm.mem.claim")))
+        if (memannot::isMemClaim(C)) {
+          V = C->getArgOperand(0);
+          continue;
+        }
+        Function *Fn = C->getCalledFunction();
+        if (!Fn || !Fn->isIntrinsic())
+          break;
+        StringRef N = Fn->getName();
+        if (N.starts_with("llvm.mem.claim") ||
+            N.starts_with("llvm.cheri.cap.bounds.set") ||
+            N.starts_with("llvm.cheri.cap.address.set") ||
+            N.starts_with("llvm.cheri.cap.perms.and"))
           V = C->getArgOperand(0);
         else
           break;
@@ -2328,7 +2338,7 @@ struct Inv {
     auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
       SmallVector<Value *, 8> Work{Start};
       while (!Work.empty()) {
-        Value *X = PeelClaim(Work.pop_back_val());
+        Value *X = PeelCap(Work.pop_back_val());
         if (!X || !Out.insert(X).second)
           continue;
         if (auto *G = dyn_cast<GetElementPtrInst>(X))
@@ -2340,7 +2350,7 @@ struct Inv {
           if (Function *Fn = LI->getFunction()) {
             int64_t LOff = 0;
             Value *LBase = GetPointerBaseWithConstantOffset(
-                PeelClaim(LI->getPointerOperand()), LOff, DL);
+                PeelCap(LI->getPointerOperand()), LOff, DL);
             if (LBase) {
               for (Instruction &I : instructions(*Fn)) {
                 auto *SI = dyn_cast<StoreInst>(&I);
@@ -2348,7 +2358,7 @@ struct Inv {
                   continue;
                 int64_t SOff = 0;
                 Value *SBase = GetPointerBaseWithConstantOffset(
-                    PeelClaim(SI->getPointerOperand()), SOff, DL);
+                    PeelCap(SI->getPointerOperand()), SOff, DL);
                 if (SBase && SBase == LBase && SOff == LOff)
                   Work.push_back(SI->getValueOperand());
               }
