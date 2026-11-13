@@ -2425,12 +2425,24 @@ struct Inv {
     if (!P)
       return S;
     int64_t COff = 0;
+    // GetPointerBaseWithConstantOffset never returns null: it stops at a
+    // non-constant GEP and reports offset 0 from that GEP. Resolve a
+    // remaining variable index via a dominating constant store.
     Value *Base = GetPointerBaseWithConstantOffset(P, COff, DL);
-    if (!Base) {
-      auto *GEP = dyn_cast<GEPOperator>(P);
-      if (!GEP || !gepConstByteOffset(GEP, COff, DT))
-        return S;
-      Base = peelRepresent(GEP->getPointerOperand());
+    if (auto *GEP = dyn_cast<GEPOperator>(Base)) {
+      int64_t GOff = 0;
+      if (gepConstByteOffset(GEP, GOff, DT)) {
+        COff += GOff;
+        Base = peelRepresent(GEP->getPointerOperand());
+        int64_t Inner = 0;
+        Value *InnerBase = GetPointerBaseWithConstantOffset(Base, Inner, DL);
+        if (InnerBase) {
+          COff += Inner;
+          Base = peelRepresent(InnerBase);
+        }
+      } else {
+        Base = peelRepresent(Base);
+      }
     } else {
       Base = peelRepresent(Base);
     }

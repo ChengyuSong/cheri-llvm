@@ -241,7 +241,7 @@ define void @copy_vec_slot(ptr addrspace(200) %buf) {
   ret void
 }
 ; CHECK-LABEL: define void @copy_vec_slot(
-; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: call {{.*}}@llvm.cheri.cap.equal.exact
 ; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %hold, align 16
 ; CHECK: call {{.*}}@eat_box(
 ; CHECK: ret void
