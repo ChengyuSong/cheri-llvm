@@ -102,7 +102,18 @@ do_free:
 ; CHECK-NOT: store volatile ptr addrspace(200) null
 ; CHECK: ret void
 
-declare void @eat_box(ptr addrspace(200))
+; eat_box is known to free: its body has mem.free of the argument.
+; A declaration with no body is not treated as the source end of life.
+define void @eat_box(ptr addrspace(200) %b) {
+  call void @free(ptr addrspace(200) %b) [ "mem.free"(ptr addrspace(200) %b) ]
+  ret void
+}
+
+; Box::leak-like: takes a mem.box_family argument but does not free it.
+define ptr addrspace(200) @leak_box(ptr addrspace(200) %b) {
+  ret ptr addrspace(200) %b
+}
+
 
 ; The source free lives in a callee. The caller moves an owned Box
 ; (mem.box_family) into that call; the wipe is immediately before it.
@@ -180,15 +191,70 @@ define void @sibling_consume(ptr addrspace(200) %buf, ptr addrspace(200) %dummy)
 ; CHECK: call {{.*}}@eat_box(
 ; CHECK: ret void
 
+
+; Named local holding a store_into copy whose cap is then passed to a
+; non-freeing consume (Box::leak). Dest must not be wiped.
+define void @leak_local(ptr addrspace(200) %buf) {
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %buf) ]
+  %leaked = call ptr addrspace(200) @leak_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  call void @use(ptr addrspace(200) %dest)
+  call void @use(ptr addrspace(200) %leaked)
+  ret void
+}
+; CHECK-LABEL: define void @leak_local(
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK-NOT: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@leak_box(
+; CHECK: ret void
+
+; ptr::read of a Vec heap slot: two loads of the same Vec::ptr field, a
+; store through claim(gep(load, len)) and a later load through
+; claim(gep(load, 16)), with len resolved from a dominating constant store.
+; The named local dest is wiped when the referent is consumed.
+define void @copy_vec_slot(ptr addrspace(200) %buf) {
+  %v = alloca ptr addrspace(200), align 16, addrspace(200)
+  %len = alloca i64, align 8, addrspace(200)
+  %hold = alloca ptr addrspace(200), align 16, addrspace(200)
+  %heap = alloca [2 x ptr addrspace(200)], align 16, addrspace(200)
+  store ptr addrspace(200) %heap, ptr addrspace(200) %v, align 16
+  store i64 0, ptr addrspace(200) %len, align 8
+  ; push at index 1: store 1 to len, then store cap at gep([16 x i8], load(v), len)
+  store i64 1, ptr addrspace(200) %len, align 8
+  %p0 = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  %l = load i64, ptr addrspace(200) %len, align 8
+  %slot = getelementptr inbounds [16 x i8], ptr addrspace(200) %p0, i64 %l
+  %cslot = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %slot, i64 16, i64 256)
+  %claimed = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %buf, i64 8, i64 261)
+  store ptr addrspace(200) %claimed, ptr addrspace(200) %cslot, align 16
+  ; later increment of len must not hide the offset at the store
+  store i64 2, ptr addrspace(200) %len, align 8
+  ; ptr::read: load from claim(gep(i8, load(v), 16))
+  %p1 = load ptr addrspace(200), ptr addrspace(200) %v, align 16
+  %slot2 = getelementptr inbounds i8, ptr addrspace(200) %p1, i64 16
+  %cslot2 = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %slot2, i64 16, i64 256)
+  %copy = load ptr addrspace(200), ptr addrspace(200) %cslot2, align 16
+  store ptr addrspace(200) %copy, ptr addrspace(200) %hold, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %hold, ptr addrspace(200) %copy) ]
+  call void @eat_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  ret void
+}
+; CHECK-LABEL: define void @copy_vec_slot(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %hold, align 16
+; CHECK: call {{.*}}@eat_box(
+; CHECK: ret void
+
 define void @none_end() {
   ret void
 }
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; STATS: store_into_facts=9
-; STATS-SAME: store_into_nulls=5
-; STATS-SAME: store_into_skipped_unready=3
+; STATS: store_into_facts=11
+; STATS-SAME: store_into_nulls=6
+; STATS-SAME: store_into_skipped_unready=4
 ; STATS-SAME: store_into_skipped_reassigned=1
-; STATS-OFF: store_into_facts=9
+; STATS-OFF: store_into_facts=11
 ; STATS-OFF-SAME: store_into_nulls=0

@@ -46,6 +46,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -2299,10 +2300,168 @@ struct Inv {
     PendingLoanInto.clear();
   }
 
+  // Peel represent layers of an *address* (claim / bounds.set of a GEP or
+  // alloca). Never used to walk an allocating claim of a box cap down to
+  // the arena (that would alias bump-allocated siblings).
+  Value *peelRepresent(Value *V) const {
+    while (V) {
+      V = V->stripPointerCasts();
+      auto *C = dyn_cast<CallBase>(V);
+      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+        break;
+      Function *Fn = C->getCalledFunction();
+      StringRef N = Fn ? Fn->getName() : StringRef();
+      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+          N.starts_with("llvm.cheri.cap.bounds.set") ||
+          N.starts_with("llvm.cheri.cap.address.set") ||
+          N.starts_with("llvm.cheri.cap.perms.and"))
+        V = C->getArgOperand(0);
+      else
+        break;
+    }
+    return V;
+  }
+
+  // Same alloca / GEP-of-alloca after peeling represent layers. No load walk.
+  bool sameConstSlot(Value *A, Value *B) const {
+    if (!A || !B)
+      return false;
+    A = peelRepresent(A);
+    B = peelRepresent(B);
+    if (!A || !B)
+      return false;
+    if (A == B)
+      return true;
+    int64_t OA = 0, OB = 0;
+    Value *BA = GetPointerBaseWithConstantOffset(A, OA, DL);
+    Value *BB = GetPointerBaseWithConstantOffset(B, OB, DL);
+    return BA && BB && BA == BB && OA == OB;
+  }
+
+  // Latest dominating constant store to the same slot as LI. A later
+  // increment of Vec::len after the load is ignored.
+  bool availableConstInt(const LoadInst *LI, const DominatorTree *DT,
+                         int64_t &Out) const {
+    if (!LI || !LI->getType()->isIntegerTy() || !LI->getFunction())
+      return false;
+    const StoreInst *Best = nullptr;
+    const ConstantInt *BestC = nullptr;
+    for (Instruction &I : instructions(*LI->getFunction())) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !sameConstSlot(SI->getPointerOperand(), LI->getPointerOperand()))
+        continue;
+      bool Dom = false;
+      if (DT)
+        Dom = DT->dominates(const_cast<StoreInst *>(SI),
+                            const_cast<LoadInst *>(LI));
+      else if (SI->getParent() == LI->getParent() && SI->comesBefore(LI))
+        Dom = true;
+      if (!Dom)
+        continue;
+      if (Best) {
+        bool Later = false;
+        if (DT && DT->dominates(const_cast<StoreInst *>(Best),
+                                const_cast<StoreInst *>(SI)))
+          Later = true;
+        else if (DT && DT->dominates(const_cast<StoreInst *>(SI),
+                                     const_cast<StoreInst *>(Best)))
+          Later = false;
+        else if (Best->getParent() == SI->getParent())
+          Later = Best->comesBefore(SI);
+        else
+          return false;
+        if (!Later)
+          continue;
+      }
+      Best = SI;
+      BestC = dyn_cast<ConstantInt>(SI->getValueOperand());
+    }
+    if (!BestC)
+      return false;
+    Out = BestC->getSExtValue();
+    return true;
+  }
+
+  // Constant byte offset of a GEP, resolving a loaded index via a unique
+  // dominating constant store (Vec::len at push).
+  bool gepConstByteOffset(const GEPOperator *GEP, int64_t &Off,
+                          const DominatorTree *DT) const {
+    if (!GEP)
+      return false;
+    unsigned AS = GEP->getPointerAddressSpace();
+    APInt APOff(DL.getIndexSizeInBits(AS), 0);
+    auto Resolve = [&](Value &Idx, APInt &Val) -> bool {
+      int64_t K = 0;
+      auto *LI = dyn_cast<LoadInst>(&Idx);
+      if (!LI || !availableConstInt(LI, DT, K))
+        return false;
+      Val = APInt(Val.getBitWidth(), K, true);
+      return true;
+    };
+    if (!GEP->accumulateConstantOffset(DL, APOff, Resolve))
+      return false;
+    Off = APOff.getSExtValue();
+    return true;
+  }
+
+  // Identify a store/load address as (buffer origin, field of that origin,
+  // const byte offset). Two loads of the same Vec::ptr field share an origin
+  // so a later ptr::read from a Vec heap slot can match the store from push.
+  // The origin is the Vec alloca (or its ptr field), never the bump arena.
+  struct SlotId {
+    Value *Origin = nullptr;
+    int64_t FieldOff = 0;
+    int64_t SlotOff = 0;
+    bool valid() const { return Origin != nullptr; }
+    bool operator==(const SlotId &O) const {
+      return Origin == O.Origin && FieldOff == O.FieldOff && SlotOff == O.SlotOff;
+    }
+  };
+
+  SlotId identifySlot(Value *P, const DominatorTree *DT) const {
+    SlotId S;
+    P = peelRepresent(P);
+    if (!P)
+      return S;
+    int64_t COff = 0;
+    Value *Base = GetPointerBaseWithConstantOffset(P, COff, DL);
+    if (!Base) {
+      auto *GEP = dyn_cast<GEPOperator>(P);
+      if (!GEP || !gepConstByteOffset(GEP, COff, DT))
+        return S;
+      Base = peelRepresent(GEP->getPointerOperand());
+    } else {
+      Base = peelRepresent(Base);
+    }
+    if (!Base)
+      return S;
+    if (auto *LI = dyn_cast<LoadInst>(Base)) {
+      Value *LP = peelRepresent(LI->getPointerOperand());
+      int64_t FOff = 0;
+      Value *FBase = GetPointerBaseWithConstantOffset(LP, FOff, DL);
+      S.Origin = FBase ? FBase : LP;
+      S.FieldOff = FBase ? FOff : 0;
+      S.SlotOff = COff;
+      return S;
+    }
+    S.Origin = Base;
+    S.FieldOff = 0;
+    S.SlotOff = COff;
+    return S;
+  }
+
+  bool sameSlot(Value *A, Value *B, const DominatorTree *DT) const {
+    if (sameConstSlot(A, B))
+      return true;
+    SlotId SA = identifySlot(A, DT), SB = identifySlot(B, DT);
+    return SA.valid() && SB.valid() && SA == SB;
+  }
+
   // Cap is a copy of a pointer into the buffer being freed (or is that
   // buffer): walk GEP/PHI/select and one load so a payload GEP of a Box
   // matches the dealloc pointer loaded from the same slot.
-  bool capRefersToFreed(Value *Cap, Value *FreeBuf) const {
+  bool capRefersToFreed(Value *Cap, Value *FreeBuf,
+                        const DominatorTree *DT = nullptr) const {
     if (!Cap || !FreeBuf)
       return false;
     if (mayBeThisBuffer(Cap, FreeBuf) || mayBeThisBuffer(FreeBuf, Cap))
@@ -2313,50 +2472,15 @@ struct Inv {
     // lowered from an inner claim). Applied only to a stored *copy*, never
     // to the box cap itself, so we do not walk an allocating claim to the
     // arena and alias bump-allocated siblings.
-    auto PeelRepresent = [](Value *V) -> Value * {
-      while (V) {
-        V = V->stripPointerCasts();
-        auto *C = dyn_cast<CallBase>(V);
-        if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
-          break;
-        Function *Fn = C->getCalledFunction();
-        StringRef N = Fn ? Fn->getName() : StringRef();
-        if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
-            N.starts_with("llvm.cheri.cap.bounds.set") ||
-            N.starts_with("llvm.cheri.cap.address.set") ||
-            N.starts_with("llvm.cheri.cap.perms.and"))
-          V = C->getArgOperand(0);
-        else
-          break;
-      }
-      return V;
-    };
-    auto SameSlot = [&](Value *A, Value *B) -> bool {
-      if (!A || !B)
-        return false;
-      A = A->stripPointerCasts();
-      B = B->stripPointerCasts();
-      if (A == B)
-        return true;
-      // Peel a represent claim on the *address* (claim of a GEP / alloca),
-      // not on the stored cap.
-      Value *PA = PeelRepresent(A);
-      Value *PB = PeelRepresent(B);
-      if (PA == PB)
-        return true;
-      int64_t OA = 0, OB = 0;
-      Value *BA = GetPointerBaseWithConstantOffset(PA, OA, DL);
-      Value *BB = GetPointerBaseWithConstantOffset(PB, OB, DL);
-      return BA && BB && BA == BB && OA == OB;
-    };
-// ptr::read dest: Cap is a load of a slot that stored this referent
+    auto PeelRepresent = [this](Value *V) -> Value * { return peelRepresent(V); };
+    // ptr::read dest: Cap is a load of a slot that stored this referent
     // (or a claim/bounds.set of it). Do not walk the box's allocating
     // claim down to the arena.
     if (auto *LI = dyn_cast<LoadInst>(Cap)) {
       if (Function *Fn = LI->getFunction()) {
         for (Instruction &I : instructions(*Fn)) {
           auto *SI = dyn_cast<StoreInst>(&I);
-          if (!SI || !SameSlot(SI->getPointerOperand(), LI->getPointerOperand()))
+          if (!SI || !sameSlot(SI->getPointerOperand(), LI->getPointerOperand(), DT))
             continue;
           Value *SV = SI->getValueOperand();
           Value *Peeled = PeelRepresent(SV);
@@ -2381,28 +2505,21 @@ struct Inv {
         else if (auto *LI = dyn_cast<LoadInst>(X)) {
           Work.push_back(LI->getPointerOperand());
           // Store-to-load: a ptr::read dest holds a copy of a cap stored
-          // to the same slot. Peel one represent layer (claim/bounds.set)
-          // of the stored value so claim(%b) still refers to %b, but do
-          // not walk the box's own allocating claim down to the arena
-          // (that would alias every bump-allocated sibling).
+          // to the same slot. Identify heap slots as (Vec alloca after
+          // peeling represent and loads from the same field, plus a
+          // resolved constant byte offset). Peel one represent layer of
+          // the stored value so claim(%b) still refers to %b, but do not
+          // walk the box's own allocating claim down to the arena.
           if (Function *Fn = LI->getFunction()) {
-            int64_t LOff = 0;
-            Value *LBase = GetPointerBaseWithConstantOffset(
-                LI->getPointerOperand()->stripPointerCasts(), LOff, DL);
-            if (LBase) {
-              for (Instruction &I : instructions(*Fn)) {
-                auto *SI = dyn_cast<StoreInst>(&I);
-                if (!SI)
-                  continue;
-                int64_t SOff = 0;
-                Value *SBase = GetPointerBaseWithConstantOffset(
-                    SI->getPointerOperand()->stripPointerCasts(), SOff, DL);
-                if (SBase && SBase == LBase && SOff == LOff) {
-                  Value *SV = SI->getValueOperand();
-                  Work.push_back(SV);
-                  Work.push_back(PeelRepresent(SV));
-                }
-              }
+            for (Instruction &I : instructions(*Fn)) {
+              auto *SI = dyn_cast<StoreInst>(&I);
+              if (!SI)
+                continue;
+              if (!sameSlot(SI->getPointerOperand(), LI->getPointerOperand(), DT))
+                continue;
+              Value *SV = SI->getValueOperand();
+              Work.push_back(SV);
+              Work.push_back(PeelRepresent(SV));
             }
           }
         } else if (auto *PN = dyn_cast<PHINode>(X))
@@ -2414,7 +2531,7 @@ struct Inv {
         }
       }
     };
-        Collect(Cap, FromCap);
+    Collect(Cap, FromCap);
     Collect(FreeBuf, FromFree);
     for (const Value *X : FromCap)
       if (FromFree.contains(X))
@@ -2422,16 +2539,55 @@ struct Inv {
     return false;
   }
 
-  // Callee takes the referent as an owned Box (mem.box_family), so this
-  // call is the source end of life even when mem.free is in the callee.
-  bool callConsumesCap(const CallBase *C, Value *Cap) const {
+  // Box::leak and the lit helper: the callee takes the box but does not free.
+  bool isBoxLeakCallee(const Function *F) const {
+    if (!F)
+      return false;
+    StringRef N = F->getName();
+    if (N == "leak_box" || N.ends_with("leak_box"))
+      return true;
+    // rustc Itanium: _ZN5alloc5boxed...4leak...
+    if (N.contains("5boxed") && N.contains("4leak"))
+      return true;
+    return false;
+  }
+
+  // True only when the callee body contains mem.free of this argument.
+  // A declaration with no body is not known to free.
+  bool calleeFreesArg(const Function *F, unsigned ArgI) const {
+    if (!F || F->isDeclaration() || F->arg_size() <= ArgI)
+      return false;
+    const Argument *Arg = F->getArg(ArgI);
+    for (Instruction &I : instructions(*F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      auto FB = CB->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      if (capRefersToFreed(FB->Inputs[0], const_cast<Argument *>(Arg)))
+        return true;
+    }
+    return false;
+  }
+
+  // The source end of life is a call known to free the box (drop / dealloc
+  // paths), not every mem.box_family consume. Box::leak and any other
+  // consume that does not free are exempt.
+  bool callConsumesCap(const CallBase *C, Value *Cap,
+                       const DominatorTree *DT = nullptr) const {
     if (!C || !Cap)
+      return false;
+    Function *F = C->getCalledFunction();
+    if (isBoxLeakCallee(F))
       return false;
     for (unsigned I = 0, E = C->arg_size(); I != E; ++I) {
       Value *A = C->getArgOperand(I);
-      if (!capRefersToFreed(Cap, A))
+      if (!capRefersToFreed(Cap, A, DT))
         continue;
-      if (C->getParamAttr(I, "mem.box_family").isValid())
+      if (!C->getParamAttr(I, "mem.box_family").isValid())
+        continue;
+      if (calleeFreesArg(F, I))
         return true;
     }
     return false;
@@ -2532,8 +2688,8 @@ struct Inv {
         continue;
       bool AnyEnd = false;
       // Consuming call first: mem.free of the referent may live in a
-      // callee (eat_u64 / drop of a Box). A "mem.box_family" argument
-      // that is this cap is the source end of life in this function.
+      // callee (eat_u64 / drop of a Box). Only a call known to free that
+      // box (drop / dealloc) is the source end of life; Box::leak is not.
       SmallVector<Instruction *, 4> Ends;
       for (Instruction &I : instructions(F)) {
         auto *CB = dyn_cast<CallBase>(&I);
@@ -2541,7 +2697,7 @@ struct Inv {
           continue;
         if (!DT.dominates(Fact, CB))
           continue;
-        if (callConsumesCap(CB, Cap))
+        if (callConsumesCap(CB, Cap, &DT))
           Ends.push_back(CB);
       }
       for (CallBase *Fr : Frees) {
@@ -2551,7 +2707,7 @@ struct Inv {
         Value *Buf = FB->Inputs[0];
         if (!DT.dominates(Fact, Fr))
           continue;
-        if (!capRefersToFreed(Cap, Buf))
+        if (!capRefersToFreed(Cap, Buf, &DT))
           continue;
         Ends.push_back(Fr);
       }
