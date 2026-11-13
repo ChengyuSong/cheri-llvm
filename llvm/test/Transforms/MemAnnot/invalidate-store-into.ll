@@ -83,14 +83,16 @@ define void @reassigned(ptr addrspace(200) %buf, ptr addrspace(200) %other) {
 ; at the free: the dest SSA is a select defined after the fact but we use a
 ; dest that is an i8* integer-derived non-fat... Use a dest computed after
 ; the free so it does not dominate. That dest cannot be named at the free.
-define void @unready(ptr addrspace(200) %buf) {
-  %slot = alloca ptr addrspace(200), align 16, addrspace(200)
-  store ptr addrspace(200) %buf, ptr addrspace(200) %slot, align 16
-  ; The fact names a dest that does not dominate the free (the load is
-  ; after the free in this crafted case we cannot form). Instead name a
-  ; dest that is not a fat pointer: a plain alloca of i8.
-  %notcap = alloca i8, align 1, addrspace(200)
-  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %notcap, ptr addrspace(200) %buf) ]
+define void @unready(ptr addrspace(200) %buf, i1 %c) {
+entry:
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %dest, align 16
+  br i1 %c, label %factbb, label %do_free
+factbb:
+  ; The fact does not dominate the free, so the dest is not ready to wipe.
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %buf) ]
+  br label %do_free
+do_free:
   call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
   ret void
 }
