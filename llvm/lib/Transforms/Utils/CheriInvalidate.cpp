@@ -2323,11 +2323,11 @@ struct Inv {
   }
 
   // Same alloca / GEP-of-alloca after peeling represent layers. No load walk.
-  bool sameConstSlot(Value *A, Value *B) const {
-    if (!A || !B)
+  bool sameConstSlot(const Value *CA, const Value *CB) const {
+    if (!CA || !CB)
       return false;
-    A = peelRepresent(A);
-    B = peelRepresent(B);
+    Value *A = peelRepresent(const_cast<Value *>(CA));
+    Value *B = peelRepresent(const_cast<Value *>(CB));
     if (!A || !B)
       return false;
     if (A == B)
@@ -2344,9 +2344,10 @@ struct Inv {
                          int64_t &Out) const {
     if (!LI || !LI->getType()->isIntegerTy() || !LI->getFunction())
       return false;
+    Function *Fn = const_cast<Function *>(LI->getFunction());
     const StoreInst *Best = nullptr;
     const ConstantInt *BestC = nullptr;
-    for (Instruction &I : instructions(*LI->getFunction())) {
+    for (Instruction &I : instructions(*Fn)) {
       auto *SI = dyn_cast<StoreInst>(&I);
       if (!SI || !sameConstSlot(SI->getPointerOperand(), LI->getPointerOperand()))
         continue;
@@ -2557,8 +2558,9 @@ struct Inv {
   bool calleeFreesArg(const Function *F, unsigned ArgI) const {
     if (!F || F->isDeclaration() || F->arg_size() <= ArgI)
       return false;
-    const Argument *Arg = F->getArg(ArgI);
-    for (Instruction &I : instructions(*F)) {
+    Function *Fn = const_cast<Function *>(F);
+    const Argument *Arg = Fn->getArg(ArgI);
+    for (Instruction &I : instructions(*Fn)) {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
