@@ -46,6 +46,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -183,6 +184,11 @@ static cl::opt<bool> InvLoanIntoFreedWipe(
     cl::desc("M7.1d B1: wipe capability slots of a buffer a mem.loan_into "
              "would skip as freed, through the ready dealloc cap before "
              "mem.free (default on; false is byte-identical to 94303ea2)"));
+static cl::opt<bool> InvStoreInto(
+    "cheri-invalidate-store-into", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d B2a: null a mem.store_into dest at the source mem.free "
+             "when dest is a ready fat pointer still holding that cap "
+             "(default on; false is byte-identical to 0c127e28)"));
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -270,6 +276,10 @@ struct Inv {
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
+  // M7.1d B2a: store_into facts, dests nulled at the source free, and dests
+  // skipped because the address was not ready or was reassigned.
+  unsigned StoreIntoFacts = 0, StoreIntoNulls = 0;
+  unsigned StoreIntoSkippedUnready = 0, StoreIntoSkippedReassigned = 0;
   // M7.1c-2a: words nulled only at lifetime.end. They are not CapSlots, so
   // free-log, free-site and scope range checks, and loan bookkeeping ignore
   // them. A fixed-offset store stays in CapSlots and is not repeated here.
@@ -294,6 +304,12 @@ struct Inv {
     bool Direct = false;
   };
   SmallVector<LoanIntoScan, 4> PendingLoanInto;
+  struct StoreIntoWipe {
+    Instruction *Free = nullptr;
+    Value *Dest = nullptr;
+    Value *Cap = nullptr;
+  };
+  SmallVector<StoreIntoWipe, 4> PendingStoreInto;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -2284,6 +2300,486 @@ struct Inv {
     PendingLoanInto.clear();
   }
 
+  // Peel represent layers of an *address* (claim / bounds.set of a GEP or
+  // alloca). Never used to walk an allocating claim of a box cap down to
+  // the arena (that would alias bump-allocated siblings).
+  Value *peelRepresent(Value *V) const {
+    while (V) {
+      V = V->stripPointerCasts();
+      auto *C = dyn_cast<CallBase>(V);
+      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+        break;
+      Function *Fn = C->getCalledFunction();
+      StringRef N = Fn ? Fn->getName() : StringRef();
+      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+          N.starts_with("llvm.cheri.cap.bounds.set") ||
+          N.starts_with("llvm.cheri.cap.address.set") ||
+          N.starts_with("llvm.cheri.cap.perms.and"))
+        V = C->getArgOperand(0);
+      else
+        break;
+    }
+    return V;
+  }
+
+  // Same alloca / GEP-of-alloca after peeling represent layers. No load walk.
+  bool sameConstSlot(const Value *CA, const Value *CB) const {
+    if (!CA || !CB)
+      return false;
+    Value *A = peelRepresent(const_cast<Value *>(CA));
+    Value *B = peelRepresent(const_cast<Value *>(CB));
+    if (!A || !B)
+      return false;
+    if (A == B)
+      return true;
+    int64_t OA = 0, OB = 0;
+    Value *BA = GetPointerBaseWithConstantOffset(A, OA, DL);
+    Value *BB = GetPointerBaseWithConstantOffset(B, OB, DL);
+    return BA && BB && BA == BB && OA == OB;
+  }
+
+  // Latest dominating constant store to the same slot as LI. A later
+  // increment of Vec::len after the load is ignored.
+  bool availableConstInt(const LoadInst *LI, const DominatorTree *DT,
+                         int64_t &Out) const {
+    if (!LI || !LI->getType()->isIntegerTy() || !LI->getFunction())
+      return false;
+    Function *Fn = const_cast<Function *>(LI->getFunction());
+    const StoreInst *Best = nullptr;
+    const ConstantInt *BestC = nullptr;
+    for (Instruction &I : instructions(*Fn)) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || !sameConstSlot(SI->getPointerOperand(), LI->getPointerOperand()))
+        continue;
+      bool Dom = false;
+      if (DT)
+        Dom = DT->dominates(const_cast<StoreInst *>(SI),
+                            const_cast<LoadInst *>(LI));
+      else if (SI->getParent() == LI->getParent() && SI->comesBefore(LI))
+        Dom = true;
+      if (!Dom)
+        continue;
+      if (Best) {
+        bool Later = false;
+        if (DT && DT->dominates(const_cast<StoreInst *>(Best),
+                                const_cast<StoreInst *>(SI)))
+          Later = true;
+        else if (DT && DT->dominates(const_cast<StoreInst *>(SI),
+                                     const_cast<StoreInst *>(Best)))
+          Later = false;
+        else if (Best->getParent() == SI->getParent())
+          Later = Best->comesBefore(SI);
+        else
+          return false;
+        if (!Later)
+          continue;
+      }
+      Best = SI;
+      BestC = dyn_cast<ConstantInt>(SI->getValueOperand());
+    }
+    if (!BestC)
+      return false;
+    Out = BestC->getSExtValue();
+    return true;
+  }
+
+  // Constant byte offset of a GEP, resolving a loaded index via a unique
+  // dominating constant store (Vec::len at push).
+  bool gepConstByteOffset(const GEPOperator *GEP, int64_t &Off,
+                          const DominatorTree *DT) const {
+    if (!GEP)
+      return false;
+    unsigned AS = GEP->getPointerAddressSpace();
+    APInt APOff(DL.getIndexSizeInBits(AS), 0);
+    auto Resolve = [&](Value &Idx, APInt &Val) -> bool {
+      int64_t K = 0;
+      auto *LI = dyn_cast<LoadInst>(&Idx);
+      if (!LI || !LI->getType()->isIntegerTy() ||
+          !availableConstInt(LI, DT, K))
+        return false;
+      // accumulateConstantOffset passes a default-constructed APInt
+      // (bitwidth 1). Size the result to the index type; the caller
+      // sextOrTruncs it to the pointer-index width.
+      Val = APInt(Idx.getType()->getIntegerBitWidth(), K, true);
+      return true;
+    };
+    if (!GEP->accumulateConstantOffset(DL, APOff, Resolve))
+      return false;
+    Off = APOff.getSExtValue();
+    return true;
+  }
+
+  // Identify a store/load address as (buffer origin, field of that origin,
+  // const byte offset). Two loads of the same Vec::ptr field share an origin
+  // so a later ptr::read from a Vec heap slot can match the store from push.
+  // The origin is the Vec alloca (or its ptr field), never the bump arena.
+  struct SlotId {
+    Value *Origin = nullptr;
+    int64_t FieldOff = 0;
+    int64_t SlotOff = 0;
+    bool valid() const { return Origin != nullptr; }
+    bool operator==(const SlotId &O) const {
+      return Origin == O.Origin && FieldOff == O.FieldOff && SlotOff == O.SlotOff;
+    }
+  };
+
+  SlotId identifySlot(Value *P, const DominatorTree *DT) const {
+    SlotId S;
+    P = peelRepresent(P);
+    if (!P)
+      return S;
+    int64_t COff = 0;
+    // GetPointerBaseWithConstantOffset never returns null: it stops at a
+    // non-constant GEP and reports offset 0 from that GEP. Resolve a
+    // remaining variable index via a dominating constant store.
+    Value *Base = GetPointerBaseWithConstantOffset(P, COff, DL);
+    if (auto *GEP = dyn_cast<GEPOperator>(Base)) {
+      int64_t GOff = 0;
+      if (gepConstByteOffset(GEP, GOff, DT)) {
+        COff += GOff;
+        Base = peelRepresent(GEP->getPointerOperand());
+        int64_t Inner = 0;
+        Value *InnerBase = GetPointerBaseWithConstantOffset(Base, Inner, DL);
+        if (InnerBase) {
+          COff += Inner;
+          Base = peelRepresent(InnerBase);
+        }
+      } else {
+        Base = peelRepresent(Base);
+      }
+    } else {
+      Base = peelRepresent(Base);
+    }
+    if (!Base)
+      return S;
+    if (auto *LI = dyn_cast<LoadInst>(Base)) {
+      Value *LP = peelRepresent(LI->getPointerOperand());
+      int64_t FOff = 0;
+      Value *FBase = GetPointerBaseWithConstantOffset(LP, FOff, DL);
+      S.Origin = FBase ? FBase : LP;
+      S.FieldOff = FBase ? FOff : 0;
+      S.SlotOff = COff;
+      return S;
+    }
+    S.Origin = Base;
+    S.FieldOff = 0;
+    S.SlotOff = COff;
+    return S;
+  }
+
+  bool sameSlot(Value *A, Value *B, const DominatorTree *DT) const {
+    if (sameConstSlot(A, B))
+      return true;
+    SlotId SA = identifySlot(A, DT), SB = identifySlot(B, DT);
+    return SA.valid() && SB.valid() && SA == SB;
+  }
+
+  // Cap is a copy of a pointer into the buffer being freed (or is that
+  // buffer): walk GEP/PHI/select and one load so a payload GEP of a Box
+  // matches the dealloc pointer loaded from the same slot.
+  bool capRefersToFreed(Value *Cap, Value *FreeBuf,
+                        const DominatorTree *DT = nullptr) const {
+    if (!Cap || !FreeBuf)
+      return false;
+    if (mayBeThisBuffer(Cap, FreeBuf) || mayBeThisBuffer(FreeBuf, Cap))
+      return true;
+    if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
+      return true;
+    // Peel every represent layer (mem.claim wrapping a bounds.set already
+    // lowered from an inner claim). Applied only to a stored *copy*, never
+    // to the box cap itself, so we do not walk an allocating claim to the
+    // arena and alias bump-allocated siblings.
+    auto PeelRepresent = [this](Value *V) -> Value * { return peelRepresent(V); };
+    // ptr::read dest: Cap is a load of a slot that stored this referent
+    // (or a claim/bounds.set of it). Do not walk the box's allocating
+    // claim down to the arena.
+    if (auto *LI = dyn_cast<LoadInst>(Cap)) {
+      if (Function *Fn = LI->getFunction()) {
+        for (Instruction &I : instructions(*Fn)) {
+          auto *SI = dyn_cast<StoreInst>(&I);
+          if (!SI || !sameSlot(SI->getPointerOperand(), LI->getPointerOperand(), DT))
+            continue;
+          Value *SV = SI->getValueOperand();
+          Value *Peeled = PeelRepresent(SV);
+          if (SV == FreeBuf || Peeled == FreeBuf)
+            return true;
+          if (mayBeThisBuffer(Peeled, FreeBuf) || mayBeThisBuffer(FreeBuf, Peeled))
+            return true;
+          if (mayBeThisBuffer(SV, FreeBuf) || mayBeThisBuffer(FreeBuf, SV))
+            return true;
+        }
+      }
+    }
+    SmallPtrSet<const Value *, 8> FromCap, FromFree;
+    auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
+      SmallVector<Value *, 8> Work{Start};
+      while (!Work.empty()) {
+        Value *X = Work.pop_back_val()->stripPointerCasts();
+        if (!X || !Out.insert(X).second)
+          continue;
+        if (auto *G = dyn_cast<GetElementPtrInst>(X))
+          Work.push_back(G->getPointerOperand());
+        else if (auto *LI = dyn_cast<LoadInst>(X)) {
+          Work.push_back(LI->getPointerOperand());
+          // Store-to-load: a ptr::read dest holds a copy of a cap stored
+          // to the same slot. Identify heap slots as (Vec alloca after
+          // peeling represent and loads from the same field, plus a
+          // resolved constant byte offset). Peel one represent layer of
+          // the stored value so claim(%b) still refers to %b, but do not
+          // walk the box's own allocating claim down to the arena.
+          if (Function *Fn = LI->getFunction()) {
+            for (Instruction &I : instructions(*Fn)) {
+              auto *SI = dyn_cast<StoreInst>(&I);
+              if (!SI)
+                continue;
+              if (!sameSlot(SI->getPointerOperand(), LI->getPointerOperand(), DT))
+                continue;
+              Value *SV = SI->getValueOperand();
+              Work.push_back(SV);
+              Work.push_back(PeelRepresent(SV));
+            }
+          }
+        } else if (auto *PN = dyn_cast<PHINode>(X))
+          for (Value *In : PN->incoming_values())
+            Work.push_back(In);
+        else if (auto *Sel = dyn_cast<SelectInst>(X)) {
+          Work.push_back(Sel->getTrueValue());
+          Work.push_back(Sel->getFalseValue());
+        }
+      }
+    };
+    Collect(Cap, FromCap);
+    Collect(FreeBuf, FromFree);
+    for (const Value *X : FromCap)
+      if (FromFree.contains(X))
+        return true;
+    return false;
+  }
+
+  // Box::leak and the lit helper: the callee takes the box but does not free.
+  bool isBoxLeakCallee(const Function *F) const {
+    if (!F)
+      return false;
+    StringRef N = F->getName();
+    if (N == "leak_box" || N.ends_with("leak_box"))
+      return true;
+    // rustc Itanium: _ZN5alloc5boxed...4leak...
+    if (N.contains("5boxed") && N.contains("4leak"))
+      return true;
+    return false;
+  }
+
+  // True only when the callee body contains mem.free of this argument.
+  // A declaration with no body is not known to free.
+  bool calleeFreesArg(const Function *F, unsigned ArgI) const {
+    if (!F || F->isDeclaration() || F->arg_size() <= ArgI)
+      return false;
+    Function *Fn = const_cast<Function *>(F);
+    const Argument *Arg = Fn->getArg(ArgI);
+    for (Instruction &I : instructions(*Fn)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      auto FB = CB->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      if (capRefersToFreed(FB->Inputs[0], const_cast<Argument *>(Arg)))
+        return true;
+    }
+    return false;
+  }
+
+  // The source end of life is a call known to free the box (drop / dealloc
+  // paths), not every mem.box_family consume. Box::leak and any other
+  // consume that does not free are exempt.
+  bool callConsumesCap(const CallBase *C, Value *Cap,
+                       const DominatorTree *DT = nullptr) const {
+    if (!C || !Cap)
+      return false;
+    Function *F = C->getCalledFunction();
+    if (isBoxLeakCallee(F))
+      return false;
+    for (unsigned I = 0, E = C->arg_size(); I != E; ++I) {
+      Value *A = C->getArgOperand(I);
+      if (!capRefersToFreed(Cap, A, DT))
+        continue;
+      if (!C->getParamAttr(I, "mem.box_family").isValid())
+        continue;
+      if (calleeFreesArg(F, I))
+        return true;
+    }
+    return false;
+  }
+
+  bool destReadyAt(Value *Dest, Instruction *At, DominatorTree &DT) const {
+    if (!Dest || !Dest->getType()->isPointerTy() ||
+        !DL.isFatPointer(Dest->getType()))
+      return false;
+    if (!loanValAvailable(Dest, At, DT))
+      return false;
+    // No ra/sp register clears. B2a may only wipe a ready named local:
+    // an alloca or a GEP of one (csc zero, 0(reg) / off(sp) of that slot).
+    // Heap cells (Box::leak, Vec buffers) and statics are not B2a dests.
+    if (auto *II = dyn_cast<IntrinsicInst>(Dest)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::returnaddress:
+      case Intrinsic::addressofreturnaddress:
+      case Intrinsic::sponentry:
+        return false;
+      default:
+        break;
+      }
+    }
+    // A ptr::write dest is often mem.claim / bounds.set of a GEP of the
+    // local. Peel those represent layers, but the base must still be an
+    // alloca (not a heap cell or a static).
+    Value *P = Dest;
+    for (int I = 0; I < 2 && P; ++I) {
+      AllocaInst *Slot = nullptr;
+      int64_t Off = 0;
+      if (frameSlot(P, Slot, Off))
+        return true;
+      P = P->stripPointerCasts();
+      auto *C = dyn_cast<CallBase>(P);
+      if (!C || !C->arg_size() || !C->getArgOperand(0)->getType()->isPointerTy())
+        break;
+      Function *Fn = C->getCalledFunction();
+      StringRef N = Fn ? Fn->getName() : StringRef();
+      if (memannot::isMemClaim(C) || N.starts_with("llvm.mem.claim") ||
+          N.starts_with("llvm.cheri.cap.bounds.set") ||
+          N.starts_with("llvm.cheri.cap.address.set") ||
+          N.starts_with("llvm.cheri.cap.perms.and"))
+        P = C->getArgOperand(0);
+      else
+        break;
+    }
+    AllocaInst *Slot = nullptr;
+    int64_t Off = 0;
+    return P && frameSlot(P, Slot, Off);
+  }
+
+  bool destReassignedBetween(Value *Dest, Instruction *From, Instruction *To,
+                             DominatorTree &DT) const {
+    AllocaInst *A = nullptr;
+    int64_t Off = 0;
+    bool Slot = frameSlot(Dest, A, Off);
+    int64_t DestOff = 0;
+    Value *DestBase = GetPointerBaseWithConstantOffset(Dest, DestOff, DL);
+    Function *Fn = To->getFunction();
+    for (Instruction &I : instructions(*Fn)) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI)
+        continue;
+      if (!dominatesBetween(From, SI, To, DT))
+        continue;
+      Value *P = SI->getPointerOperand();
+      if (Slot && isThisSlot(P, A, Off))
+        return true;
+      int64_t PO = 0;
+      Value *PB = GetPointerBaseWithConstantOffset(P, PO, DL);
+      if (PB && DestBase && PB == DestBase && PO == DestOff)
+        return true;
+    }
+    return false;
+  }
+
+  void storeIntoPlan(Function &F, DominatorTree &DT) {
+    if (!InvStoreInto)
+      return;
+    SmallVector<CallBase *, 4> Facts, Frees;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (memannot::isMemStoreIntoFact(CB))
+        Facts.push_back(CB);
+      if (CB->getOperandBundle(memannot::TagFree))
+        Frees.push_back(CB);
+    }
+    for (CallBase *Fact : Facts) {
+      auto OB = Fact->getOperandBundle(memannot::TagStoreInto);
+      if (!OB || OB->Inputs.size() < 2)
+        continue;
+      Value *Dest = OB->Inputs[0];
+      Value *Cap = OB->Inputs[1];
+      if (!Dest || !Cap)
+        continue;
+      bool AnyEnd = false;
+      // Consuming call first: mem.free of the referent may live in a
+      // callee (eat_u64 / drop of a Box). Only a call known to free that
+      // box (drop / dealloc) is the source end of life; Box::leak is not.
+      SmallVector<Instruction *, 4> Ends;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+          continue;
+        if (!DT.dominates(Fact, CB))
+          continue;
+        if (callConsumesCap(CB, Cap, &DT))
+          Ends.push_back(CB);
+      }
+      for (CallBase *Fr : Frees) {
+        auto FB = Fr->getOperandBundle(memannot::TagFree);
+        if (!FB || FB->Inputs.empty())
+          continue;
+        Value *Buf = FB->Inputs[0];
+        if (!DT.dominates(Fact, Fr))
+          continue;
+        if (!capRefersToFreed(Cap, Buf, &DT))
+          continue;
+        Ends.push_back(Fr);
+      }
+      for (Instruction *At : Ends) {
+        AnyEnd = true;
+        if (!destReadyAt(Dest, At, DT) || !loanValAvailable(Cap, At, DT)) {
+          ++StoreIntoSkippedUnready;
+          continue;
+        }
+        if (destReassignedBetween(Dest, Fact, At, DT)) {
+          ++StoreIntoSkippedReassigned;
+          continue;
+        }
+        PendingStoreInto.push_back({At, Dest, Cap});
+      }
+      if (!AnyEnd)
+        ++StoreIntoSkippedUnready;
+    }
+  }
+
+  // Single-slot wipe immediately before mem.free: load dest, exact-equal to
+  // cap, store null through the ready dest pointer. Not a buffer scan.
+  void storeIntoEmit() {
+    Type *CapTy = PointerType::get(M.getContext(), 200);
+    for (const StoreIntoWipe &S : PendingStoreInto) {
+      Instruction *At = S.Free;
+      if (!At || !At->getParent() || !S.Dest || !S.Cap)
+        continue;
+      BasicBlock *Cont =
+          SplitBlock(At->getParent(), At->getIterator(),
+                     static_cast<DominatorTree *>(nullptr), nullptr, nullptr,
+                     "storeinto.cont");
+      BasicBlock *Pre = Cont->getSinglePredecessor();
+      Pre->getTerminator()->eraseFromParent();
+      LLVMContext &Ctx = M.getContext();
+      Function *Fn = Cont->getParent();
+      auto *NullBB = BasicBlock::Create(Ctx, "storeinto.null", Fn, Cont);
+      IRBuilder<> B(Pre);
+      Value *Got =
+          B.CreateAlignedLoad(CapTy, S.Dest, Align(16), "storeinto.got");
+      Value *Eq =
+          B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact), {Got, S.Cap});
+      B.CreateCondBr(Eq, NullBB, Cont);
+      B.SetInsertPoint(NullBB);
+      auto *St = B.CreateAlignedStore(
+          ConstantPointerNull::get(cast<PointerType>(CapTy)), S.Dest, Align(16),
+          InvVolatile);
+      markClear(St, "cheri_inv_store_into");
+      B.CreateBr(Cont);
+      ++StoreIntoNulls;
+    }
+    PendingStoreInto.clear();
+  }
+
   void loanClears(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     Type *CapTy = PointerType::get(M.getContext(), 200);
@@ -2728,27 +3224,33 @@ struct Inv {
     // capability slot for the range checks.
     bool HasMove = false;
     bool HasLoanInto = false;
-    if (Loan)
-      for (Instruction &I : instructions(F)) {
-        if (memannot::isMemMoveFact(&I))
-          HasMove = true;
-        if (memannot::isMemLoanIntoFact(&I)) {
-          ++LoanIntoFacts;
-          HasLoanInto = true;
-        } else if (memannot::isMemLoanIntoValFact(&I)) {
-          ++LoanIntoValFacts;
-          HasLoanInto = true;
-        } else if (auto *CB = dyn_cast<CallBase>(&I))
-          if (memannot::isMemFact(CB) &&
-              CB->getOperandBundle(memannot::TagLoanIntoPromoted))
-            ++LoanIntoSkippedPromoted;
+    bool HasStoreInto = false;
+    for (Instruction &I : instructions(F)) {
+      if (memannot::isMemStoreIntoFact(&I)) {
+        ++StoreIntoFacts;
+        HasStoreInto = true;
       }
+      if (!Loan)
+        continue;
+      if (memannot::isMemMoveFact(&I))
+        HasMove = true;
+      if (memannot::isMemLoanIntoFact(&I)) {
+        ++LoanIntoFacts;
+        HasLoanInto = true;
+      } else if (memannot::isMemLoanIntoValFact(&I)) {
+        ++LoanIntoValFacts;
+        HasLoanInto = true;
+      } else if (auto *CB = dyn_cast<CallBase>(&I))
+        if (memannot::isMemFact(CB) &&
+            CB->getOperandBundle(memannot::TagLoanIntoPromoted))
+          ++LoanIntoSkippedPromoted;
+    }
     bool RegFree = InvCapReg && (Free || AFLog);
     bool RegScope = InvCapReg && Scope;
     // M7.1b: a loan_into fact is scanned even when this function has no other
     // frame capability slot. A promoted marker is only counted.
     if (CapSlots.empty() && WideByAlloca.empty() && !RegFree && !RegScope &&
-        !HasMove && !HasLoanInto)
+        !HasMove && !HasLoanInto && !HasStoreInto)
       return;
     DominatorTree DT(F);
     buildCallReach(F);
@@ -2766,6 +3268,8 @@ struct Inv {
       loanIntoPlan(F, DT);
       loanIntoValPlan(F, DT);
     }
+    if (HasStoreInto && (Loan || Free))
+      storeIntoPlan(F, DT);
     SmallVector<IntrinsicInst *, 8> Ends;
     SmallVector<CallBase *, 4> Frees;
     for (Instruction &I : instructions(F)) {
@@ -3008,6 +3512,8 @@ struct Inv {
       flogCalls(F, CapSlots, DT); // last DT user: it splits blocks
     if (Loan && !PendingLoanInto.empty())
       loanIntoEmit();
+    if (!PendingStoreInto.empty())
+      storeIntoEmit();
   }
 
   void run() {
@@ -3058,6 +3564,10 @@ struct Inv {
          << " free_dead_checked=" << FreeDeadChecked
          << " free_dead_call_plain=" << FreeDeadCallPlain
          << " free_dead_call_checked=" << FreeDeadCallChecked
+         << " store_into_facts=" << StoreIntoFacts
+         << " store_into_nulls=" << StoreIntoNulls
+         << " store_into_skipped_unready=" << StoreIntoSkippedUnready
+         << " store_into_skipped_reassigned=" << StoreIntoSkippedReassigned
          << "\n";
     }
   }

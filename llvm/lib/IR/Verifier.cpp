@@ -4179,6 +4179,15 @@ void Verifier::visitCallBase(CallBase &Call) {
               Call);
         continue;
       }
+      if (T == memannot::TagStoreInto) {
+        // M7.1d B2a: dest that received a cap copy, and that cap. The late
+        // pass may null dest at the source mem.free.
+        Check(IsFact && In.size() == 2 && IsPtr(In[0]) && IsPtr(In[1]),
+              "\"mem.store_into\" bundle must be (ptr dest, ptr cap) "
+              "on llvm.mem.fact",
+              Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

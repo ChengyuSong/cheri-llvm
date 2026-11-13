@@ -89,6 +89,12 @@ inline constexpr StringRef TagMove = "mem.move";
 inline constexpr StringRef TagLoanInto = "mem.loan_into";
 inline constexpr StringRef TagLoanIntoVal = "mem.loan_into.val";
 inline constexpr StringRef TagLoanIntoPromoted = "mem.loan_into.promoted";
+/// [LLM-generated] M7.1d B2a: "mem.store_into"(ptr dest, ptr cap) on
+/// llvm.mem.fact. rustc named a local destination that received a copy of
+/// cap. The late CHERI pass may null dest at the source mem.free if dest
+/// still holds cap. Not droppable: losing it loses the clear. Generic
+/// passes must preserve dest and cap SSA. No remapping in this slice.
+inline constexpr StringRef TagStoreInto = "mem.store_into";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
@@ -197,6 +203,8 @@ LLVM_ABI bool isMemLoanIntoFact(const Instruction *I);
 /// [LLM-generated] M7.1b: "mem.loan_into.val"(ptr buf_cap, ptr val, i64 id).
 /// The owner slot was promoted; \c buf_cap is the buffer pointer itself.
 LLVM_ABI bool isMemLoanIntoValFact(const Instruction *I);
+/// [LLM-generated] M7.1d B2a: llvm.mem.fact ["mem.store_into"(ptr dest, ptr cap)].
+LLVM_ABI bool isMemStoreIntoFact(const Instruction *I);
 /// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
 /// Header copies must not be reordered across that program point.
 LLVM_ABI const Value *slotClobber(const Instruction *I);
