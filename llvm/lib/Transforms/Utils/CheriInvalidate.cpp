@@ -2310,17 +2310,45 @@ struct Inv {
     if (getUnderlyingObject(Cap) == getUnderlyingObject(FreeBuf))
       return true;
     SmallPtrSet<const Value *, 8> FromCap, FromFree;
+    auto PeelClaim = [](Value *V) -> Value * {
+      while (V) {
+        V = V->stripPointerCasts();
+        if (!memannot::isMemClaim(V))
+          break;
+        V = cast<CallBase>(V)->getArgOperand(0);
+      }
+      return V;
+    };
     auto Collect = [&](Value *Start, SmallPtrSetImpl<const Value *> &Out) {
       SmallVector<Value *, 8> Work{Start};
       while (!Work.empty()) {
-        Value *X = Work.pop_back_val()->stripPointerCasts();
-        if (!Out.insert(X).second)
+        Value *X = PeelClaim(Work.pop_back_val());
+        if (!X || !Out.insert(X).second)
           continue;
         if (auto *G = dyn_cast<GetElementPtrInst>(X))
           Work.push_back(G->getPointerOperand());
-        else if (auto *LI = dyn_cast<LoadInst>(X))
+        else if (auto *LI = dyn_cast<LoadInst>(X)) {
           Work.push_back(LI->getPointerOperand());
-        else if (auto *PN = dyn_cast<PHINode>(X))
+          // Store-to-load: a ptr::read dest holds a copy of a cap stored
+          // to the same slot. Peel claims so vec GEP + mem.claim match.
+          if (Function *Fn = LI->getFunction()) {
+            int64_t LOff = 0;
+            Value *LBase = GetPointerBaseWithConstantOffset(
+                PeelClaim(LI->getPointerOperand()), LOff, DL);
+            if (LBase) {
+              for (Instruction &I : instructions(*Fn)) {
+                auto *SI = dyn_cast<StoreInst>(&I);
+                if (!SI)
+                  continue;
+                int64_t SOff = 0;
+                Value *SBase = GetPointerBaseWithConstantOffset(
+                    PeelClaim(SI->getPointerOperand()), SOff, DL);
+                if (SBase && SBase == LBase && SOff == LOff)
+                  Work.push_back(SI->getValueOperand());
+              }
+            }
+          }
+        } else if (auto *PN = dyn_cast<PHINode>(X))
           for (Value *In : PN->incoming_values())
             Work.push_back(In);
         else if (auto *Sel = dyn_cast<SelectInst>(X)) {
@@ -2358,8 +2386,9 @@ struct Inv {
       return false;
     if (!loanValAvailable(Dest, At, DT))
       return false;
-    // No ra/sp register clears. A store through a ready alloca/GEP/named
-    // SSA (csc zero, 0(reg) or off(sp) of a slot) is the approved shape.
+    // No ra/sp register clears. B2a may only wipe a ready named local:
+    // an alloca or a GEP of one (csc zero, 0(reg) / off(sp) of that slot).
+    // Heap cells (Box::leak, Vec buffers) and statics are not B2a dests.
     if (auto *II = dyn_cast<IntrinsicInst>(Dest)) {
       switch (II->getIntrinsicID()) {
       case Intrinsic::returnaddress:
@@ -2370,7 +2399,9 @@ struct Inv {
         break;
       }
     }
-    return true;
+    AllocaInst *Slot = nullptr;
+    int64_t Off = 0;
+    return frameSlot(Dest, Slot, Off);
   }
 
   bool destReassignedBetween(Value *Dest, Instruction *From, Instruction *To,

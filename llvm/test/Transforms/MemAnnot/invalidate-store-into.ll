@@ -123,15 +123,53 @@ define void @consume_box(ptr addrspace(200) %buf) {
 ; FLAGOFF: call {{.*}}@eat_box(
 ; FLAGOFF: ret void
 
+declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64)
+
+; Heap dest (Box::new payload / Vec buffer): ready but not a named local.
+; B2a must not wipe it, even at a consume of the referent.
+define void @heap_dest(ptr addrspace(200) %buf, ptr addrspace(200) %cell) {
+  store ptr addrspace(200) %buf, ptr addrspace(200) %cell, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %cell, ptr addrspace(200) %buf) ]
+  call void @eat_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  ret void
+}
+; CHECK-LABEL: define void @heap_dest(
+; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: call {{.*}}@eat_box(
+; CHECK: ret void
+
+; ptr::read dest: the fact cap is a load of a slot that stored a claim of
+; the referent. Wipe the named local at the consume call.
+define void @copy_local(ptr addrspace(200) %buf) {
+  %slot = alloca ptr addrspace(200), align 16, addrspace(200)
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  %claimed = call ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200) %buf, i64 8, i64 261)
+  store ptr addrspace(200) %claimed, ptr addrspace(200) %slot, align 16
+  %copy = load ptr addrspace(200), ptr addrspace(200) %slot, align 16
+  store ptr addrspace(200) %copy, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %copy) ]
+  call void @eat_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  ret void
+}
+; CHECK-LABEL: define void @copy_local(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %dest, align 16
+; CHECK: call {{.*}}@eat_box(
+; CHECK: ret void
+; FLAGOFF-LABEL: define void @copy_local(
+; FLAGOFF-NOT: @llvm.cheri.cap.equal.exact
+; FLAGOFF: call {{.*}}@eat_box(
+; FLAGOFF: ret void
+
 define void @none_end() {
   ret void
 }
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; STATS: store_into_facts=5
-; STATS-SAME: store_into_nulls=3
-; STATS-SAME: store_into_skipped_unready=1
+; STATS: store_into_facts=7
+; STATS-SAME: store_into_nulls=4
+; STATS-SAME: store_into_skipped_unready=2
 ; STATS-SAME: store_into_skipped_reassigned=1
-; STATS-OFF: store_into_facts=5
+; STATS-OFF: store_into_facts=7
 ; STATS-OFF-SAME: store_into_nulls=0
