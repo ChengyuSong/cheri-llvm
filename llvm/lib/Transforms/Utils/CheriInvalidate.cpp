@@ -2346,7 +2346,7 @@ struct Inv {
       Value *A = C->getArgOperand(I);
       if (!capRefersToFreed(Cap, A))
         continue;
-      if (C->paramHasAttr(I, "mem.box_family"))
+      if (C->getParamAttr(I, "mem.box_family").isValid())
         return true;
     }
     return false;
