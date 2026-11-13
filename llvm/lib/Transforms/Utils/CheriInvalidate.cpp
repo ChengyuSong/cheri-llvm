@@ -2394,9 +2394,13 @@ struct Inv {
     auto Resolve = [&](Value &Idx, APInt &Val) -> bool {
       int64_t K = 0;
       auto *LI = dyn_cast<LoadInst>(&Idx);
-      if (!LI || !availableConstInt(LI, DT, K))
+      if (!LI || !LI->getType()->isIntegerTy() ||
+          !availableConstInt(LI, DT, K))
         return false;
-      Val = APInt(Val.getBitWidth(), K, true);
+      // accumulateConstantOffset passes a default-constructed APInt
+      // (bitwidth 1). Size the result to the index type; the caller
+      // sextOrTruncs it to the pointer-index width.
+      Val = APInt(Idx.getType()->getIntegerBitWidth(), K, true);
       return true;
     };
     if (!GEP->accumulateConstantOffset(DL, APOff, Resolve))
