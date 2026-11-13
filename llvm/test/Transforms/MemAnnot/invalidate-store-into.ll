@@ -102,15 +102,36 @@ do_free:
 ; CHECK-NOT: store volatile ptr addrspace(200) null
 ; CHECK: ret void
 
+declare void @eat_box(ptr addrspace(200))
+
+; The source free lives in a callee. The caller moves an owned Box
+; (mem.box_family) into that call; the wipe is immediately before it.
+define void @consume_box(ptr addrspace(200) %buf) {
+  %dest = alloca ptr addrspace(200), align 16, addrspace(200)
+  store ptr addrspace(200) %buf, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %buf) ]
+  call void @eat_box(ptr addrspace(200) "mem.box_family"="__rust_alloc" %buf)
+  ret void
+}
+; CHECK-LABEL: define void @consume_box(
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %dest, align 16
+; CHECK: call {{.*}}@eat_box(
+; CHECK: ret void
+; FLAGOFF-LABEL: define void @consume_box(
+; FLAGOFF-NOT: @llvm.cheri.cap.equal.exact
+; FLAGOFF: call {{.*}}@eat_box(
+; FLAGOFF: ret void
+
 define void @none_end() {
   ret void
 }
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; STATS: store_into_facts=4
-; STATS-SAME: store_into_nulls=2
+; STATS: store_into_facts=5
+; STATS-SAME: store_into_nulls=3
 ; STATS-SAME: store_into_skipped_unready=1
 ; STATS-SAME: store_into_skipped_reassigned=1
-; STATS-OFF: store_into_facts=4
+; STATS-OFF: store_into_facts=5
 ; STATS-OFF-SAME: store_into_nulls=0

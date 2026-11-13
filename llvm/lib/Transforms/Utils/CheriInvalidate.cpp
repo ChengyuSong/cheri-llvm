@@ -2337,6 +2337,21 @@ struct Inv {
     return false;
   }
 
+  // Callee takes the referent as an owned Box (mem.box_family), so this
+  // call is the source end of life even when mem.free is in the callee.
+  bool callConsumesCap(const CallBase *C, Value *Cap) const {
+    if (!C || !Cap)
+      return false;
+    for (unsigned I = 0, E = C->arg_size(); I != E; ++I) {
+      Value *A = C->getArgOperand(I);
+      if (!capRefersToFreed(Cap, A))
+        continue;
+      if (C->paramHasAttr(I, "mem.box_family"))
+        return true;
+    }
+    return false;
+  }
+
   bool destReadyAt(Value *Dest, Instruction *At, DominatorTree &DT) const {
     if (!Dest || !Dest->getType()->isPointerTy() ||
         !DL.isFatPointer(Dest->getType()))
@@ -2404,7 +2419,20 @@ struct Inv {
       Value *Cap = OB->Inputs[1];
       if (!Dest || !Cap)
         continue;
-      bool AnyFree = false;
+      bool AnyEnd = false;
+      // Consuming call first: mem.free of the referent may live in a
+      // callee (eat_u64 / drop of a Box). A "mem.box_family" argument
+      // that is this cap is the source end of life in this function.
+      SmallVector<Instruction *, 4> Ends;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+          continue;
+        if (!DT.dominates(Fact, CB))
+          continue;
+        if (callConsumesCap(CB, Cap))
+          Ends.push_back(CB);
+      }
       for (CallBase *Fr : Frees) {
         auto FB = Fr->getOperandBundle(memannot::TagFree);
         if (!FB || FB->Inputs.empty())
@@ -2414,18 +2442,21 @@ struct Inv {
           continue;
         if (!capRefersToFreed(Cap, Buf))
           continue;
-        AnyFree = true;
-        if (!destReadyAt(Dest, Fr, DT) || !loanValAvailable(Cap, Fr, DT)) {
+        Ends.push_back(Fr);
+      }
+      for (Instruction *At : Ends) {
+        AnyEnd = true;
+        if (!destReadyAt(Dest, At, DT) || !loanValAvailable(Cap, At, DT)) {
           ++StoreIntoSkippedUnready;
           continue;
         }
-        if (destReassignedBetween(Dest, Fact, Fr, DT)) {
+        if (destReassignedBetween(Dest, Fact, At, DT)) {
           ++StoreIntoSkippedReassigned;
           continue;
         }
-        PendingStoreInto.push_back({Fr, Dest, Cap});
+        PendingStoreInto.push_back({At, Dest, Cap});
       }
-      if (!AnyFree)
+      if (!AnyEnd)
         ++StoreIntoSkippedUnready;
     }
   }
