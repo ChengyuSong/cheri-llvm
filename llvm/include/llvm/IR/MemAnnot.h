@@ -101,6 +101,15 @@ inline constexpr StringRef TagStoreInto = "mem.store_into";
 /// GEP(i8, base, off) at the source mem.free if both are ready. The dest GEP
 /// is not a fact operand, so mid-end need not keep it alive.
 inline constexpr StringRef TagStoreIntoSlot = "mem.store_into_slot";
+/// [LLM-generated] M7.1d B3a: parameter attributes on cap arguments of an
+/// extern "C" call. "mem.ffi_borrow" means the callee must not stash a
+/// usable copy; the late CHERI pass may drop Global on that argument.
+/// "mem.ffi_retain" is an ownership hand-off; do not narrow. Generic
+/// mid-end must preserve these string attributes. Not droppable in the
+/// sense that losing borrow loses the narrow; losing retain is fail-safe
+/// (no narrow).
+inline constexpr StringRef TagFfiBorrow = "mem.ffi_borrow";
+inline constexpr StringRef TagFfiRetain = "mem.ffi_retain";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
