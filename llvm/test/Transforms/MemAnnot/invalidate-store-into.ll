@@ -137,7 +137,8 @@ define void @consume_box(ptr addrspace(200) %buf) {
 declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64 immarg)
 
 ; Heap dest (Box::new payload / Vec buffer): ready but not a named local.
-; B2a must not wipe it, even at a consume of the referent.
+; B2c-1: a ready heap cell (argument base, constant offset 0) is rematerialised
+; and wiped at the consume of the referent. Statics remain skipped.
 define void @heap_dest(ptr addrspace(200) %buf, ptr addrspace(200) %cell) {
   store ptr addrspace(200) %buf, ptr addrspace(200) %cell, align 16
   call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %cell, ptr addrspace(200) %buf) ]
@@ -145,7 +146,8 @@ define void @heap_dest(ptr addrspace(200) %buf, ptr addrspace(200) %cell) {
   ret void
 }
 ; CHECK-LABEL: define void @heap_dest(
-; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %{{[^,]+}}, align 16
 ; CHECK: call {{.*}}@eat_box(
 ; CHECK: ret void
 
@@ -253,8 +255,8 @@ define void @none_end() {
 ; NONE: define void @none_end(
 
 ; STATS: store_into_facts=11
-; STATS-SAME: store_into_nulls=6
-; STATS-SAME: store_into_skipped_unready=4
+; STATS-SAME: store_into_nulls=7
+; STATS-SAME: store_into_skipped_unready=3
 ; STATS-SAME: store_into_skipped_reassigned=1
 ; STATS-OFF: store_into_facts=11
 ; STATS-OFF-SAME: store_into_nulls=0

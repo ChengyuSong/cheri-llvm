@@ -39,8 +39,46 @@ exit:
 }
 ; LICM-LABEL: define void @nohoist(
 ; LICM: entry:
-; LICM-NOT: mem.store_into
+; LICM-NOT: "mem.store_into"(
 ; LICM: loop:
 ; LICM: call {{.*}}@llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %dest, ptr addrspace(200) %cap) ]
 ; LICM: exit:
-; LICM-NOT: mem.store_into
+; LICM-NOT: "mem.store_into"(
+
+define void @twice_slot(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) {
+  %dest = getelementptr inbounds i8, ptr addrspace(200) %base, i64 %off
+  store ptr addrspace(200) %cap, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+  store ptr addrspace(200) %cap, ptr addrspace(200) %dest, align 16
+  call void @llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+  ret void
+}
+; IC-LABEL: define void @twice_slot(
+; IC: call {{.*}}@llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+; IC: store ptr addrspace(200) %cap, ptr addrspace(200) %dest, align 16
+; IC: call {{.*}}@llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+; IC-NOT: mem.dropped
+
+define void @nohoist_slot(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap, i32 %n) {
+entry:
+  %dest = getelementptr inbounds i8, ptr addrspace(200) %base, i64 %off
+  store ptr addrspace(200) %cap, ptr addrspace(200) %dest, align 16
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %v = load ptr addrspace(200), ptr addrspace(200) %dest, align 16
+  call void @use(ptr addrspace(200) %v)
+  call void @llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+  %i1 = add i32 %i, 1
+  %c = icmp ult i32 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+; LICM-LABEL: define void @nohoist_slot(
+; LICM: entry:
+; LICM-NOT: "mem.store_into_slot"(
+; LICM: loop:
+; LICM: call {{.*}}@llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) %base, i64 %off, ptr addrspace(200) %cap) ]
+; LICM: exit:
+; LICM-NOT: "mem.store_into_slot"(

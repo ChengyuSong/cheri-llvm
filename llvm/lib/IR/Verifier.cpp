@@ -4188,6 +4188,15 @@ void Verifier::visitCallBase(CallBase &Call) {
               Call);
         continue;
       }
+      if (T == memannot::TagStoreIntoSlot) {
+        // M7.1d B2c: base of an indexed dest, byte offset, and the cap.
+        Check(IsFact && In.size() == 3 && IsPtr(In[0]) && IsInt(In[1]) &&
+                  In[1]->getType()->isIntegerTy(64) && IsPtr(In[2]),
+              "\"mem.store_into_slot\" bundle must be "
+              "(ptr base, i64 off, ptr cap) on llvm.mem.fact",
+              Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

@@ -47,6 +47,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -306,7 +307,16 @@ struct Inv {
   SmallVector<LoanIntoScan, 4> PendingLoanInto;
   struct StoreIntoWipe {
     Instruction *Free = nullptr;
+    // B2a: a ready dest pointer used as-is. B2c: rematerialise
+    // GEP(i8, Base, Index*Scale+Add) at the free. If BaseReload / IdxReload
+    // are set, load those addresses first (the SSA did not dominate).
     Value *Dest = nullptr;
+    Value *Base = nullptr;
+    Value *Index = nullptr;
+    Value *BaseReload = nullptr;
+    Value *IdxReload = nullptr;
+    int64_t Scale = 1;
+    int64_t Add = 0;
     Value *Cap = nullptr;
   };
   SmallVector<StoreIntoWipe, 4> PendingStoreInto;
@@ -2437,7 +2447,7 @@ struct Inv {
       int64_t GOff = 0;
       if (gepConstByteOffset(GEP, GOff, DT)) {
         COff += GOff;
-        Base = peelRepresent(GEP->getPointerOperand());
+        Base = peelRepresent(const_cast<Value *>(GEP->getPointerOperand()));
         int64_t Inner = 0;
         Value *InnerBase = GetPointerBaseWithConstantOffset(Base, Inner, DL);
         if (InnerBase) {
@@ -2611,6 +2621,295 @@ struct Inv {
     return false;
   }
 
+  // Integer (offset) available at At: a constant, an SSA that dominates At,
+  // or a load that can be rematerialised from a ready, unreassigned address.
+  bool idxReadyAt(Value *Idx, Instruction *At, DominatorTree &DT) const {
+    if (!Idx || !Idx->getType()->isIntegerTy())
+      return false;
+    if (isa<Constant>(Idx))
+      return true;
+    if (auto *I = dyn_cast<Instruction>(Idx)) {
+      if (DT.dominates(I, At))
+        return true;
+      auto *LI = dyn_cast<LoadInst>(I);
+      if (!LI)
+        return false;
+      Value *P = LI->getPointerOperand();
+      if (!addrReloadable(P, LI, At, DT))
+        return false;
+      return true;
+    }
+    return true;
+  }
+
+  // B2c does not wipe static / global destinations (out of this slice).
+  bool isStaticBase(Value *Base) const {
+    if (!Base)
+      return false;
+    Value *P = peelRepresent(Base);
+    if (!P)
+      return false;
+    if (isa<GlobalValue>(P))
+      return true;
+    return isa<GlobalValue>(getUnderlyingObject(P));
+  }
+
+  // Pointer available at At, or reloadable from a ready frame slot.
+  bool baseReadyAt(Value *Base, Instruction *At, DominatorTree &DT) const {
+    if (!Base || !Base->getType()->isPointerTy() ||
+        !DL.isFatPointer(Base->getType()))
+      return false;
+    Value *P = peelRepresent(Base);
+    if (!P)
+      return false;
+    if (auto *II = dyn_cast<IntrinsicInst>(P)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::returnaddress:
+      case Intrinsic::addressofreturnaddress:
+      case Intrinsic::sponentry:
+        return false;
+      default:
+        break;
+      }
+    }
+    if (loanValAvailable(P, At, DT))
+      return true;
+    auto *LI = dyn_cast<LoadInst>(P);
+    if (!LI)
+      return false;
+    return addrReloadable(LI->getPointerOperand(), LI, At, DT);
+  }
+
+  bool addrReloadable(Value *Addr, Instruction *From, Instruction *At,
+                      DominatorTree &DT) const {
+    if (!Addr || !destReadyAt(Addr, At, DT))
+      return false;
+    return !destReassignedBetween(Addr, From, At, DT);
+  }
+
+  // The heap buffer pointed to by Base may have moved (Vec realloc / a store
+  // to the pointer field) between From and To.
+  bool bufferMayMove(Value *Base, Instruction *From, Instruction *To,
+                     DominatorTree &DT) const {
+    if (!Base || !From || !To)
+      return false;
+    Value *P = peelRepresent(Base);
+    int64_t Off = 0;
+    AllocaInst *A = nullptr;
+    if (frameSlot(P, A, Off))
+      return false; // the base is the local array itself
+    auto *LI = dyn_cast<LoadInst>(P);
+    if (LI && destReassignedBetween(LI->getPointerOperand(), From, To, DT))
+      return true;
+    Value *Origin = P;
+    int64_t FOff = 0;
+    if (LI) {
+      SlotId S = identifySlot(LI->getPointerOperand(), &DT);
+      if (S.valid())
+        Origin = S.Origin;
+      else {
+        Value *LB = GetPointerBaseWithConstantOffset(LI->getPointerOperand(),
+                                                     FOff, DL);
+        if (LB)
+          Origin = peelRepresent(LB);
+      }
+    }
+    Function *Fn = To->getFunction();
+    for (Instruction &I : instructions(*Fn)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+        continue;
+      if (!dominatesBetween(From, CB, To, DT))
+        continue;
+      Function *C = CB->getCalledFunction();
+      StringRef N = C ? C->getName() : StringRef();
+      if (!N.contains("realloc") && !N.contains("try_reserve") &&
+          !N.contains("try_grow") && !N.contains("shrink_to") &&
+          !N.contains("reserve") && !N.contains("grow"))
+        continue;
+      for (Value *Arg : CB->args()) {
+        if (!Arg || !Arg->getType()->isPointerTy())
+          continue;
+        if (peelRepresent(Arg) == Origin || mayBeThisBuffer(Arg, Origin) ||
+            mayBeThisBuffer(Origin, Arg))
+          return true;
+        if (getUnderlyingObject(Arg) == getUnderlyingObject(Origin))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // Decode a GEP that has at most one variable index into Base + Index*Scale+Add.
+  bool gepToSlot(const GEPOperator *GEP, Value *&Base, Value *&Index,
+                 int64_t &Scale, int64_t &Add,
+                 const DominatorTree *DT) const {
+    if (!GEP)
+      return false;
+    int64_t COff = 0;
+    if (gepConstByteOffset(GEP, COff, DT)) {
+      Base = peelRepresent(const_cast<Value *>(GEP->getPointerOperand()));
+      int64_t Inner = 0;
+      Value *IB = GetPointerBaseWithConstantOffset(Base, Inner, DL);
+      if (IB) {
+        COff += Inner;
+        Base = peelRepresent(IB);
+      }
+      Index = ConstantInt::get(Type::getInt64Ty(GEP->getContext()), 0, true);
+      Scale = 1;
+      Add = COff;
+      return Base != nullptr;
+    }
+    Value *Var = nullptr;
+    int64_t VarStride = 0;
+    int64_t Const = 0;
+    auto GTI = gep_type_begin(GEP);
+    for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I, ++GTI) {
+      Value *Idx = *I;
+      if (StructType *ST = GTI.getStructTypeOrNull()) {
+        auto *CI = dyn_cast<ConstantInt>(Idx);
+        if (!CI)
+          return false;
+        Const += DL.getStructLayout(ST)->getElementOffset(CI->getZExtValue());
+        continue;
+      }
+      int64_t Stride = (int64_t)GTI.getSequentialElementStride(DL).getFixedValue();
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        Const += CI->getSExtValue() * Stride;
+        continue;
+      }
+      if (Var)
+        return false;
+      Var = Idx;
+      VarStride = Stride;
+    }
+    Base = peelRepresent(const_cast<Value *>(GEP->getPointerOperand()));
+    int64_t Inner = 0;
+    Value *IB = GetPointerBaseWithConstantOffset(Base, Inner, DL);
+    if (IB && !isa<GEPOperator>(IB)) {
+      Const += Inner;
+      Base = peelRepresent(IB);
+    }
+    if (!Base)
+      return false;
+    if (!Var) {
+      Index = ConstantInt::get(Type::getInt64Ty(GEP->getContext()), 0, true);
+      Scale = 1;
+      Add = Const;
+      return true;
+    }
+    Index = Var;
+    Scale = VarStride;
+    Add = Const;
+    return true;
+  }
+
+  // Peel a dest address to (Base, Index*Scale+Add). True even for offset 0
+  // (the dest is Base itself).
+  bool destToSlot(Value *Dest, Value *&Base, Value *&Index, int64_t &Scale,
+                  int64_t &Add, const DominatorTree *DT) const {
+    Dest = peelRepresent(Dest);
+    if (!Dest)
+      return false;
+    int64_t COff = 0;
+    Value *B = GetPointerBaseWithConstantOffset(Dest, COff, DL);
+    B = peelRepresent(B);
+    if (auto *GEP = dyn_cast<GEPOperator>(B)) {
+      if (gepToSlot(GEP, Base, Index, Scale, Add, DT)) {
+        Add += COff;
+        return true;
+      }
+      return false;
+    }
+    Base = B ? B : Dest;
+    Index = ConstantInt::get(Type::getInt64Ty(Dest->getContext()), 0, true);
+    Scale = 1;
+    Add = COff;
+    return Base != nullptr;
+  }
+
+  bool slotAddrReady(Value *Base, Value *Index, int64_t /*Scale*/, int64_t /*Add*/,
+                     Instruction *At, DominatorTree &DT) const {
+    return baseReadyAt(Base, At, DT) && idxReadyAt(Index, At, DT);
+  }
+
+  bool slotReassignedBetween(Value *Base, Value *Index, int64_t Scale, int64_t Add,
+                             Instruction *From, Instruction *To,
+                             DominatorTree &DT) const {
+    Function *Fn = To->getFunction();
+    for (Instruction &I : instructions(*Fn)) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI)
+        continue;
+      if (!dominatesBetween(From, SI, To, DT))
+        continue;
+      Value *PB = nullptr, *PI = nullptr;
+      int64_t PS = 1, PA = 0;
+      if (!destToSlot(SI->getPointerOperand(), PB, PI, PS, PA, &DT))
+        continue;
+      if (peelRepresent(PB) != peelRepresent(Base))
+        continue;
+      if (Scale == PS && Add == PA && (PI == Index ||
+                                       (isa<ConstantInt>(PI) && isa<ConstantInt>(Index) &&
+                                        cast<ConstantInt>(PI)->getSExtValue() ==
+                                            cast<ConstantInt>(Index)->getSExtValue())))
+        return true;
+    }
+    return false;
+  }
+
+  Value *materializeBase(IRBuilder<> &B, Value *Base, Instruction *At,
+                         DominatorTree &DT) const {
+    Value *P = peelRepresent(Base);
+    if (!P)
+      return nullptr;
+    if (loanValAvailable(P, At, DT))
+      return P;
+    auto *LI = dyn_cast<LoadInst>(P);
+    if (!LI)
+      return nullptr;
+    Value *Addr = LI->getPointerOperand();
+    if (!addrReloadable(Addr, LI, At, DT))
+      return nullptr;
+    return B.CreateAlignedLoad(LI->getType(), Addr, LI->getAlign(),
+                               "storeinto.base");
+  }
+
+  Value *materializeIdx(IRBuilder<> &B, Value *Idx, Instruction *At,
+                        DominatorTree &DT) const {
+    if (!Idx)
+      return nullptr;
+    if (isa<Constant>(Idx) || !isa<Instruction>(Idx) ||
+        DT.dominates(cast<Instruction>(Idx), At))
+      return Idx;
+    auto *LI = dyn_cast<LoadInst>(Idx);
+    if (!LI)
+      return nullptr;
+    Value *Addr = LI->getPointerOperand();
+    if (!addrReloadable(Addr, LI, At, DT))
+      return nullptr;
+    return B.CreateAlignedLoad(LI->getType(), Addr, LI->getAlign(),
+                               "storeinto.idx");
+  }
+
+  Value *rematerializeSlot(IRBuilder<> &B, Value *Base, Value *Index,
+                           int64_t Scale, int64_t Add, Instruction *At,
+                           DominatorTree &DT) const {
+    Value *MB = materializeBase(B, Base, At, DT);
+    Value *MI = materializeIdx(B, Index, At, DT);
+    if (!MB || !MI)
+      return nullptr;
+    Type *I64 = B.getInt64Ty();
+    Value *Off = MI;
+    if (Off->getType() != I64)
+      Off = B.CreateSExtOrTrunc(Off, I64, "storeinto.off");
+    if (Scale != 1)
+      Off = B.CreateMul(Off, ConstantInt::get(I64, Scale, true), "storeinto.scl");
+    if (Add)
+      Off = B.CreateAdd(Off, ConstantInt::get(I64, Add, true), "storeinto.add");
+    return B.CreateInBoundsGEP(B.getInt8Ty(), MB, Off, "storeinto.slot");
+  }
+
   bool destReadyAt(Value *Dest, Instruction *At, DominatorTree &DT) const {
     if (!Dest || !Dest->getType()->isPointerTy() ||
         !DL.isFatPointer(Dest->getType()))
@@ -2683,6 +2982,48 @@ struct Inv {
     return false;
   }
 
+  void collectStoreIntoEnds(Function &F, DominatorTree &DT, CallBase *Fact,
+                            Value *Cap, SmallVector<CallBase *, 4> &Frees,
+                            SmallVectorImpl<Instruction *> &Ends) const {
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
+        continue;
+      if (!DT.dominates(Fact, CB))
+        continue;
+      if (callConsumesCap(CB, Cap, &DT))
+        Ends.push_back(CB);
+    }
+    for (CallBase *Fr : Frees) {
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      Value *Buf = FB->Inputs[0];
+      if (!DT.dominates(Fact, Fr))
+        continue;
+      if (!capRefersToFreed(Cap, Buf, &DT))
+        continue;
+      Ends.push_back(Fr);
+    }
+  }
+
+  void fillReload(Value *V, Instruction *At, DominatorTree &DT,
+                  Value *&Keep, Value *&Reload) const {
+    Keep = V;
+    Reload = nullptr;
+    if (!V || isa<Constant>(V))
+      return;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || DT.dominates(I, At))
+      return;
+    auto *LI = dyn_cast<LoadInst>(I);
+    if (!LI || !addrReloadable(LI->getPointerOperand(), LI, At, DT)) {
+      Keep = nullptr;
+      return;
+    }
+    Reload = LI->getPointerOperand();
+  }
+
   void storeIntoPlan(Function &F, DominatorTree &DT) {
     if (!InvStoreInto)
       return;
@@ -2691,55 +3032,110 @@ struct Inv {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
-      if (memannot::isMemStoreIntoFact(CB))
+      if (memannot::isMemStoreIntoFact(CB) || memannot::isMemStoreIntoSlotFact(CB))
         Facts.push_back(CB);
       if (CB->getOperandBundle(memannot::TagFree))
         Frees.push_back(CB);
     }
     for (CallBase *Fact : Facts) {
-      auto OB = Fact->getOperandBundle(memannot::TagStoreInto);
-      if (!OB || OB->Inputs.size() < 2)
-        continue;
-      Value *Dest = OB->Inputs[0];
-      Value *Cap = OB->Inputs[1];
-      if (!Dest || !Cap)
+      Value *Dest = nullptr, *Base = nullptr, *Index = nullptr, *Cap = nullptr;
+      int64_t Scale = 1, Add = 0;
+      bool SlotFact = false;
+      if (auto OB = Fact->getOperandBundle(memannot::TagStoreIntoSlot)) {
+        if (OB->Inputs.size() < 3)
+          continue;
+        Base = OB->Inputs[0];
+        Index = OB->Inputs[1];
+        Cap = OB->Inputs[2];
+        Scale = 1;
+        Add = 0;
+        SlotFact = true;
+      } else {
+        auto SI = Fact->getOperandBundle(memannot::TagStoreInto);
+        if (!SI || SI->Inputs.size() < 2)
+          continue;
+        Dest = SI->Inputs[0];
+        Cap = SI->Inputs[1];
+        // Peel a GEP dest so a heap / variable-index store_into can still
+        // rematerialise at the free (B2c-1/2, existing rustc facts).
+        Value *B = nullptr, *I = nullptr;
+        int64_t Sc = 1, Ad = 0;
+        if (Dest && destToSlot(Dest, B, I, Sc, Ad, &DT)) {
+          AllocaInst *A = nullptr;
+          int64_t FOff = 0;
+          // Keep the B2a dest-SSA path for a constant GEP of an alloca
+          // when that dest is already ready (array_write). Otherwise use
+          // the peeled slot (heap or variable index).
+          bool FrameConst = frameSlot(peelRepresent(Dest), A, FOff) ||
+                            (Ad != 0 && !I && false);
+          (void)FrameConst;
+          if (!frameSlot(peelRepresent(Dest), A, FOff)) {
+            // dest itself is not a frame slot. Try peeled form.
+            Base = B;
+            Index = I;
+            Scale = Sc;
+            Add = Ad;
+            SlotFact = true;
+          } else if (auto *GEP = dyn_cast<GEPOperator>(peelRepresent(Dest))) {
+            // Variable GEP of an alloca (array_add): frameSlot fails on
+            // Dest, so the first frameSlot is false... handled above.
+            (void)GEP;
+          }
+        }
+      }
+      if (!Cap || (SlotFact && (!Base || !Index)) || (!SlotFact && !Dest))
         continue;
       bool AnyEnd = false;
       // Consuming call first: mem.free of the referent may live in a
       // callee (eat_u64 / drop of a Box). Only a call known to free that
       // box (drop / dealloc) is the source end of life; Box::leak is not.
       SmallVector<Instruction *, 4> Ends;
-      for (Instruction &I : instructions(F)) {
-        auto *CB = dyn_cast<CallBase>(&I);
-        if (!CB || memannot::isMemFact(CB) || CB->isLifetimeStartOrEnd())
-          continue;
-        if (!DT.dominates(Fact, CB))
-          continue;
-        if (callConsumesCap(CB, Cap, &DT))
-          Ends.push_back(CB);
-      }
-      for (CallBase *Fr : Frees) {
-        auto FB = Fr->getOperandBundle(memannot::TagFree);
-        if (!FB || FB->Inputs.empty())
-          continue;
-        Value *Buf = FB->Inputs[0];
-        if (!DT.dominates(Fact, Fr))
-          continue;
-        if (!capRefersToFreed(Cap, Buf, &DT))
-          continue;
-        Ends.push_back(Fr);
-      }
+      collectStoreIntoEnds(F, DT, Fact, Cap, Frees, Ends);
       for (Instruction *At : Ends) {
         AnyEnd = true;
-        if (!destReadyAt(Dest, At, DT) || !loanValAvailable(Cap, At, DT)) {
+        if (!loanValAvailable(Cap, At, DT)) {
           ++StoreIntoSkippedUnready;
           continue;
         }
-        if (destReassignedBetween(Dest, Fact, At, DT)) {
-          ++StoreIntoSkippedReassigned;
-          continue;
+        StoreIntoWipe W;
+        W.Free = At;
+        W.Cap = Cap;
+        if (SlotFact) {
+          if (isStaticBase(Base)) {
+            ++StoreIntoSkippedUnready;
+            continue;
+          }
+          if (!slotAddrReady(Base, Index, Scale, Add, At, DT) ||
+              bufferMayMove(Base, Fact, At, DT)) {
+            ++StoreIntoSkippedUnready;
+            continue;
+          }
+          if (slotReassignedBetween(Base, Index, Scale, Add, Fact, At, DT)) {
+            ++StoreIntoSkippedReassigned;
+            continue;
+          }
+          W.Base = Base;
+          W.Index = Index;
+          W.Scale = Scale;
+          W.Add = Add;
+          fillReload(peelRepresent(Base), At, DT, W.Base, W.BaseReload);
+          fillReload(Index, At, DT, W.Index, W.IdxReload);
+          if (!W.Base || !W.Index) {
+            ++StoreIntoSkippedUnready;
+            continue;
+          }
+        } else {
+          if (!destReadyAt(Dest, At, DT)) {
+            ++StoreIntoSkippedUnready;
+            continue;
+          }
+          if (destReassignedBetween(Dest, Fact, At, DT)) {
+            ++StoreIntoSkippedReassigned;
+            continue;
+          }
+          W.Dest = Dest;
         }
-        PendingStoreInto.push_back({At, Dest, Cap});
+        PendingStoreInto.push_back(W);
       }
       if (!AnyEnd)
         ++StoreIntoSkippedUnready;
@@ -2747,12 +3143,14 @@ struct Inv {
   }
 
   // Single-slot wipe immediately before mem.free: load dest, exact-equal to
-  // cap, store null through the ready dest pointer. Not a buffer scan.
+  // cap, store null through the ready dest pointer. Not a buffer scan. A
+  // B2c slot is rematerialised as GEP(i8, base, idx*scale+add).
   void storeIntoEmit() {
     Type *CapTy = PointerType::get(M.getContext(), 200);
+    Type *I64 = Type::getInt64Ty(M.getContext());
     for (const StoreIntoWipe &S : PendingStoreInto) {
       Instruction *At = S.Free;
-      if (!At || !At->getParent() || !S.Dest || !S.Cap)
+      if (!At || !At->getParent() || !S.Cap)
         continue;
       BasicBlock *Cont =
           SplitBlock(At->getParent(), At->getIterator(),
@@ -2764,14 +3162,39 @@ struct Inv {
       Function *Fn = Cont->getParent();
       auto *NullBB = BasicBlock::Create(Ctx, "storeinto.null", Fn, Cont);
       IRBuilder<> B(Pre);
+      Value *Dest = S.Dest;
+      if (!Dest && S.Base && S.Index) {
+        Value *MB = S.Base;
+        if (S.BaseReload)
+          MB = B.CreateAlignedLoad(S.Base->getType(), S.BaseReload, Align(16),
+                                   "storeinto.base");
+        Value *MI = S.Index;
+        if (S.IdxReload)
+          MI = B.CreateAlignedLoad(S.Index->getType(), S.IdxReload, Align(8),
+                                   "storeinto.idx");
+        Value *Off = MI;
+        if (Off->getType() != I64)
+          Off = B.CreateSExtOrTrunc(Off, I64, "storeinto.off");
+        if (S.Scale != 1)
+          Off = B.CreateMul(Off, ConstantInt::get(I64, S.Scale, true),
+                            "storeinto.scl");
+        if (S.Add)
+          Off = B.CreateAdd(Off, ConstantInt::get(I64, S.Add, true),
+                            "storeinto.add");
+        Dest = B.CreateInBoundsGEP(B.getInt8Ty(), MB, Off, "storeinto.slot");
+      }
+      if (!Dest) {
+        B.CreateBr(Cont);
+        continue;
+      }
       Value *Got =
-          B.CreateAlignedLoad(CapTy, S.Dest, Align(16), "storeinto.got");
+          B.CreateAlignedLoad(CapTy, Dest, Align(16), "storeinto.got");
       Value *Eq =
           B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact), {Got, S.Cap});
       B.CreateCondBr(Eq, NullBB, Cont);
       B.SetInsertPoint(NullBB);
       auto *St = B.CreateAlignedStore(
-          ConstantPointerNull::get(cast<PointerType>(CapTy)), S.Dest, Align(16),
+          ConstantPointerNull::get(cast<PointerType>(CapTy)), Dest, Align(16),
           InvVolatile);
       markClear(St, "cheri_inv_store_into");
       B.CreateBr(Cont);
@@ -3226,7 +3649,8 @@ struct Inv {
     bool HasLoanInto = false;
     bool HasStoreInto = false;
     for (Instruction &I : instructions(F)) {
-      if (memannot::isMemStoreIntoFact(&I)) {
+      if (memannot::isMemStoreIntoFact(&I) ||
+          memannot::isMemStoreIntoSlotFact(&I)) {
         ++StoreIntoFacts;
         HasStoreInto = true;
       }
