@@ -95,6 +95,12 @@ inline constexpr StringRef TagLoanIntoPromoted = "mem.loan_into.promoted";
 /// still holds cap. Not droppable: losing it loses the clear. Generic
 /// passes must preserve dest and cap SSA. No remapping in this slice.
 inline constexpr StringRef TagStoreInto = "mem.store_into";
+/// [LLM-generated] M7.1d B2c: "mem.store_into_slot"(ptr base, i64 off, ptr cap)
+/// on llvm.mem.fact. rustc named an indexed / GEP destination as a ready base
+/// plus a byte offset (constant or SSA). The late pass rematerialises
+/// GEP(i8, base, off) at the source mem.free if both are ready. The dest GEP
+/// is not a fact operand, so mid-end need not keep it alive.
+inline constexpr StringRef TagStoreIntoSlot = "mem.store_into_slot";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
@@ -205,6 +211,8 @@ LLVM_ABI bool isMemLoanIntoFact(const Instruction *I);
 LLVM_ABI bool isMemLoanIntoValFact(const Instruction *I);
 /// [LLM-generated] M7.1d B2a: llvm.mem.fact ["mem.store_into"(ptr dest, ptr cap)].
 LLVM_ABI bool isMemStoreIntoFact(const Instruction *I);
+/// [LLM-generated] M7.1d B2c: llvm.mem.fact ["mem.store_into_slot"(ptr base, i64 off, ptr cap)].
+LLVM_ABI bool isMemStoreIntoSlotFact(const Instruction *I);
 /// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
 /// Header copies must not be reordered across that program point.
 LLVM_ABI const Value *slotClobber(const Instruction *I);
