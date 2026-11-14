@@ -190,6 +190,14 @@ static cl::opt<bool> InvStoreInto(
     cl::desc("M7.1d B2a: null a mem.store_into dest at the source mem.free "
              "when dest is a ready fat pointer still holding that cap "
              "(default on; false is byte-identical to 0c127e28)"));
+static cl::opt<bool> InvFfiNarrow(
+    "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
+             "extern C calls (default on; false is byte-identical when rustc "
+             "also emits no fact)"));
+static unsigned FfiBorrowFacts = 0;
+static unsigned FfiNarrows = 0;
+static unsigned FfiRetainSkipped = 0;
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -4021,6 +4029,9 @@ struct Inv {
          << " store_into_nulls=" << StoreIntoNulls
          << " store_into_skipped_unready=" << StoreIntoSkippedUnready
          << " store_into_skipped_reassigned=" << StoreIntoSkippedReassigned
+         << " ffi_borrow_facts=" << FfiBorrowFacts
+         << " ffi_narrows=" << FfiNarrows
+         << " ffi_retain_skipped=" << FfiRetainSkipped
          << "\n";
     }
   }
@@ -4140,6 +4151,49 @@ static void tagMayFreeCalls(Module &M) {
   }
 }
 
+// [LLM-generated] M7.1d B3a. rustc marks cap arguments of an extern "C"
+// call with "mem.ffi_borrow" (callee must not stash) or "mem.ffi_retain"
+// (hand-off). This pass drops Global on borrow arguments with candperm
+// immediately before the call. No dest wipe, no ra/sp clear, no seal.
+// Off with -cheri-invalidate-ffi-narrow=false, or when the whole pass
+// is in "none" mode.
+static void insertFfiNarrow(Module &M) {
+  if (!InvFfiNarrow)
+    return;
+  Type *I64 = Type::getInt64Ty(M.getContext());
+  // ~CHERI_PERM_GLOBAL; GLOBAL is bit 0 (__CHERI_CAP_PERMISSION_GLOBAL__ == 1).
+  Constant *Mask = ConstantInt::get(I64, (uint64_t)-2);
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      for (unsigned i = 0, e = CB->arg_size(); i != e; ++i) {
+        Value *Arg = CB->getArgOperand(i);
+        auto *PTy = dyn_cast<PointerType>(Arg->getType());
+        if (!PTy || PTy->getAddressSpace() != 200)
+          continue;
+        if (CB->getAttributes().hasParamAttr(i, memannot::TagFfiRetain)) {
+          ++FfiRetainSkipped;
+          continue;
+        }
+        if (!CB->getAttributes().hasParamAttr(i, memannot::TagFfiBorrow))
+          continue;
+        ++FfiBorrowFacts;
+        IRBuilder<> B(CB);
+        // Overload is only the integer mask type; the cap type is fixed.
+        Function *And = Intrinsic::getOrInsertDeclaration(
+            &M, Intrinsic::cheri_cap_perms_and, {I64});
+        Value *Narrowed = B.CreateCall(And, {Arg, Mask}, "ffi_borrow");
+        CB->setArgOperand(i, Narrowed);
+        ++FfiNarrows;
+      }
+    }
+  }
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -4178,6 +4232,8 @@ bool memannot::runCheriInvalidate(Module &M) {
     }
   }
   StringRef Mode = InvalidateOpt;
+  if (Mode != "none")
+    insertFfiNarrow(M);
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
   bool SLite = Mode.contains("slite");
