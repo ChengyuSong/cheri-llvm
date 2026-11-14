@@ -2462,14 +2462,43 @@ struct Inv {
     }
     if (!Base)
       return S;
-    if (auto *LI = dyn_cast<LoadInst>(Base)) {
+    // A load from a container field (Vec::ptr). Also a PHI of such loads:
+    // mid-end CSE of an earlier header reload with the post-grow path
+    // turns the store's base into phi(load %v, load %v), which must still
+    // identify as the same field as a later load %v (ptr_read / read_local).
+    auto originFromLoad = [&](Value *V) -> SlotId {
+      SlotId T;
+      V = peelRepresent(V);
+      auto *LI = dyn_cast<LoadInst>(V);
+      if (!LI)
+        return T;
       Value *LP = peelRepresent(LI->getPointerOperand());
       int64_t FOff = 0;
       Value *FBase = GetPointerBaseWithConstantOffset(LP, FOff, DL);
-      S.Origin = FBase ? FBase : LP;
-      S.FieldOff = FBase ? FOff : 0;
-      S.SlotOff = COff;
-      return S;
+      T.Origin = FBase ? FBase : LP;
+      T.FieldOff = FBase ? FOff : 0;
+      return T;
+    };
+    if (auto *LI = dyn_cast<LoadInst>(Base)) {
+      SlotId T = originFromLoad(LI);
+      T.SlotOff = COff;
+      return T;
+    }
+    if (auto *PN = dyn_cast<PHINode>(Base)) {
+      SlotId Common;
+      for (Value *In : PN->incoming_values()) {
+        SlotId T = originFromLoad(In);
+        if (!T.valid())
+          return S;
+        if (!Common.valid())
+          Common = T;
+        else if (Common.Origin != T.Origin || Common.FieldOff != T.FieldOff)
+          return S;
+      }
+      if (!Common.valid())
+        return S;
+      Common.SlotOff = COff;
+      return Common;
     }
     S.Origin = Base;
     S.FieldOff = 0;
