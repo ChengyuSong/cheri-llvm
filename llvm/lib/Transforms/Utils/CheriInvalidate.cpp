@@ -32,8 +32,9 @@
 //     lowered here to a call to an outlined non-volatile helper that
 //     stores a null capability in every 16-byte slot wholly in
 //     [ptr, ptr+len). No ra/sp clears. Off with
-//     -cheri-invalidate-wipe-cap-words=false (and -cheri-invalidate=none
-//     does not plant wipes).
+//     -cheri-invalidate-wipe-cap-words=false and -cheri-invalidate=none
+//     drop the fact and plant no stores. The rustc typic/grow path is
+//     a separate rustc flag (-Zcheri-wipe-cap-words=no).
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -4342,8 +4343,12 @@ static void emitUnrolledWipe(IRBuilder<> &B, Module &M, Value *Ptr,
   B.CreateCall(Side);
 }
 
-static void lowerWipeCapWords(Module &M) {
-  SmallVector<CallBase *, 16> Facts;
+// Collect and erase mem.wipe_cap_words facts without lowering them to
+// stores. Used when the LLVM wipe half is off (the dedicated flag, or
+// -cheri-invalidate=none). The rustc typic path is a separate rustc
+// flag; leaving the fact in the IR is not a substitute for turning
+// that path off, and would let a later viewer treat the fact as live.
+static void collectWipeCapWordsFacts(Module &M, SmallVectorImpl<CallBase *> &Facts) {
   for (Function &Fn : M) {
     if (Fn.isDeclaration() || Fn.getName() == "__cheri_wipe_cap_words")
       continue;
@@ -4352,8 +4357,23 @@ static void lowerWipeCapWords(Module &M) {
         Facts.push_back(cast<CallBase>(&I));
     }
   }
+}
+
+static void dropWipeCapWordsFacts(Module &M) {
+  SmallVector<CallBase *, 16> Facts;
+  collectWipeCapWordsFacts(M, Facts);
+  WipeCapWordsFacts += Facts.size();
+  for (CallBase *CB : Facts)
+    CB->eraseFromParent();
+}
+
+static void lowerWipeCapWords(Module &M) {
+  SmallVector<CallBase *, 16> Facts;
+  collectWipeCapWordsFacts(M, Facts);
   if (!InvWipeCapWords) {
     WipeCapWordsFacts += Facts.size();
+    for (CallBase *CB : Facts)
+      CB->eraseFromParent();
     return;
   }
   const DataLayout &DL = M.getDataLayout();
@@ -4449,7 +4469,12 @@ bool memannot::runCheriInvalidate(Module &M) {
     }
   }
   StringRef Mode = InvalidateOpt;
-  if (Mode != "none") {
+  if (Mode == "none") {
+    // None disables every LLVM invalidation half, including wipe:
+    // drop the fact, do not lower it to stores. rustc typic/grow
+    // still needs -Zcheri-wipe-cap-words=no in the ablation harness.
+    dropWipeCapWordsFacts(M);
+  } else {
     insertFfiNarrow(M);
     lowerWipeCapWords(M);
   }
