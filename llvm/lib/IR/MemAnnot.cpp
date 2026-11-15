@@ -49,6 +49,11 @@ bool memannot::isMemStoreIntoSlotFact(const Instruction *I) {
   return CB && isMemFact(CB) && CB->getOperandBundle(TagStoreIntoSlot);
 }
 
+bool memannot::isMemWipeCapWordsFact(const Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  return CB && isMemFact(CB) && CB->getOperandBundle(TagWipeCapWords);
+}
+
 const Value *memannot::slotClobber(const Instruction *I) {
   auto *CB = dyn_cast<CallBase>(I);
   if (!CB || !isMemFact(CB))

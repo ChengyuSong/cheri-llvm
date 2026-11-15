@@ -4197,6 +4197,17 @@ void Verifier::visitCallBase(CallBase &Call) {
               Call);
         continue;
       }
+      if (T == memannot::TagWipeCapWords) {
+        // M7.2a-w1: heap block being returned and its Layout / capacity
+        // length in bytes. The late pass wipes every wholly-contained
+        // cap-sized word.
+        Check(IsFact && In.size() == 2 && IsPtr(In[0]) && IsInt(In[1]) &&
+                  In[1]->getType()->isIntegerTy(64),
+              "\"mem.wipe_cap_words\" bundle must be "
+              "(ptr base, i64 len) on llvm.mem.fact",
+              Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

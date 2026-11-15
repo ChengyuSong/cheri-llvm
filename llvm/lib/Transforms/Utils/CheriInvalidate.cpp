@@ -28,6 +28,13 @@
 //     skipped_val_freed) instead scans the still-live buffer through the
 //     ready dealloc capability immediately before mem.free, when the loan
 //     is a capability. Off with -cheri-invalidate-loan-into-freed-wipe=false.
+//   * M7.2a-w1: llvm.mem.fact ["mem.wipe_cap_words"(ptr, i64 len)] is
+//     lowered here to a call to an outlined non-volatile helper that
+//     stores a null capability in every 16-byte slot wholly in
+//     [ptr, ptr+len). No ra/sp clears. Off with
+//     -cheri-invalidate-wipe-cap-words=false and -cheri-invalidate=none
+//     drop the fact and plant no stores. The rustc typic/grow path is
+//     a separate rustc flag (-Zcheri-wipe-cap-words=no).
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -54,6 +61,7 @@
 #include "llvm/IR/MemAnnot.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ModRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -198,6 +206,23 @@ static cl::opt<bool> InvFfiNarrow(
 static unsigned FfiBorrowFacts = 0;
 static unsigned FfiNarrows = 0;
 static unsigned FfiRetainSkipped = 0;
+static cl::opt<bool> InvWipeCapWords(
+    "cheri-invalidate-wipe-cap-words", cl::init(true), cl::Hidden,
+    cl::desc("M7.2a-w1: lower mem.wipe_cap_words to ready-address "
+             "csc-null stores (default on; false plants no wipes)"));
+// [LLM-generated] M7.2a-w1-opt. Inline/unroll when len is a constant of
+// at most this many cap words. Default 8 (128 B): w1 r1 heapbench had
+// 42/46 calls at typic-const 2 or 5 words; 8 covers those plus slightly
+// larger ADTs, while 12/60/64-word variable Vecs stay on the helper.
+// 0 disables unroll (every fact becomes a helper call).
+static cl::opt<unsigned> InvWipeCapWordsUnroll(
+    "cheri-invalidate-wipe-cap-words-unroll", cl::init(8), cl::Hidden,
+    cl::desc("Inline/unroll mem.wipe_cap_words for constant len of at "
+             "most this many cap words (0 = never unroll)"));
+static unsigned WipeCapWordsFacts = 0;
+static unsigned WipeCapWordsCalls = 0;
+static unsigned WipeCapWordsInlined = 0;
+static unsigned WipeCapWordsSkipped = 0;
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
     cl::desc("Only range-check a slot whose stored capabilities may point "
@@ -4032,6 +4057,10 @@ struct Inv {
          << " ffi_borrow_facts=" << FfiBorrowFacts
          << " ffi_narrows=" << FfiNarrows
          << " ffi_retain_skipped=" << FfiRetainSkipped
+         << " wipe_cap_words_facts=" << WipeCapWordsFacts
+         << " wipe_cap_words_calls=" << WipeCapWordsCalls
+         << " wipe_cap_words_inlined=" << WipeCapWordsInlined
+         << " wipe_cap_words_skipped=" << WipeCapWordsSkipped
          << "\n";
     }
   }
@@ -4194,6 +4223,214 @@ static void insertFfiNarrow(Module &M) {
   }
 }
 
+// [LLM-generated] M7.2a-w1-opt. Outlined non-volatile helper: for every
+// cap-sized slot wholly in [ptr, ptr+len), store a null capability.
+// len==0 returns before the pointer is used. llvm.sideeffect plus unknown
+// memory effects keep DSE from deleting the stores just because a mem.free
+// follows in the caller. No ra/sp access. Internal noinline.
+//
+// Loop is unrolled by two and uses a pointer-end compare, targeting
+// ~2 insts/word in the even body (csc, csc, cincoffset 32, bne). One
+// odd word is peeled. Prolog still aligns start up and end down so a
+// partially filled slot is not touched; rustc already passes a
+// cap-aligned Layout length, so the align math is a short no-op add/and
+// on the common path, not a second walk.
+static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
+  constexpr StringRef Name = "__cheri_wipe_cap_words";
+  if (Function *Existing = M.getFunction(Name))
+    return Existing;
+  LLVMContext &C = M.getContext();
+  const DataLayout &DL = M.getDataLayout();
+  Type *Void = Type::getVoidTy(C);
+  Type *I64 = Type::getInt64Ty(C);
+  Type *I8 = Type::getInt8Ty(C);
+  PointerType *PTy = PointerType::get(C, PtrAS);
+  FunctionType *FT = FunctionType::get(Void, {PTy, I64}, false);
+  Function *F = Function::Create(FT, GlobalValue::InternalLinkage,
+                                 DL.getProgramAddressSpace(), Name, &M);
+  F->setDoesNotThrow();
+  F->addFnAttr(Attribute::NoInline);
+  F->addFnAttr(Attribute::NoRecurse);
+  F->setMemoryEffects(MemoryEffects::unknown());
+  Argument *Ptr = F->getArg(0);
+  Ptr->setName("ptr");
+  Argument *Len = F->getArg(1);
+  Len->setName("len");
+
+  BasicBlock *Entry = BasicBlock::Create(C, "entry", F);
+  BasicBlock *Setup = BasicBlock::Create(C, "setup", F);
+  BasicBlock *Dispatch = BasicBlock::Create(C, "dispatch", F);
+  BasicBlock *Peel = BasicBlock::Create(C, "peel", F);
+  BasicBlock *Loop = BasicBlock::Create(C, "loop", F);
+  BasicBlock *Ret = BasicBlock::Create(C, "ret", F);
+
+  uint64_t CapBytes = DL.getTypeAllocSize(PTy);
+  if (CapBytes == 0)
+    CapBytes = 16;
+
+  IRBuilder<> B(Entry);
+  Function *Side = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::sideeffect);
+  B.CreateCall(Side);
+  Value *IsZero = B.CreateICmpEQ(Len, ConstantInt::get(I64, 0), "len_is_zero");
+  B.CreateCondBr(IsZero, Ret, Setup);
+
+  B.SetInsertPoint(Setup);
+  Value *Addr = B.CreatePtrToInt(Ptr, I64, "addr");
+  Value *CapImm = ConstantInt::get(I64, CapBytes);
+  Value *TwoCap = ConstantInt::get(I64, CapBytes * 2);
+  Value *Mask = ConstantInt::get(I64, ~(CapBytes - 1));
+  Value *Sum = B.CreateAdd(Addr, ConstantInt::get(I64, CapBytes - 1), "sum");
+  Value *Aligned = B.CreateAnd(Sum, Mask, "aligned");
+  Value *EndAddr = B.CreateAdd(Addr, Len, "endaddr");
+  Value *EndAl = B.CreateAnd(EndAddr, Mask, "endal");
+  Value *Empty = B.CreateICmpUGE(Aligned, EndAl, "empty");
+  Value *Off = B.CreateSub(Aligned, Addr, "off");
+  Value *Cur0 = B.CreateInBoundsGEP(I8, Ptr, Off, "cur0");
+  Value *EndOff = B.CreateSub(EndAl, Addr, "endoff");
+  Value *EndPtr = B.CreateInBoundsGEP(I8, Ptr, EndOff, "endptr");
+  Value *NBytes = B.CreateSub(EndAl, Aligned, "nbytes");
+  Value *Odd = B.CreateICmpNE(B.CreateAnd(NBytes, CapImm),
+                              ConstantInt::get(I64, 0), "odd");
+  B.CreateCondBr(Empty, Ret, Dispatch);
+
+  B.SetInsertPoint(Dispatch);
+  B.CreateCondBr(Odd, Peel, Loop);
+
+  B.SetInsertPoint(Peel);
+  B.CreateAlignedStore(ConstantPointerNull::get(PTy), Cur0, Align(CapBytes),
+                       /*IsVolatile=*/false);
+  Value *Cur1 = B.CreateInBoundsGEP(I8, Cur0, CapImm, "cur1");
+  Value *PeelDone = B.CreateICmpEQ(Cur1, EndPtr, "peel_done");
+  B.CreateCondBr(PeelDone, Ret, Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *Cur = B.CreatePHI(PTy, 3, "cur");
+  Cur->addIncoming(Cur0, Dispatch);
+  Cur->addIncoming(Cur1, Peel);
+  B.CreateAlignedStore(ConstantPointerNull::get(PTy), Cur, Align(CapBytes),
+                       /*IsVolatile=*/false);
+  Value *CurLo = B.CreateInBoundsGEP(I8, Cur, CapImm, "cur_lo");
+  B.CreateAlignedStore(ConstantPointerNull::get(PTy), CurLo, Align(CapBytes),
+                       /*IsVolatile=*/false);
+  Value *Next = B.CreateInBoundsGEP(I8, Cur, TwoCap, "next");
+  Cur->addIncoming(Next, Loop);
+  Value *Done = B.CreateICmpEQ(Next, EndPtr, "done");
+  B.CreateCondBr(Done, Ret, Loop);
+
+  B.SetInsertPoint(Ret);
+  B.CreateRetVoid();
+  return F;
+}
+
+// Emit N unrolled non-volatile null stores at ptr+i*CapBytes, then
+// llvm.sideeffect so DSE cannot delete them in front of allockind free.
+static void emitUnrolledWipe(IRBuilder<> &B, Module &M, Value *Ptr,
+                             unsigned AS, uint64_t CapBytes, uint64_t Words) {
+  Type *I8 = Type::getInt8Ty(M.getContext());
+  PointerType *PTy = PointerType::get(M.getContext(), AS);
+  Value *P = Ptr;
+  if (P->getType() != PTy)
+    P = B.CreatePointerCast(P, PTy);
+  for (uint64_t I = 0; I < Words; ++I) {
+    Value *Slot = P;
+    if (I != 0)
+      Slot = B.CreateInBoundsGEP(I8, P, B.getInt64(I * CapBytes),
+                                 "wipe_slot");
+    B.CreateAlignedStore(ConstantPointerNull::get(PTy), Slot, Align(CapBytes),
+                         /*IsVolatile=*/false);
+  }
+  Function *Side = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::sideeffect);
+  B.CreateCall(Side);
+}
+
+// Collect and erase mem.wipe_cap_words facts without lowering them to
+// stores. Used when the LLVM wipe half is off (the dedicated flag, or
+// -cheri-invalidate=none). The rustc typic path is a separate rustc
+// flag; leaving the fact in the IR is not a substitute for turning
+// that path off, and would let a later viewer treat the fact as live.
+static void collectWipeCapWordsFacts(Module &M, SmallVectorImpl<CallBase *> &Facts) {
+  for (Function &Fn : M) {
+    if (Fn.isDeclaration() || Fn.getName() == "__cheri_wipe_cap_words")
+      continue;
+    for (Instruction &I : instructions(Fn)) {
+      if (memannot::isMemWipeCapWordsFact(&I))
+        Facts.push_back(cast<CallBase>(&I));
+    }
+  }
+}
+
+static void dropWipeCapWordsFacts(Module &M) {
+  SmallVector<CallBase *, 16> Facts;
+  collectWipeCapWordsFacts(M, Facts);
+  WipeCapWordsFacts += Facts.size();
+  for (CallBase *CB : Facts)
+    CB->eraseFromParent();
+}
+
+static void lowerWipeCapWords(Module &M) {
+  SmallVector<CallBase *, 16> Facts;
+  collectWipeCapWordsFacts(M, Facts);
+  if (!InvWipeCapWords) {
+    WipeCapWordsFacts += Facts.size();
+    for (CallBase *CB : Facts)
+      CB->eraseFromParent();
+    return;
+  }
+  const DataLayout &DL = M.getDataLayout();
+  Function *Helper = nullptr;
+  for (CallBase *CB : Facts) {
+    ++WipeCapWordsFacts;
+    auto OB = CB->getOperandBundle(memannot::TagWipeCapWords);
+    if (!OB || OB->Inputs.size() < 2) {
+      ++WipeCapWordsSkipped;
+      continue;
+    }
+    Value *Ptr = OB->Inputs[0];
+    Value *Len = OB->Inputs[1];
+    if (!Ptr->getType()->isPointerTy() || isa<UndefValue>(Ptr) ||
+        isa<PoisonValue>(Ptr)) {
+      ++WipeCapWordsSkipped;
+      continue;
+    }
+    unsigned AS = Ptr->getType()->getPointerAddressSpace();
+    uint64_t CapBytes = DL.getTypeAllocSize(Ptr->getType());
+    if (CapBytes == 0)
+      CapBytes = 16;
+
+    IRBuilder<> B(CB->getParent(), std::next(CB->getIterator()));
+
+    // Constant zero: no-op, and must not touch ptr.
+    if (auto *CLen = dyn_cast<ConstantInt>(Len)) {
+      uint64_t Bytes = CLen->getZExtValue();
+      if (Bytes == 0) {
+        ++WipeCapWordsInlined;
+        continue;
+      }
+      if (InvWipeCapWordsUnroll > 0 && Bytes % CapBytes == 0) {
+        uint64_t Words = Bytes / CapBytes;
+        if (Words <= InvWipeCapWordsUnroll) {
+          emitUnrolledWipe(B, M, Ptr, AS, CapBytes, Words);
+          ++WipeCapWordsInlined;
+          continue;
+        }
+      }
+    }
+
+    if (!Helper)
+      Helper = getOrCreateWipeCapWordsFn(M, AS);
+    Value *P = Ptr;
+    Type *WantP = Helper->getArg(0)->getType();
+    if (P->getType() != WantP)
+      P = B.CreatePointerCast(P, WantP);
+    Value *N = Len;
+    Type *WantN = Helper->getArg(1)->getType();
+    if (N->getType() != WantN)
+      N = B.CreateIntCast(N, WantN, /*isSigned=*/false);
+    B.CreateCall(Helper, {P, N});
+    ++WipeCapWordsCalls;
+  }
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -4232,8 +4469,15 @@ bool memannot::runCheriInvalidate(Module &M) {
     }
   }
   StringRef Mode = InvalidateOpt;
-  if (Mode != "none")
+  if (Mode == "none") {
+    // None disables every LLVM invalidation half, including wipe:
+    // drop the fact, do not lower it to stores. rustc typic/grow
+    // still needs -Zcheri-wipe-cap-words=no in the ablation harness.
+    dropWipeCapWordsFacts(M);
+  } else {
     insertFfiNarrow(M);
+    lowerWipeCapWords(M);
+  }
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
   bool SLite = Mode.contains("slite");

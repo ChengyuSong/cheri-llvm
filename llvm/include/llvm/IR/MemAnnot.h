@@ -110,6 +110,13 @@ inline constexpr StringRef TagStoreIntoSlot = "mem.store_into_slot";
 /// (no narrow).
 inline constexpr StringRef TagFfiBorrow = "mem.ffi_borrow";
 inline constexpr StringRef TagFfiRetain = "mem.ffi_retain";
+/// [LLM-generated] M7.2a-w1: "mem.wipe_cap_words"(ptr base, i64 len) on
+/// llvm.mem.fact. rustc named a cap-containing heap block being returned
+/// to the allocator (Layout / capacity bytes). The late CHERI pass stores
+/// a null capability in every 16-byte slot wholly in [base, base+len)
+/// through an outlined non-volatile helper. Not droppable: losing it
+/// loses the wipe. Generic passes must preserve base and len SSA.
+inline constexpr StringRef TagWipeCapWords = "mem.wipe_cap_words";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";
@@ -222,6 +229,8 @@ LLVM_ABI bool isMemLoanIntoValFact(const Instruction *I);
 LLVM_ABI bool isMemStoreIntoFact(const Instruction *I);
 /// [LLM-generated] M7.1d B2c: llvm.mem.fact ["mem.store_into_slot"(ptr base, i64 off, ptr cap)].
 LLVM_ABI bool isMemStoreIntoSlotFact(const Instruction *I);
+/// [LLM-generated] M7.2a-w1: llvm.mem.fact ["mem.wipe_cap_words"(ptr, i64 len)].
+LLVM_ABI bool isMemWipeCapWordsFact(const Instruction *I);
 /// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
 /// Header copies must not be reordered across that program point.
 LLVM_ABI const Value *slotClobber(const Instruction *I);
