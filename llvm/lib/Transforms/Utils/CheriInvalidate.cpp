@@ -207,11 +207,20 @@ static unsigned FfiNarrows = 0;
 static unsigned FfiRetainSkipped = 0;
 static cl::opt<bool> InvWipeCapWords(
     "cheri-invalidate-wipe-cap-words", cl::init(true), cl::Hidden,
-    cl::desc("M7.2a-w1: lower mem.wipe_cap_words to an outlined "
-             "non-volatile helper of ready-address csc-null stores "
-             "(default on; false plants no wipes)"));
+    cl::desc("M7.2a-w1: lower mem.wipe_cap_words to ready-address "
+             "csc-null stores (default on; false plants no wipes)"));
+// [LLM-generated] M7.2a-w1-opt. Inline/unroll when len is a constant of
+// at most this many cap words. Default 8 (128 B): w1 r1 heapbench had
+// 42/46 calls at typic-const 2 or 5 words; 8 covers those plus slightly
+// larger ADTs, while 12/60/64-word variable Vecs stay on the helper.
+// 0 disables unroll (every fact becomes a helper call).
+static cl::opt<unsigned> InvWipeCapWordsUnroll(
+    "cheri-invalidate-wipe-cap-words-unroll", cl::init(8), cl::Hidden,
+    cl::desc("Inline/unroll mem.wipe_cap_words for constant len of at "
+             "most this many cap words (0 = never unroll)"));
 static unsigned WipeCapWordsFacts = 0;
 static unsigned WipeCapWordsCalls = 0;
+static unsigned WipeCapWordsInlined = 0;
 static unsigned WipeCapWordsSkipped = 0;
 static cl::opt<bool> InvFilter(
     "cheri-invalidate-filter", cl::init(true), cl::Hidden,
@@ -4049,6 +4058,7 @@ struct Inv {
          << " ffi_retain_skipped=" << FfiRetainSkipped
          << " wipe_cap_words_facts=" << WipeCapWordsFacts
          << " wipe_cap_words_calls=" << WipeCapWordsCalls
+         << " wipe_cap_words_inlined=" << WipeCapWordsInlined
          << " wipe_cap_words_skipped=" << WipeCapWordsSkipped
          << "\n";
     }
@@ -4212,12 +4222,18 @@ static void insertFfiNarrow(Module &M) {
   }
 }
 
-// [LLM-generated] M7.2a-w1. Outlined non-volatile helper: for every
+// [LLM-generated] M7.2a-w1-opt. Outlined non-volatile helper: for every
 // cap-sized slot wholly in [ptr, ptr+len), store a null capability.
-// len==0 returns before the pointer is used (dangling Unique / cap==0).
-// llvm.sideeffect plus unknown memory effects keep DSE from deleting
-// the stores just because a mem.free follows in the caller. No ra/sp
-// access. The helper is internal noinline so each site is a call.
+// len==0 returns before the pointer is used. llvm.sideeffect plus unknown
+// memory effects keep DSE from deleting the stores just because a mem.free
+// follows in the caller. No ra/sp access. Internal noinline.
+//
+// Loop is unrolled by two and uses a pointer-end compare, targeting
+// ~2 insts/word in the even body (csc, csc, cincoffset 32, bne). One
+// odd word is peeled. Prolog still aligns start up and end down so a
+// partially filled slot is not touched; rustc already passes a
+// cap-aligned Layout length, so the align math is a short no-op add/and
+// on the common path, not a second walk.
 static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
   constexpr StringRef Name = "__cheri_wipe_cap_words";
   if (Function *Existing = M.getFunction(Name))
@@ -4226,6 +4242,7 @@ static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
   const DataLayout &DL = M.getDataLayout();
   Type *Void = Type::getVoidTy(C);
   Type *I64 = Type::getInt64Ty(C);
+  Type *I8 = Type::getInt8Ty(C);
   PointerType *PTy = PointerType::get(C, PtrAS);
   FunctionType *FT = FunctionType::get(Void, {PTy, I64}, false);
   Function *F = Function::Create(FT, GlobalValue::InternalLinkage,
@@ -4241,6 +4258,8 @@ static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
 
   BasicBlock *Entry = BasicBlock::Create(C, "entry", F);
   BasicBlock *Setup = BasicBlock::Create(C, "setup", F);
+  BasicBlock *Dispatch = BasicBlock::Create(C, "dispatch", F);
+  BasicBlock *Peel = BasicBlock::Create(C, "peel", F);
   BasicBlock *Loop = BasicBlock::Create(C, "loop", F);
   BasicBlock *Ret = BasicBlock::Create(C, "ret", F);
 
@@ -4257,6 +4276,7 @@ static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
   B.SetInsertPoint(Setup);
   Value *Addr = B.CreatePtrToInt(Ptr, I64, "addr");
   Value *CapImm = ConstantInt::get(I64, CapBytes);
+  Value *TwoCap = ConstantInt::get(I64, CapBytes * 2);
   Value *Mask = ConstantInt::get(I64, ~(CapBytes - 1));
   Value *Sum = B.CreateAdd(Addr, ConstantInt::get(I64, CapBytes - 1), "sum");
   Value *Aligned = B.CreateAnd(Sum, Mask, "aligned");
@@ -4264,18 +4284,34 @@ static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
   Value *EndAl = B.CreateAnd(EndAddr, Mask, "endal");
   Value *Empty = B.CreateICmpUGE(Aligned, EndAl, "empty");
   Value *Off = B.CreateSub(Aligned, Addr, "off");
-  Type *I8 = Type::getInt8Ty(C);
   Value *Cur0 = B.CreateInBoundsGEP(I8, Ptr, Off, "cur0");
   Value *EndOff = B.CreateSub(EndAl, Addr, "endoff");
   Value *EndPtr = B.CreateInBoundsGEP(I8, Ptr, EndOff, "endptr");
-  B.CreateCondBr(Empty, Ret, Loop);
+  Value *NBytes = B.CreateSub(EndAl, Aligned, "nbytes");
+  Value *Odd = B.CreateICmpNE(B.CreateAnd(NBytes, CapImm),
+                              ConstantInt::get(I64, 0), "odd");
+  B.CreateCondBr(Empty, Ret, Dispatch);
+
+  B.SetInsertPoint(Dispatch);
+  B.CreateCondBr(Odd, Peel, Loop);
+
+  B.SetInsertPoint(Peel);
+  B.CreateAlignedStore(ConstantPointerNull::get(PTy), Cur0, Align(CapBytes),
+                       /*IsVolatile=*/false);
+  Value *Cur1 = B.CreateInBoundsGEP(I8, Cur0, CapImm, "cur1");
+  Value *PeelDone = B.CreateICmpEQ(Cur1, EndPtr, "peel_done");
+  B.CreateCondBr(PeelDone, Ret, Loop);
 
   B.SetInsertPoint(Loop);
-  PHINode *Cur = B.CreatePHI(PTy, 2, "cur");
-  Cur->addIncoming(Cur0, Setup);
+  PHINode *Cur = B.CreatePHI(PTy, 3, "cur");
+  Cur->addIncoming(Cur0, Dispatch);
+  Cur->addIncoming(Cur1, Peel);
   B.CreateAlignedStore(ConstantPointerNull::get(PTy), Cur, Align(CapBytes),
                        /*IsVolatile=*/false);
-  Value *Next = B.CreateInBoundsGEP(I8, Cur, CapImm, "next");
+  Value *CurLo = B.CreateInBoundsGEP(I8, Cur, CapImm, "cur_lo");
+  B.CreateAlignedStore(ConstantPointerNull::get(PTy), CurLo, Align(CapBytes),
+                       /*IsVolatile=*/false);
+  Value *Next = B.CreateInBoundsGEP(I8, Cur, TwoCap, "next");
   Cur->addIncoming(Next, Loop);
   Value *Done = B.CreateICmpEQ(Next, EndPtr, "done");
   B.CreateCondBr(Done, Ret, Loop);
@@ -4283,6 +4319,27 @@ static Function *getOrCreateWipeCapWordsFn(Module &M, unsigned PtrAS) {
   B.SetInsertPoint(Ret);
   B.CreateRetVoid();
   return F;
+}
+
+// Emit N unrolled non-volatile null stores at ptr+i*CapBytes, then
+// llvm.sideeffect so DSE cannot delete them in front of allockind free.
+static void emitUnrolledWipe(IRBuilder<> &B, Module &M, Value *Ptr,
+                             unsigned AS, uint64_t CapBytes, uint64_t Words) {
+  Type *I8 = Type::getInt8Ty(M.getContext());
+  PointerType *PTy = PointerType::get(M.getContext(), AS);
+  Value *P = Ptr;
+  if (P->getType() != PTy)
+    P = B.CreatePointerCast(P, PTy);
+  for (uint64_t I = 0; I < Words; ++I) {
+    Value *Slot = P;
+    if (I != 0)
+      Slot = B.CreateInBoundsGEP(I8, P, B.getInt64(I * CapBytes),
+                                 "wipe_slot");
+    B.CreateAlignedStore(ConstantPointerNull::get(PTy), Slot, Align(CapBytes),
+                         /*IsVolatile=*/false);
+  }
+  Function *Side = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::sideeffect);
+  B.CreateCall(Side);
 }
 
 static void lowerWipeCapWords(Module &M) {
@@ -4296,10 +4353,10 @@ static void lowerWipeCapWords(Module &M) {
     }
   }
   if (!InvWipeCapWords) {
-    // Count facts for stats, but plant nothing.
     WipeCapWordsFacts += Facts.size();
     return;
   }
+  const DataLayout &DL = M.getDataLayout();
   Function *Helper = nullptr;
   for (CallBase *CB : Facts) {
     ++WipeCapWordsFacts;
@@ -4316,9 +4373,31 @@ static void lowerWipeCapWords(Module &M) {
       continue;
     }
     unsigned AS = Ptr->getType()->getPointerAddressSpace();
+    uint64_t CapBytes = DL.getTypeAllocSize(Ptr->getType());
+    if (CapBytes == 0)
+      CapBytes = 16;
+
+    IRBuilder<> B(CB->getParent(), std::next(CB->getIterator()));
+
+    // Constant zero: no-op, and must not touch ptr.
+    if (auto *CLen = dyn_cast<ConstantInt>(Len)) {
+      uint64_t Bytes = CLen->getZExtValue();
+      if (Bytes == 0) {
+        ++WipeCapWordsInlined;
+        continue;
+      }
+      if (InvWipeCapWordsUnroll > 0 && Bytes % CapBytes == 0) {
+        uint64_t Words = Bytes / CapBytes;
+        if (Words <= InvWipeCapWordsUnroll) {
+          emitUnrolledWipe(B, M, Ptr, AS, CapBytes, Words);
+          ++WipeCapWordsInlined;
+          continue;
+        }
+      }
+    }
+
     if (!Helper)
       Helper = getOrCreateWipeCapWordsFn(M, AS);
-    IRBuilder<> B(CB->getParent(), std::next(CB->getIterator()));
     Value *P = Ptr;
     Type *WantP = Helper->getArg(0)->getType();
     if (P->getType() != WantP)
