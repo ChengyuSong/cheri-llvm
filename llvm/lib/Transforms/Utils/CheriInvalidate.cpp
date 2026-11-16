@@ -195,8 +195,9 @@ static cl::opt<bool> InvLoanIntoFreedWipe(
              "mem.free (default on; false is byte-identical to 94303ea2)"));
 static cl::opt<bool> InvStoreInto(
     "cheri-invalidate-store-into", cl::init(true), cl::Hidden,
-    cl::desc("M7.1d B2a: null a mem.store_into dest at the source mem.free "
-             "when dest is a ready fat pointer still holding that cap "
+    cl::desc("M7.1d B2a/B2b: null a mem.store_into dest at the source mem.free "
+             "when dest is a ready fat pointer (alloca or GlobalVariable, "
+             "or a constant GEP of one) still holding that cap "
              "(default on; false is byte-identical to 0c127e28)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
@@ -1372,6 +1373,25 @@ struct Inv {
     AllocaInst *B = nullptr;
     int64_t O = 0;
     return frameSlot(P, B, O) && B == A && O == Off;
+  }
+
+  // B2b: a GlobalVariable (or a constant GEP of one, or a GlobalAlias
+  // of one) is a process-lifetime ready dest. Functions are not dests.
+  // Offset must be cap-aligned, same as a frame slot.
+  bool staticSlot(Value *P, GlobalVariable *&GV, int64_t &Off) const {
+    GV = nullptr;
+    Off = 0;
+    if (!P || !P->getType()->isPointerTy())
+      return false;
+    Value *Base = GetPointerBaseWithConstantOffset(P, Off, DL);
+    Base = peelRepresent(Base);
+    if (!Base)
+      return false;
+    if (auto *A = dyn_cast<GlobalAlias>(Base))
+      Base = A->getAliaseeObject();
+    Base = peelRepresent(Base);
+    GV = dyn_cast<GlobalVariable>(Base);
+    return GV && Off >= 0 && Off % 16 == 0;
   }
   // A Vec move passes the slot itself to the callee. That call is the move
   // even though it does not load the owner into a register.
@@ -2704,7 +2724,9 @@ struct Inv {
     return true;
   }
 
-  // B2c does not wipe static / global destinations (out of this slice).
+  // True if Base's underlying object is a global (variable, alias, or
+  // function). B2b wipes GlobalVariable dests when they are ready; this
+  // helper is only a classification, not a skip.
   bool isStaticBase(Value *Base) const {
     if (!Base)
       return false;
@@ -2760,6 +2782,10 @@ struct Inv {
     AllocaInst *A = nullptr;
     if (frameSlot(P, A, Off))
       return false; // the base is the local array itself
+    GlobalVariable *GV = nullptr;
+    int64_t SOff = 0;
+    if (staticSlot(P, GV, SOff))
+      return false; // process-lifetime static does not realloc
     auto *LI = dyn_cast<LoadInst>(P);
     if (LI && destReassignedBetween(LI->getPointerOperand(), From, To, DT))
       return true;
@@ -2978,9 +3004,10 @@ struct Inv {
       return false;
     if (!loanValAvailable(Dest, At, DT))
       return false;
-    // No ra/sp register clears. B2a may only wipe a ready named local:
-    // an alloca or a GEP of one (csc zero, 0(reg) / off(sp) of that slot).
-    // Heap cells (Box::leak, Vec buffers) and statics are not B2a dests.
+    // No ra/sp register clears. A dest is ready if it is an alloca or a
+    // GlobalVariable, or a constant GEP of one (csc zero through that
+    // address). Heap cells (Box::leak, Vec buffers) are still not ready
+    // as a dest-SSA unless rematerialised via store_into_slot.
     if (auto *II = dyn_cast<IntrinsicInst>(Dest)) {
       switch (II->getIntrinsicID()) {
       case Intrinsic::returnaddress:
@@ -2992,13 +3019,18 @@ struct Inv {
       }
     }
     // A ptr::write dest is often mem.claim / bounds.set of a GEP of the
-    // local. Peel those represent layers, but the base must still be an
-    // alloca (not a heap cell or a static).
-    Value *P = Dest;
-    for (int I = 0; I < 2 && P; ++I) {
+    // local or of a static. Peel those represent layers.
+    auto readyBase = [&](Value *Q) -> bool {
       AllocaInst *Slot = nullptr;
       int64_t Off = 0;
-      if (frameSlot(P, Slot, Off))
+      if (frameSlot(Q, Slot, Off))
+        return true;
+      GlobalVariable *GV = nullptr;
+      return staticSlot(Q, GV, Off);
+    };
+    Value *P = Dest;
+    for (int I = 0; I < 2 && P; ++I) {
+      if (readyBase(P))
         return true;
       P = P->stripPointerCasts();
       auto *C = dyn_cast<CallBase>(P);
@@ -3014,9 +3046,7 @@ struct Inv {
       else
         break;
     }
-    AllocaInst *Slot = nullptr;
-    int64_t Off = 0;
-    return P && frameSlot(P, Slot, Off);
+    return P && readyBase(P);
   }
 
   bool destReassignedBetween(Value *Dest, Instruction *From, Instruction *To,
@@ -3163,10 +3193,10 @@ struct Inv {
         W.Free = At;
         W.Cap = Cap;
         if (SlotFact) {
-          if (isStaticBase(Base)) {
-            ++StoreIntoSkippedUnready;
-            continue;
-          }
+          // B2b: a GlobalVariable base is ready (process-lifetime). Do not
+          // skip it just for being static; slotAddrReady / bufferMayMove
+          // still decline an unready or moved dest. Exact-equal at the
+          // free decides whether to null (including a cross-crate static).
           if (!slotAddrReady(Base, Index, Scale, Add, At, DT) ||
               bufferMayMove(Base, Fact, At, DT)) {
             ++StoreIntoSkippedUnready;

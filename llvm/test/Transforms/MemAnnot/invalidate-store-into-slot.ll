@@ -113,17 +113,19 @@ do_free:
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
 ; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
 
-; Statics are out of B2c-1/2 scope: skip even if the global base is ready.
+; B2b: a GlobalVariable base (or a constant GEP of one) is a ready dest.
 @gbuf = addrspace(200) global [2 x ptr addrspace(200)] zeroinitializer
-define void @static_skip(ptr addrspace(200) %buf) {
+define void @static_ready(ptr addrspace(200) %buf) {
   %slot = getelementptr inbounds [2 x ptr addrspace(200)], ptr addrspace(200) @gbuf, i64 0, i64 1
   store ptr addrspace(200) %buf, ptr addrspace(200) %slot, align 16
   call void @llvm.mem.fact() [ "mem.store_into_slot"(ptr addrspace(200) @gbuf, i64 16, ptr addrspace(200) %buf) ]
   call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
   ret void
 }
-; CHECK-LABEL: define void @static_skip(
-; CHECK-NOT: @llvm.cheri.cap.equal.exact
+; CHECK-LABEL: define void @static_ready(
+; CHECK: getelementptr inbounds (i8, ptr addrspace(200) @gbuf, i64 16)
+; CHECK: @llvm.cheri.cap.equal.exact
+; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) getelementptr inbounds (i8, ptr addrspace(200) @gbuf, i64 16), align 16
 ; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
 
 declare ptr addrspace(200) @llvm.mem.claim.p200(ptr addrspace(200), i64, i64)
@@ -150,9 +152,9 @@ define void @none_end() {
 ; NONE-NOT: @llvm.cheri.cap.equal.exact
 ; NONE: define void @none_end(
 
-; 5 wipes (heap_slot_const, heap_store_into_const, var_idx, array_var, claim_var) +
-; 3 unready (realloc_skip, idx_unready, static_skip). Facts = 8.
+; 6 wipes (heap_slot_const, heap_store_into_const, var_idx, array_var, claim_var,
+; static_ready) + 2 unready (realloc_skip, idx_unready). Facts = 8.
 ; STATS: store_into_facts=8
-; STATS-SAME: store_into_nulls=5
-; STATS-SAME: store_into_skipped_unready=3
+; STATS-SAME: store_into_nulls=6
+; STATS-SAME: store_into_skipped_unready=2
 ; STATS-SAME: store_into_skipped_reassigned=0
