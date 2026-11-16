@@ -207,6 +207,15 @@ static cl::opt<bool> InvFfiNarrow(
 static unsigned FfiBorrowFacts = 0;
 static unsigned FfiNarrows = 0;
 static unsigned FfiRetainSkipped = 0;
+static cl::opt<bool> InvCroot(
+    "cheri-invalidate-croot", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d CR-1: at mem.free, walk a non-empty typic C-root table "
+             "and null any ready slot that exact-equals the freed cap "
+             "(csc zero through the ready global; no ra/sp clear). "
+             "Default on; false plants no walk, even if a table is present"));
+static unsigned CrootSlots = 0;
+static unsigned CrootWalks = 0;
+static unsigned CrootNulls = 0;
 static cl::opt<bool> InvWipeCapWords(
     "cheri-invalidate-wipe-cap-words", cl::init(true), cl::Hidden,
     cl::desc("M7.2a-w1: lower mem.wipe_cap_words to ready-address "
@@ -4091,6 +4100,9 @@ struct Inv {
          << " wipe_cap_words_calls=" << WipeCapWordsCalls
          << " wipe_cap_words_inlined=" << WipeCapWordsInlined
          << " wipe_cap_words_skipped=" << WipeCapWordsSkipped
+         << " croot_slots=" << CrootSlots
+         << " croot_walks=" << CrootWalks
+         << " croot_nulls=" << CrootNulls
          << "\n";
     }
   }
@@ -4206,6 +4218,126 @@ static void tagMayFreeCalls(Module &M) {
       }
       if (MayFree)
         CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-may-free"));
+    }
+  }
+}
+
+
+// [LLM-generated] M7.1d CR-1. Collect typic C-root slot addresses from the
+// module-local table rustc (or a later CR-2 section) emits. The preferred
+// form is a constant
+//   @__cheri_croot = { i64 N, ptr @__cheri_croot_slots }
+//   @__cheri_croot_slots = [N x ptr addrspace(200)] [ptr @SLOT, ...]
+// If that header is absent or empty, plant nothing. A later link-time
+// section can add entries under section "cheri_croot" as pointer constants.
+static void collectCrootSlots(Module &M, SmallVectorImpl<Value *> &Slots) {
+  auto addSlot = [&](Value *V) {
+    if (!V)
+      return;
+    Value *P = V->stripPointerCasts();
+    if (!P->getType()->isPointerTy())
+      return;
+    if (auto *GV = dyn_cast<GlobalVariable>(P)) {
+      if (GV->getName() == "__cheri_croot" ||
+          GV->getName() == "__cheri_croot_slots")
+        return;
+    }
+    if ((isa<GlobalVariable>(P) || isa<GEPOperator>(P) || isa<Constant>(P)) &&
+        !is_contained(Slots, P))
+      Slots.push_back(P);
+  };
+  auto addFromInit = [&](Constant *Init) {
+    if (!Init)
+      return;
+    if (auto *CA = dyn_cast<ConstantArray>(Init)) {
+      for (unsigned I = 0, E = CA->getNumOperands(); I != E; ++I)
+        addSlot(CA->getOperand(I));
+      return;
+    }
+    if (auto *CV = dyn_cast<ConstantVector>(Init)) {
+      for (unsigned I = 0, E = CV->getNumOperands(); I != E; ++I)
+        addSlot(CV->getOperand(I));
+      return;
+    }
+    addSlot(Init);
+  };
+  if (GlobalVariable *Hdr = M.getGlobalVariable("__cheri_croot", /*AllowLocal=*/true)) {
+    if (Hdr->hasInitializer()) {
+      Constant *Init = Hdr->getInitializer();
+      if (auto *CS = dyn_cast<ConstantStruct>(Init)) {
+        if (CS->getNumOperands() >= 2) {
+          Value *Arr = CS->getOperand(1)->stripPointerCasts();
+          if (auto *AG = dyn_cast<GlobalVariable>(Arr))
+            addFromInit(AG->getInitializer());
+          else if (auto *CA = dyn_cast<ConstantArray>(Arr))
+            addFromInit(CA);
+        }
+      } else {
+        addFromInit(Init);
+      }
+    }
+  }
+}
+
+// Insert, immediately before each mem.free, an exact-equal null of every
+// C-root slot that still holds the freed cap. Ready-address stores only
+// (the slots are globals). No ra/sp clear. Unrolled: official tables are
+// tiny (the gadget has one slot). Empty / absent table: this is a no-op.
+static void insertCrootWalk(Module &M) {
+  if (!InvCroot)
+    return;
+  SmallVector<Value *, 8> Slots;
+  collectCrootSlots(M, Slots);
+  CrootSlots = Slots.size();
+  if (Slots.empty())
+    return;
+  Type *CapTy = PointerType::get(M.getContext(), 200);
+  Function *EqFn =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::cheri_cap_equal_exact);
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<CallBase *, 8> Frees;
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      auto FB = CB->getOperandBundle(memannot::TagFree);
+      if (!FB || FB->Inputs.empty())
+        continue;
+      Frees.push_back(CB);
+    }
+    for (CallBase *Fr : Frees) {
+      Value *Cap = Fr->getOperandBundle(memannot::TagFree)->Inputs[0];
+      if (!Cap || !Cap->getType()->isPointerTy())
+        continue;
+      ++CrootWalks;
+      for (Value *Slot : Slots) {
+        if (!Slot)
+          continue;
+        BasicBlock *Cont = SplitBlock(
+            Fr->getParent(), Fr->getIterator(),
+            static_cast<DominatorTree *>(nullptr), nullptr, nullptr,
+            "croot.cont");
+        BasicBlock *Pre = Cont->getSinglePredecessor();
+        Pre->getTerminator()->eraseFromParent();
+        auto *NullBB =
+            BasicBlock::Create(M.getContext(), "croot.null", &F, Cont);
+        IRBuilder<> B(Pre);
+        Value *Got = B.CreateAlignedLoad(CapTy, Slot, Align(16), "croot.got");
+        Value *Eq = B.CreateCall(EqFn, {Got, Cap}, "croot.eq");
+        B.CreateCondBr(Eq, NullBB, Cont);
+        B.SetInsertPoint(NullBB);
+        auto *St = B.CreateAlignedStore(
+            ConstantPointerNull::get(cast<PointerType>(CapTy)), Slot, Align(16),
+            InvVolatile);
+        St->setMetadata("pcsections",
+                        MDNode::get(M.getContext(),
+                                    {MDString::get(M.getContext(),
+                                                   "cheri_inv_croot")}));
+        B.CreateBr(Cont);
+        ++CrootNulls;
+      }
     }
   }
 }
@@ -4516,6 +4648,11 @@ bool memannot::runCheriInvalidate(Module &M) {
   bool Free = All || Mode.contains("free");
   bool Loan = All || Mode.contains("loan");
   bool FLogOn = Mode.contains("flog");
+  // CR-1: walk a non-empty typic C-root table at mem.free. -cheri-invalidate=none
+  // already skipped this path; InvCroot=false plants nothing even if a table is
+  // present. Official KPI crates have no table, so this is a no-op there.
+  if (Mode != "none" && Free)
+    insertCrootWalk(M);
   if (Scope || Free || Loan || FLogOn || !InvStatsOut.empty()) {
     Inv I(M, Scope, Free, Loan);
     I.FLog = FLogOn;
