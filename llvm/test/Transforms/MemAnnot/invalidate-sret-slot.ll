@@ -31,10 +31,10 @@ define void @sret_drop() {
   call void @llvm.lifetime.end.p200(ptr addrspace(200) %s)
   ret void
 }
+; Lifetime.end only, no mem.free: r3 skips this slot.
 ; ON-LABEL: define void @sret_drop(
 ; ON: call {{.*}}@make_string(
-; ON: store volatile ptr addrspace(200) null, ptr addrspace(200) %s, align 16
-; ON-NOT: store volatile ptr addrspace(200) null, ptr addrspace(200) %s
+; ON-NOT: store volatile ptr addrspace(200) null
 ; ON: call {{.*}}@llvm.lifetime.end.p200
 ; NONE-LABEL: define void @sret_drop(
 ; NONE-NOT: store volatile ptr addrspace(200) null
@@ -83,7 +83,7 @@ define void @writeonly_only() {
 ; ON-NOT: store volatile ptr addrspace(200) null
 ; ON: call {{.*}}@llvm.lifetime.end.p200
 
-; STATS: sret_slots=2
+; STATS: sret_slots=1
 ; STATS-OFF-NOT: store volatile
 ; The none run emits no own-nulls; sret_slots may still be counted if the
 ; collector runs, but the invalidate=none path must not plant a store.

@@ -579,9 +579,25 @@ struct Inv {
   // callee; that must not skip own-null at the caller's later lifetime.end
   // (InvOwnNull does not consult escapes()). Clears go through the alloca
   // (a ready address). No ra/sp clears.
+  //
+  // Byte-attribution prototype (S-1a r3): classify only in a function that
+  // already contains a reachable mem.free. Official leftover close for
+  // bench-O2-on and the sret_drop witness lives in such functions
+  // (cheri_test_main drops the returned String). Slots in functions with no
+  // mem.free (fmt helpers, RawVec::grow_one / finish_grow result) accounted
+  // for most of the .text overshoot and are skipped.
   void collectSretSlots(Function &F,
                         MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
     if (!InvSretSlots)
+      return;
+    bool HasFree = false;
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->getOperandBundle(memannot::TagFree)) {
+          HasFree = true;
+          break;
+        }
+    if (!HasFree)
       return;
     auto add = [&](Value *V) {
       int64_t Off = 0;
