@@ -219,10 +219,11 @@ static cl::opt<bool> InvCroot(
 // keep flag-off .text official-identical.
 static cl::opt<bool> InvSretSlots(
     "cheri-invalidate-sret-slots", cl::init(true), cl::Hidden,
-    cl::desc("M7.1d S-1a: classify a static alloca used as an sret or "
-             "writeonly cap dest as a CapSlots member at offset 0 "
-             "(pointer word only), so InvOwnNull at lifetime.end wipes it. "
-             "Default on; false plants no sret classification"));
+    cl::desc("M7.1d S-1a: classify a static alloca used as an sret cap "
+             "dest as a CapSlots member at offset 0 (pointer word only), "
+             "so InvOwnNull at lifetime.end wipes it. Writeonly out-params "
+             "are not classified. Default on; false plants no sret "
+             "classification"));
 static unsigned CrootSlots = 0;
 static unsigned CrootWalks = 0;
 static unsigned CrootNulls = 0;
@@ -605,10 +606,10 @@ struct Inv {
         continue;
       for (unsigned i = 0, e = CB->arg_size(); i != e; ++i) {
         // sret is how rustc returns String / Vec / other cap-owning values
-        // that do not fit in registers. writeonly is the same shape without
-        // the sret attribute (an out-param the callee writes).
-        if (!CB->paramHasAttr(i, Attribute::StructRet) &&
-            !CB->paramHasAttr(i, Attribute::WriteOnly))
+        // that do not fit in registers. Writeonly out-params are not
+        // classified: they are a broader set than the sret leftover and
+        // overran the 0.3% .text bar in S-1a r1.
+        if (!CB->paramHasAttr(i, Attribute::StructRet))
           continue;
         add(CB->getArgOperand(i));
       }

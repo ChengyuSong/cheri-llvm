@@ -4,7 +4,8 @@
 ; through that ready alloca at lifetime.end, even though the address
 ; escaped to the sret callee. Offsets 16 and 32 (String/Vec usizes) are
 ; not wiped. -cheri-invalidate=none and -cheri-invalidate-own-null=false
-; emit nothing. A non-sret alloca passed to a callee is not classified.
+; emit nothing. A non-sret alloca passed to a callee is not classified,
+; including a writeonly-only dest (S-1a r2: writeonly is no longer a slot).
 ;
 ; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=ON
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONE
@@ -21,6 +22,7 @@ declare void @llvm.lifetime.end.p200(ptr addrspace(200))
 declare void @make_string(ptr addrspace(200) sret([48 x i8]) align 16)
 declare void @dealloc(ptr addrspace(200))
 declare void @use(ptr addrspace(200))
+declare void @write_out(ptr addrspace(200) writeonly)
 
 define void @sret_drop() {
   %s = alloca [48 x i8], align 16, addrspace(200)
@@ -69,7 +71,19 @@ define void @not_sret() {
 ; ON-NOT: store volatile ptr addrspace(200) null
 ; ON: call {{.*}}@llvm.lifetime.end.p200
 
-; STATS: sret_slots={{[1-9]}}
+; A writeonly-only dest, with no sret and no local cap store, is not a slot.
+define void @writeonly_only() {
+  %s = alloca [48 x i8], align 16, addrspace(200)
+  call void @llvm.lifetime.start.p200(ptr addrspace(200) %s)
+  call void @write_out(ptr addrspace(200) writeonly %s)
+  call void @llvm.lifetime.end.p200(ptr addrspace(200) %s)
+  ret void
+}
+; ON-LABEL: define void @writeonly_only(
+; ON-NOT: store volatile ptr addrspace(200) null
+; ON: call {{.*}}@llvm.lifetime.end.p200
+
+; STATS: sret_slots=2
 ; STATS-OFF-NOT: store volatile
 ; The none run emits no own-nulls; sret_slots may still be counted if the
 ; collector runs, but the invalidate=none path must not plant a store.
