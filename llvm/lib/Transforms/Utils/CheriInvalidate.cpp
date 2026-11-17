@@ -213,6 +213,17 @@ static cl::opt<bool> InvCroot(
              "and null any ready slot that exact-equals the freed cap "
              "(csc zero through the ready global; no ra/sp clear). "
              "Default on; false plants no walk, even if a table is present"));
+// [LLM-generated] M7.1d S-1a ident-off sub-flag. Official ident-off still
+// runs default InvOwnNull for locally-stored CapSlots, so disabling the
+// whole pass or own-null would itself DIFF. This flag is the only way to
+// keep flag-off .text official-identical.
+static cl::opt<bool> InvSretSlots(
+    "cheri-invalidate-sret-slots", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d S-1a: classify a static alloca used as an sret cap "
+             "dest as a CapSlots member at offset 0 (pointer word only), "
+             "so InvOwnNull at lifetime.end wipes it. Writeonly out-params "
+             "are not classified. Default on; false plants no sret "
+             "classification"));
 static unsigned CrootSlots = 0;
 static unsigned CrootWalks = 0;
 static unsigned CrootNulls = 0;
@@ -331,6 +342,9 @@ struct Inv {
   // M7.1c-2b: plain nulls and range-checked clears of slots dead after a free.
   unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
   unsigned FreeDeadCallPlain = 0, FreeDeadCallChecked = 0;
+  // M7.1d S-1a: static sret / callee-written cap allocas added as CapSlots
+  // at offset 0 (pointer word only).
+  unsigned SretSlots = 0;
   DenseMap<std::pair<AllocaInst *, int64_t>, SmallVector<Value *, 2>> SlotStored;
   // Every pointer store into an alloca, any index. Unknown if a copy or too
   // many stores hide the values. Used to see through a load from a local
@@ -531,6 +545,7 @@ struct Inv {
           Pv.Unknown = true;
       }
     }
+    collectSretSlots(F, Out);
     collectWide(F, Out);
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
@@ -552,6 +567,68 @@ struct Inv {
         Fill.Unknown = true;
       else
         Fill.Vals.push_back(SI->getValueOperand());
+    }
+  }
+
+  // [LLM-generated] M7.1d S-1a. A static alloca used as an sret dest (a
+  // cap-holding return slot written by the callee) is a CapSlots member at
+  // offset 0, the pointer word only. The callee store is not a StoreInst in
+  // this function, so the walk above misses it, and InvOwnNull at
+  // lifetime.end never wiped the caller's slot. Offset 16+ (String/Vec
+  // length and capacity usizes) stay out. The address escaped to the sret
+  // callee; that must not skip own-null at the caller's later lifetime.end
+  // (InvOwnNull does not consult escapes()). Clears go through the alloca
+  // (a ready address). No ra/sp clears.
+  //
+  // Byte-attribution prototype (S-1a r3): classify only in a function that
+  // already contains a reachable mem.free. Official leftover close for
+  // bench-O2-on and the sret_drop witness lives in such functions
+  // (cheri_test_main drops the returned String). Slots in functions with no
+  // mem.free (fmt helpers, RawVec::grow_one / finish_grow result) accounted
+  // for most of the .text overshoot and are skipped.
+  void collectSretSlots(Function &F,
+                        MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    if (!InvSretSlots)
+      return;
+    bool HasFree = false;
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->getOperandBundle(memannot::TagFree)) {
+          HasFree = true;
+          break;
+        }
+    if (!HasFree)
+      return;
+    auto add = [&](Value *V) {
+      int64_t Off = 0;
+      Value *Base = GetPointerBaseWithConstantOffset(V, Off, DL);
+      auto *A = dyn_cast_or_null<AllocaInst>(Base);
+      if (!A || !A->isStaticAlloca() || Off != 0)
+        return;
+      if (A->getAlign().value() < 16)
+        return;
+      std::optional<TypeSize> Sz = A->getAllocationSize(DL);
+      if (!Sz || Sz->isScalable() || Sz->getFixedValue() < 16)
+        return;
+      auto &Vec = Out[A];
+      if (is_contained(Vec, (int64_t)0))
+        return;
+      Vec.push_back(0);
+      ++SretSlots;
+    };
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm() || isa<IntrinsicInst>(CB))
+        continue;
+      for (unsigned i = 0, e = CB->arg_size(); i != e; ++i) {
+        // sret is how rustc returns String / Vec / other cap-owning values
+        // that do not fit in registers. Writeonly out-params are not
+        // classified: they are a broader set than the sret leftover and
+        // overran the 0.3% .text bar in S-1a r1.
+        if (!CB->paramHasAttr(i, Attribute::StructRet))
+          continue;
+        add(CB->getArgOperand(i));
+      }
     }
   }
 
@@ -4103,6 +4180,7 @@ struct Inv {
          << " croot_slots=" << CrootSlots
          << " croot_walks=" << CrootWalks
          << " croot_nulls=" << CrootNulls
+         << " sret_slots=" << SretSlots
          << "\n";
     }
   }
