@@ -213,6 +213,16 @@ static cl::opt<bool> InvCroot(
              "and null any ready slot that exact-equals the freed cap "
              "(csc zero through the ready global; no ra/sp clear). "
              "Default on; false plants no walk, even if a table is present"));
+// [LLM-generated] M7.1d S-1a ident-off sub-flag. Official ident-off still
+// runs default InvOwnNull for locally-stored CapSlots, so disabling the
+// whole pass or own-null would itself DIFF. This flag is the only way to
+// keep flag-off .text official-identical.
+static cl::opt<bool> InvSretSlots(
+    "cheri-invalidate-sret-slots", cl::init(true), cl::Hidden,
+    cl::desc("M7.1d S-1a: classify a static alloca used as an sret or "
+             "writeonly cap dest as a CapSlots member at offset 0 "
+             "(pointer word only), so InvOwnNull at lifetime.end wipes it. "
+             "Default on; false plants no sret classification"));
 static unsigned CrootSlots = 0;
 static unsigned CrootWalks = 0;
 static unsigned CrootNulls = 0;
@@ -570,6 +580,8 @@ struct Inv {
   // (a ready address). No ra/sp clears.
   void collectSretSlots(Function &F,
                         MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    if (!InvSretSlots)
+      return;
     auto add = [&](Value *V) {
       int64_t Off = 0;
       Value *Base = GetPointerBaseWithConstantOffset(V, Off, DL);

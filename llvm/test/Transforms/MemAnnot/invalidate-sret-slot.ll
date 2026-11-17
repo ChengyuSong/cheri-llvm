@@ -9,6 +9,8 @@
 ; RUN: opt -S -passes=cheri-bounds-lowering < %s | FileCheck %s --check-prefix=ON
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONE
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate-own-null=false < %s | FileCheck %s --check-prefix=OWNOFF
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate-sret-slots=false < %s | FileCheck %s --check-prefix=SRETOFF
+; RUN: rm -f %t.stats-sretoff && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate-sret-slots=false -cheri-invalidate-stats-out=%t.stats-sretoff < %s && FileCheck %s --check-prefix=STATS-SRETOFF < %t.stats-sretoff
 ; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
 ; RUN: rm -f %t.stats-off && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=none -cheri-invalidate-stats-out=%t.stats-off < %s && FileCheck %s --check-prefix=STATS-OFF < %t.stats-off
 
@@ -36,6 +38,8 @@ define void @sret_drop() {
 ; NONE-NOT: store volatile ptr addrspace(200) null
 ; OWNOFF-LABEL: define void @sret_drop(
 ; OWNOFF-NOT: store volatile ptr addrspace(200) null
+; SRETOFF-LABEL: define void @sret_drop(
+; SRETOFF-NOT: store volatile ptr addrspace(200) null
 
 ; Same shape as bench: sret, then mem.free of the loaded cap, then lifetime.end.
 ; The null is a store through the alloca (ready address), after the free.
@@ -70,3 +74,5 @@ define void @not_sret() {
 ; The none run emits no own-nulls; sret_slots may still be counted if the
 ; collector runs, but the invalidate=none path must not plant a store.
 ; STATS-OFF-NOT: own_nulled={{[1-9]}}
+; STATS-SRETOFF: sret_slots=0
+; STATS-SRETOFF-NOT: own_nulled={{[1-9]}}
