@@ -331,6 +331,9 @@ struct Inv {
   // M7.1c-2b: plain nulls and range-checked clears of slots dead after a free.
   unsigned FreeDeadPlain = 0, FreeDeadChecked = 0;
   unsigned FreeDeadCallPlain = 0, FreeDeadCallChecked = 0;
+  // M7.1d S-1a: static sret / callee-written cap allocas added as CapSlots
+  // at offset 0 (pointer word only).
+  unsigned SretSlots = 0;
   DenseMap<std::pair<AllocaInst *, int64_t>, SmallVector<Value *, 2>> SlotStored;
   // Every pointer store into an alloca, any index. Unknown if a copy or too
   // many stores hide the values. Used to see through a load from a local
@@ -531,6 +534,7 @@ struct Inv {
           Pv.Unknown = true;
       }
     }
+    collectSretSlots(F, Out);
     collectWide(F, Out);
     for (auto &[A, Offs] : Out)
       Slots += Offs.size();
@@ -552,6 +556,50 @@ struct Inv {
         Fill.Unknown = true;
       else
         Fill.Vals.push_back(SI->getValueOperand());
+    }
+  }
+
+  // [LLM-generated] M7.1d S-1a. A static alloca used as an sret dest (a
+  // cap-holding return slot written by the callee) is a CapSlots member at
+  // offset 0, the pointer word only. The callee store is not a StoreInst in
+  // this function, so the walk above misses it, and InvOwnNull at
+  // lifetime.end never wiped the caller's slot. Offset 16+ (String/Vec
+  // length and capacity usizes) stay out. The address escaped to the sret
+  // callee; that must not skip own-null at the caller's later lifetime.end
+  // (InvOwnNull does not consult escapes()). Clears go through the alloca
+  // (a ready address). No ra/sp clears.
+  void collectSretSlots(Function &F,
+                        MapVector<AllocaInst *, SmallVector<int64_t, 2>> &Out) {
+    auto add = [&](Value *V) {
+      int64_t Off = 0;
+      Value *Base = GetPointerBaseWithConstantOffset(V, Off, DL);
+      auto *A = dyn_cast_or_null<AllocaInst>(Base);
+      if (!A || !A->isStaticAlloca() || Off != 0)
+        return;
+      if (A->getAlign().value() < 16)
+        return;
+      std::optional<TypeSize> Sz = A->getAllocationSize(DL);
+      if (!Sz || Sz->isScalable() || Sz->getFixedValue() < 16)
+        return;
+      auto &Vec = Out[A];
+      if (is_contained(Vec, (int64_t)0))
+        return;
+      Vec.push_back(0);
+      ++SretSlots;
+    };
+    for (Instruction &I : instructions(F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm() || isa<IntrinsicInst>(CB))
+        continue;
+      for (unsigned i = 0, e = CB->arg_size(); i != e; ++i) {
+        // sret is how rustc returns String / Vec / other cap-owning values
+        // that do not fit in registers. writeonly is the same shape without
+        // the sret attribute (an out-param the callee writes).
+        if (!CB->paramHasAttr(i, Attribute::StructRet) &&
+            !CB->paramHasAttr(i, Attribute::WriteOnly))
+          continue;
+        add(CB->getArgOperand(i));
+      }
     }
   }
 
@@ -4103,6 +4151,7 @@ struct Inv {
          << " croot_slots=" << CrootSlots
          << " croot_walks=" << CrootWalks
          << " croot_nulls=" << CrootNulls
+         << " sret_slots=" << SretSlots
          << "\n";
     }
   }
