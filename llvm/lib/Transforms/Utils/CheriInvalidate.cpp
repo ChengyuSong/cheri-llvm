@@ -2475,7 +2475,8 @@ struct Inv {
       // [LLM-generated] M7.2c: put a last-use anchor on the loop exit.
       // D97 keeps a live owner; a dead comparison cap is nulled here,
       // including the zero-trip path, not on the loop's backedge.
-      if (InvCapReg && InvLoanIntoExitAnchor && fatCap(S.Loan)) {
+      if (InvCapReg && InvLoanIntoExitAnchor && !memannot::cheriInvalidateNone() &&
+          fatCap(S.Loan)) {
         ++LoanIntoExitAnchors;
         B.SetInsertPoint(&*Cont->getFirstInsertionPt());
         B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
@@ -3373,7 +3374,7 @@ struct Inv {
       // the store fact. Only integers, never the old capability, cross
       // intervening calls. The tag is a separate part of exact equality.
       Value *OldAddr = nullptr, *OldHigh = nullptr, *OldTag = nullptr;
-      if (S.Fact && InvStoreIntoInt) {
+      if (S.Fact && InvStoreIntoInt && !memannot::cheriInvalidateNone()) {
         auto &Snap = StoreIntoSnaps[{S.Fact, S.Cap}];
         if (!Snap[0]) {
           IRBuilder<> Capture(S.Fact);
@@ -4015,7 +4016,8 @@ struct Inv {
       // M7.2c: only rustc's post-dealloc llvm.mem.fact free is a real heap
       // free. A free bundle on another call (realloc may return the same
       // block) keeps the drop-if-live rule.
-      bool Heap = InvHeapFreeUntag && memannot::isMemFact(C);
+      bool Heap = InvHeapFreeUntag && !memannot::cheriInvalidateNone() &&
+                memannot::isMemFact(C);
       emitCapRegsKind(B, P, At, DT, CapRegFree,
                       Heap ? KindHeapFree : KindLoanFree);
     };
@@ -4302,6 +4304,8 @@ static cl::opt<DeadCapToggle> DeadCapOpt(
                clEnumValN(DeadCapToggle::All, "all",
                           "across any later call or return")));
 
+bool memannot::cheriInvalidateNone() { return StringRef(InvalidateOpt) == "none"; }
+
 memannot::CheriDeadCapMode memannot::cheriDeadCapMode() {
   switch (DeadCapOpt) {
   case DeadCapToggle::Off:
@@ -4374,7 +4378,7 @@ static void tagMayFreeCalls(Module &M) {
         // [LLM-generated] M7.2c: an owned Box can be moved in SSA,
         // without a moved alloca. Its callee may free it.
         for (unsigned A = 0; !MayFree && A != CB->arg_size(); ++A)
-          if (InvBoxFamilyMayFree &&
+          if (InvBoxFamilyMayFree && !memannot::cheriInvalidateNone() &&
               DL.isFatPointer(CB->getArgOperand(A)->getType()) &&
               CB->getParamAttr(A, "mem.box_family").isValid())
             MayFree = true;

@@ -10,6 +10,7 @@
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan+free < %s | FileCheck %s
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=loan+free -cheri-invalidate-box-family-mayfree=false -cheri-invalidate-loan-into-exit-anchor=false -cheri-invalidate-store-into-int=false -cheri-invalidate-heap-free-untag=false < %s | FileCheck %s --check-prefix=OFF
 ; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONE
+; RUN: opt -S -passes=cheri-bounds-lowering -cheri-invalidate=none < %s | FileCheck %s --check-prefix=NONEBOX
 ; RUN: rm -f %t.stats && opt -disable-output -passes=cheri-bounds-lowering -cheri-invalidate=loan+free -cheri-invalidate-stats-out=%t.stats < %s && FileCheck %s --check-prefix=STATS < %t.stats
 target datalayout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
 
@@ -62,6 +63,9 @@ define void @loan_into_exit(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
 ; CHECK: call {{.*}}@eat(ptr addrspace(200) "mem.box_family"="__rust_alloc" %b) #[[MF:[0-9]+]]
 ; OFF-LABEL: define void @moved_box(
 ; OFF: call {{.*}}@eat(ptr addrspace(200) "mem.box_family"="__rust_alloc" %b){{$}}
+; Under -cheri-invalidate=none the round-1 fixes are off (byte-stable ablation).
+; NONEBOX-LABEL: define void @moved_box(
+; NONEBOX: call {{.*}}@eat(ptr addrspace(200) "mem.box_family"="__rust_alloc" %b){{$}}
 
 ; CHECK-LABEL: define void @heap_free_live(
 ; CHECK: call {{.*}}@llvm.cheri.cap.invalidate(ptr addrspace(200) %p, i32 3)

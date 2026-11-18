@@ -982,7 +982,8 @@ static bool isMovedBoxCall(const MachineInstr &MI) {
 // address. Rewrite it in place to that integer before the call, so neither
 // the callee nor a later call can save the tagged capability.
 static bool clearMovedAddresses(MachineFunction &MF) {
-  if (!MovedAddressInt ||
+  // [LLM-generated] Off under -cheri-invalidate=none (byte-stable ablation).
+  if (!MovedAddressInt || memannot::cheriInvalidateNone() ||
       memannot::cheriDeadCapMode() == memannot::CheriDeadCapMode::Off)
     return false;
   const Function &Fn = MF.getFunction();
