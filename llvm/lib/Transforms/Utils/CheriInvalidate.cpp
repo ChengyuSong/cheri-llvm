@@ -64,6 +64,7 @@
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 
 using namespace llvm;
 
@@ -193,6 +194,25 @@ static cl::opt<bool> InvLoanIntoFreedWipe(
     cl::desc("M7.1d B1: wipe capability slots of a buffer a mem.loan_into "
              "would skip as freed, through the ready dealloc cap before "
              "mem.free (default on; false is byte-identical to 94303ea2)"));
+// [LLM-generated] M7.2c gap fixes round 1. Each is default on; false
+// restores the round-3 output for that rule alone.
+static cl::opt<bool> InvBoxFamilyMayFree(
+    "cheri-invalidate-box-family-mayfree", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: tag a call that takes a mem.box_family capability "
+             "argument as may-free for the dead callee-saved clear"));
+static cl::opt<bool> InvLoanIntoExitAnchor(
+    "cheri-invalidate-loan-into-exit-anchor", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: invalidate the loan_into comparison cap at the scan "
+             "loop exit, so a dead register is nulled there"));
+static cl::opt<bool> InvStoreIntoInt(
+    "cheri-invalidate-store-into-int", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: compare a store_into slot against an address/high/tag "
+             "snapshot taken at the fact, not the live old capability"));
+static cl::opt<bool> InvHeapFreeUntag(
+    "cheri-invalidate-heap-free-untag", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: mark mem.free register invalidates as heap free, so the "
+             "late pass clears the tag of a register still live after the "
+             "free instead of dropping the invalidate"));
 static cl::opt<bool> InvStoreInto(
     "cheri-invalidate-store-into", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B2a/B2b: null a mem.store_into dest at the source mem.free "
@@ -328,6 +348,7 @@ struct Inv {
   unsigned LoanIntoSkippedFreed = 0, LoanIntoSkippedMoved = 0;
   unsigned LoanIntoMovedLive = 0;
   unsigned LoanIntoFreedWipe = 0;
+  unsigned LoanIntoExitAnchors = 0, StoreIntoIntCompares = 0;
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
   unsigned LoanIntoSkippedValReassigned = 0;
@@ -364,6 +385,7 @@ struct Inv {
   SmallVector<LoanIntoScan, 4> PendingLoanInto;
   struct StoreIntoWipe {
     Instruction *Free = nullptr;
+    Instruction *Fact = nullptr;
     // B2a: a ready dest pointer used as-is. B2c: rematerialise
     // GEP(i8, Base, Index*Scale+Add) at the free. If BaseReload / IdxReload
     // are set, load those addresses first (the SSA did not dominate).
@@ -377,6 +399,9 @@ struct Inv {
     Value *Cap = nullptr;
   };
   SmallVector<StoreIntoWipe, 4> PendingStoreInto;
+  // [LLM-generated] M7.2c: one address/high/tag snapshot per fact and cap.
+  DenseMap<std::pair<Instruction *, Value *>, std::array<Value *, 3>>
+      StoreIntoSnaps;
   // Provenance of the capabilities stored into each slot (R4 filter):
   // the identified underlying objects, and whether any origin is unknown.
   struct Prov {
@@ -1287,6 +1312,8 @@ struct Inv {
   static constexpr unsigned KindLoanFree = 0;
   static constexpr unsigned KindScopeEscape = 1;
   static constexpr unsigned KindScopeLocal = 2;
+  // Real heap mem.free only: preserve bits but revoke a live register.
+  static constexpr unsigned KindHeapFree = 3;
 
   // D104. PHIs must stay grouped at the top of the block. A last use that is
   // a PHI (or the next instruction, which is still a PHI) is not a valid
@@ -1421,7 +1448,7 @@ struct Inv {
       // Loan and free stay at At: after the call and after the range-check
       // loads inserted at the same point. Moving them earlier breaks the
       // free sequence and can clear a register the call still needs.
-      if (Kind == KindLoanFree) {
+      if (Kind == KindLoanFree || Kind == KindHeapFree) {
         emitOne(B, V, At, Kind, Counter);
         continue;
       }
@@ -2445,6 +2472,16 @@ struct Inv {
       B.CreateBr(Loop);
       IV->addIncoming(Inc, Next);
       ++LoanIntoScans;
+      // [LLM-generated] M7.2c: put a last-use anchor on the loop exit.
+      // D97 keeps a live owner; a dead comparison cap is nulled here,
+      // including the zero-trip path, not on the loop's backedge.
+      if (InvCapReg && InvLoanIntoExitAnchor && !memannot::cheriInvalidateNone() &&
+          fatCap(S.Loan)) {
+        ++LoanIntoExitAnchors;
+        B.SetInsertPoint(&*Cont->getFirstInsertionPt());
+        B.CreateCall(decl(Intrinsic::cheri_cap_invalidate),
+                     {S.Loan, B.getInt32(KindLoanFree)});
+      }
     }
     PendingLoanInto.clear();
   }
@@ -3277,6 +3314,9 @@ struct Inv {
         }
         StoreIntoWipe W;
         W.Free = At;
+        // The integer snapshot sits at the fact, so it must dominate.
+        if (DT.dominates(Fact, At))
+          W.Fact = Fact;
         W.Cap = Cap;
         if (SlotFact) {
           // B2b: a GlobalVariable base is ready (process-lifetime). Do not
@@ -3330,6 +3370,25 @@ struct Inv {
       Instruction *At = S.Free;
       if (!At || !At->getParent() || !S.Cap)
         continue;
+      // [LLM-generated] M7.2c: snapshot the exact capability bits at
+      // the store fact. Only integers, never the old capability, cross
+      // intervening calls. The tag is a separate part of exact equality.
+      Value *OldAddr = nullptr, *OldHigh = nullptr, *OldTag = nullptr;
+      if (S.Fact && InvStoreIntoInt && !memannot::cheriInvalidateNone()) {
+        auto &Snap = StoreIntoSnaps[{S.Fact, S.Cap}];
+        if (!Snap[0]) {
+          IRBuilder<> Capture(S.Fact);
+          Snap[0] = Capture.CreateCall(
+              decl(Intrinsic::cheri_cap_address_get, {I64}), {S.Cap});
+          Snap[1] = Capture.CreateCall(
+              decl(Intrinsic::cheri_cap_high_get, {I64}), {S.Cap});
+          Snap[2] = Capture.CreateCall(decl(Intrinsic::cheri_cap_tag_get),
+                                       {S.Cap});
+        }
+        OldAddr = Snap[0];
+        OldHigh = Snap[1];
+        OldTag = Snap[2];
+      }
       BasicBlock *Cont =
           SplitBlock(At->getParent(), At->getIterator(),
                      static_cast<DominatorTree *>(nullptr), nullptr, nullptr,
@@ -3367,8 +3426,20 @@ struct Inv {
       }
       Value *Got =
           B.CreateAlignedLoad(CapTy, Dest, Align(16), "storeinto.got");
-      Value *Eq =
-          B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact), {Got, S.Cap});
+      Value *Eq;
+      if (OldAddr) {
+        Value *Addr = B.CreateCall(
+            decl(Intrinsic::cheri_cap_address_get, {I64}), {Got});
+        Value *High = B.CreateCall(
+            decl(Intrinsic::cheri_cap_high_get, {I64}), {Got});
+        Value *Tag = B.CreateCall(decl(Intrinsic::cheri_cap_tag_get), {Got});
+        Eq = B.CreateAnd(B.CreateICmpEQ(Addr, OldAddr),
+                         B.CreateAnd(B.CreateICmpEQ(High, OldHigh),
+                                     B.CreateICmpEQ(Tag, OldTag)));
+        ++StoreIntoIntCompares;
+      } else
+        Eq = B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact),
+                          {Got, S.Cap});
       B.CreateCondBr(Eq, NullBB, Cont);
       B.SetInsertPoint(NullBB);
       auto *St = B.CreateAlignedStore(
@@ -3379,6 +3450,7 @@ struct Inv {
       ++StoreIntoNulls;
     }
     PendingStoreInto.clear();
+    StoreIntoSnaps.clear();
   }
 
   void loanClears(Function &F, DominatorTree &DT) {
@@ -3941,7 +4013,13 @@ struct Inv {
       // D91: the pointer passed to dealloc and dominating copies. Aflog
       // records base/length before the call; this clear is after it, and
       // after any frame-slot range check inserted at the same point.
-      emitCapRegs(B, P, At, DT, CapRegFree);
+      // M7.2c: only rustc's post-dealloc llvm.mem.fact free is a real heap
+      // free. A free bundle on another call (realloc may return the same
+      // block) keeps the drop-if-live rule.
+      bool Heap = InvHeapFreeUntag && !memannot::cheriInvalidateNone() &&
+                memannot::isMemFact(C);
+      emitCapRegsKind(B, P, At, DT, CapRegFree,
+                      Heap ? KindHeapFree : KindLoanFree);
     };
     if (Free)
       for (CallBase *C : Frees) {
@@ -4181,6 +4259,8 @@ struct Inv {
          << " croot_walks=" << CrootWalks
          << " croot_nulls=" << CrootNulls
          << " sret_slots=" << SretSlots
+         << " loan_into_exit_anchor=" << LoanIntoExitAnchors
+         << " store_into_int=" << StoreIntoIntCompares
          << "\n";
     }
   }
@@ -4223,6 +4303,8 @@ static cl::opt<DeadCapToggle> DeadCapOpt(
                           "only across a mem.free or moved-owner call (default)"),
                clEnumValN(DeadCapToggle::All, "all",
                           "across any later call or return")));
+
+bool memannot::cheriInvalidateNone() { return StringRef(InvalidateOpt) == "none"; }
 
 memannot::CheriDeadCapMode memannot::cheriDeadCapMode() {
   switch (DeadCapOpt) {
@@ -4293,6 +4375,13 @@ static void tagMayFreeCalls(Module &M) {
           MayFree = true;
         if (!MayFree && takesMoved(*CB))
           MayFree = true;
+        // [LLM-generated] M7.2c: an owned Box can be moved in SSA,
+        // without a moved alloca. Its callee may free it.
+        for (unsigned A = 0; !MayFree && A != CB->arg_size(); ++A)
+          if (InvBoxFamilyMayFree && !memannot::cheriInvalidateNone() &&
+              DL.isFatPointer(CB->getArgOperand(A)->getType()) &&
+              CB->getParamAttr(A, "mem.box_family").isValid())
+            MayFree = true;
       }
       if (MayFree)
         CB->addFnAttr(Attribute::get(CB->getContext(), "cheri-may-free"));

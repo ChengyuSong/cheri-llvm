@@ -538,6 +538,12 @@ static bool reloadBeforeStore(MachineBasicBlock &MBB,
 static constexpr int KindLoanFree = 0;
 static constexpr int KindScopeEscape = 1;
 static constexpr int KindScopeLocal = 2;
+// [LLM-generated] M7.2c: only an actual mem.free may revoke a live cap.
+static constexpr int KindHeapFree = 3;
+static cl::opt<bool> MovedAddressInt(
+    "cheri-invalidate-moved-address-int", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: at a may-free call, turn a moved Box saved register "
+             "whose later reads are all integer-view reads into an integer"));
 // D101. A dead register overwritten this soon, with no call and no branch
 // in between, is not saved by a callee and has no path that skips the
 // overwrite. Eight instructions covers the move/offset/bounds setup that
@@ -839,6 +845,220 @@ static bool mayFreeBeforeSlotWrite(MachineBasicBlock &MBB,
   return Walk(Walk, MBB, It);
 }
 
+// [LLM-generated] M7.2c: never alter ABI-owned authority registers.
+static bool canClearRegister(Register R, const MachineFunction &MF,
+                             const TargetRegisterInfo &TRI) {
+  if (!R.isPhysical() || !RISCV::YGPRRegClass.contains(R))
+    return false;
+  for (Register ABI : {RISCV::X0_Y, RISCV::X1_Y, RISCV::X2_Y,
+                       RISCV::X3_Y, RISCV::X4_Y})
+    if (TRI.regsOverlap(R, ABI))
+      return false;
+  if (MF.getRegInfo().isReserved(R))
+    return false;
+  return !(MF.getSubtarget<RISCVSubtarget>().getFrameLowering()->hasFP(MF) &&
+           TRI.regsOverlap(R, RISCV::X8_Y));
+}
+
+// Classify reads of R after MI until the next def, on every path.
+// An EH pad that may read R, or an exhausted walk, counts as a capability read.
+// A def which also reads the old bits is checked before stopping the walk.
+// Walk result: Capability (a capability-view read, or unknown), Integer
+// (only integer-view reads), or None (no read before a def or return).
+enum class LaterReads { Capability, Integer, None };
+static LaterReads laterReads(MachineInstr &MI, Register R,
+                             const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 2048;
+  bool Read = false;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    if (ehMayRead(BB, R, TRI))
+      return false;
+    for (; It != BB.end(); ++It) {
+      if (!Budget--)
+        return false;
+      if (It->isDebugInstr())
+        continue;
+      // Inline asm operands are explicit; an asm that names R is a read.
+      // A planted clear is a new def, not a read of the old value.
+      if (It->getOpcode() == RISCV::PseudoCheriCapClear &&
+          definesOverlap(*It, R, TRI))
+        return true;
+      bool IntRead = false, CapRead = false, ImplicitCap = false;
+      for (const MachineOperand &MO : It->operands()) {
+        if (!MO.isReg() || !MO.isUse() || !MO.getReg() || MO.isUndef() ||
+            !TRI.regsOverlap(MO.getReg(), R))
+          continue;
+        if (RISCV::GPRRegClass.contains(MO.getReg()))
+          IntRead = true;
+        else if (MO.isImplicit())
+          ImplicitCap = true;
+        else
+          CapRead = true;
+      }
+      // A kill of a capability through its integer view is printed as an
+      // implicit full-register use. That is not a capability read.
+      if (CapRead || (ImplicitCap && !IntRead))
+        return false;
+      Read |= IntRead;
+      if (definesOverlap(*It, R, TRI))
+        return true;
+    }
+    for (MachineBasicBlock *S : BB.successors()) {
+      if (!Seen.insert(S).second)
+        continue;
+      if (!Self(Self, *S, S->begin()))
+        return false;
+    }
+    return true;
+  };
+  if (!Walk(Walk, *MI.getParent(), std::next(MI.getIterator())))
+    return LaterReads::Capability;
+  return Read ? LaterReads::Integer : LaterReads::None;
+}
+
+// [LLM-generated] M7.2c: do not add an address rewrite for a register
+// already defined through its integer view. A bounded backward search
+// returns true when it cannot prove that the tag is gone.
+static bool mayHoldTagged(MachineInstr &At, Register R,
+                           const TargetRegisterInfo &TRI) {
+  SmallPtrSet<MachineBasicBlock *, 16> Seen;
+  unsigned Budget = 256;
+  auto Walk = [&](auto &Self, MachineBasicBlock &BB,
+                  MachineBasicBlock::iterator It) -> bool {
+    while (It != BB.begin()) {
+      --It;
+      if (!Budget--)
+        return true;
+      if (!definesOverlap(*It, R, TRI))
+        continue;
+      if (It->getOpcode() == RISCV::PseudoCheriCapClear ||
+          It->getOpcode() == RISCV::CClearTag)
+        return false;
+      for (const MachineOperand &MO : It->operands())
+        if (MO.isReg() && MO.isDef() && MO.getReg() &&
+            TRI.regsOverlap(MO.getReg(), R))
+          return RISCV::YGPRRegClass.contains(MO.getReg());
+      return true;
+    }
+    if (BB.pred_empty())
+      return true;
+    for (MachineBasicBlock *P : BB.predecessors()) {
+      if (!Seen.insert(P).second)
+        continue;
+      if (Self(Self, *P, P->end()))
+        return true;
+    }
+    return false;
+  };
+  return Walk(Walk, *At.getParent(), At.getIterator());
+}
+
+static unsigned MovedAddressInts = 0;
+static unsigned HeapFreeUntags = 0;
+static unsigned MovedDeadClears = 0;
+// A direct call to a function that takes an owned Box (rustc marks the
+// parameter "mem.box_family"). Only these calls trigger the integer rewrite.
+static bool isMovedBoxCall(const MachineInstr &MI) {
+  if (!isMayFreeCall(MI))
+    return false;
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isGlobal())
+      continue;
+    const auto *F = dyn_cast<Function>(MO.getGlobal());
+    if (!F)
+      return false;
+    for (unsigned I = 0, E = F->arg_size(); I != E; ++I)
+      if (F->getAttributes().getParamAttr(I, "mem.box_family").isValid())
+        return true;
+    return false;
+  }
+  return false;
+}
+
+// M7.2c rule 5. At a moved-Box call, a callee-saved register whose later
+// reads, until it is redefined, are all integer-view reads keeps only its
+// address. Rewrite it in place to that integer before the call, so neither
+// the callee nor a later call can save the tagged capability.
+static bool clearMovedAddresses(MachineFunction &MF) {
+  // [LLM-generated] Off under -cheri-invalidate=none (byte-stable ablation).
+  if (!MovedAddressInt || memannot::cheriInvalidateNone() ||
+      memannot::cheriDeadCapMode() == memannot::CheriDeadCapMode::Off)
+    return false;
+  const Function &Fn = MF.getFunction();
+  // Same exemption as the dead callee-saved clear: these do not restore.
+  if (Fn.hasFnAttribute(Attribute::Naked) ||
+      (Fn.hasFnAttribute(Attribute::NoReturn) &&
+       Fn.hasFnAttribute(Attribute::NoUnwind) &&
+       !Fn.hasFnAttribute(Attribute::UWTable)))
+    return false;
+  const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
+  const TargetRegisterInfo &TRI = *ST.getRegisterInfo();
+  const TargetInstrInfo &TII = *ST.getInstrInfo();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  bool Changed = false;
+  for (MachineBasicBlock &BB : MF) {
+    for (MachineInstr &Call : BB) {
+      if (!isMovedBoxCall(Call))
+        continue;
+      for (const MCPhysReg *CS = TRI.getCalleeSavedRegs(&MF); CS && *CS;
+           ++CS) {
+        Register Int = *CS;
+        if (!RISCV::GPRRegClass.contains(Int))
+          continue;
+        Register R = TRI.getMatchingSuperReg(Int, RISCV::sub_cap_addr,
+                                             &RISCV::YGPRRegClass);
+        if (!R || !canClearRegister(R, MF, TRI) ||
+            !MRI.isPhysRegModified(R) || readsReg(Call, R, TRI) ||
+            !mayHoldTagged(Call, R, TRI))
+          continue;
+        LaterReads LR = laterReads(Call, R, TRI);
+        if (LR == LaterReads::Capability)
+          continue;
+        if (LR == LaterReads::None) {
+          // Dead across the call. The dead callee-saved clear has usually
+          // nulled it after its last use already; it skips a last use that
+          // is a branch. Do not add a second clear in the same block.
+          bool Cleared = false;
+          for (auto I = Call.getIterator(); I != BB.begin();) {
+            --I;
+            if (!definesOverlap(*I, R, TRI))
+              continue;
+            Cleared = I->getOpcode() == RISCV::PseudoCheriCapClear;
+            break;
+          }
+          if (Cleared)
+            continue;
+          BuildMI(BB, Call.getIterator(), Call.getDebugLoc(),
+                  TII.get(RISCV::PseudoCheriCapClear), R)
+              .addReg(R, RegState::Undef);
+          ++MovedDeadClears;
+          Changed = true;
+          continue;
+        }
+        // R is read after the call, so it is live here. Earlier reads in
+        // this block are no longer kills.
+        for (auto I = Call.getIterator(); I != BB.begin();) {
+          --I;
+          for (MachineOperand &MO : I->operands())
+            if (MO.isReg() && MO.isUse() && MO.getReg() &&
+                TRI.regsOverlap(MO.getReg(), R))
+              MO.setIsKill(false);
+          if (definesOverlap(*I, R, TRI))
+            break;
+        }
+        BuildMI(BB, Call.getIterator(), Call.getDebugLoc(),
+                TII.get(RISCV::PseudoCGetAddr), Int)
+            .addReg(R);
+        ++MovedAddressInts;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 static bool isDeadCapCSR(Register R, const MachineFunction &MF,
                          const TargetRegisterInfo &TRI) {
   if (!R.isPhysical() || !RISCV::YGPRRegClass.contains(R))
@@ -1075,6 +1295,7 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
         SpillRegs.insert(MI.getOperand(0).getReg());
     }
   SmallVector<MachineInstr *, 8> Drop;
+  SmallPtrSet<MachineInstr *, 8> LiveHeapFrees;
   SmallSet<int, 8> ScopeFIs;
   auto keepNull = [&](MachineBasicBlock *MBB, MachineInstr *Before, int FI,
                       unsigned StoreOpc) {
@@ -1100,6 +1321,17 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
       if (std::optional<int> FI = frameAddrFI(Rs, *MI, TRI))
         ScopeFIs.insert(*FI);
     };
+    if (!canClearRegister(Rs, MF, TRI)) {
+      Drop.push_back(MI);
+      continue;
+    }
+    if (Kind == KindHeapFree && !deadAfter(*MI, Rs, TRI)) {
+      // Keep all address/metadata bits, but make later dereferences fail.
+      // REMINDER: speculative ordering/barrier semantics are deferred.
+      LiveHeapFrees.insert(MI);
+      ++HeapFreeUntags;
+      continue;
+    }
     if (Rs.isVirtual() || !deadAfter(*MI, Rs, TRI)) {
       // D97: a live register still holds a cap for a later read (colored
       // frame address, pointer compared after free). Drop the pseudo.
@@ -1292,7 +1524,8 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
       continue;
     Register Rs = MI->getOperand(0).getReg();
     BuildMI(*MI->getParent(), MI, MI->getDebugLoc(),
-            TII.get(RISCV::PseudoCheriCapClear), Rs)
+            TII.get(LiveHeapFrees.count(MI) ? RISCV::CClearTag
+                                          : RISCV::PseudoCheriCapClear), Rs)
         .addReg(Rs);
     MI->eraseFromParent();
     Changed = true;
@@ -1359,11 +1592,23 @@ bool RISCVCheriCapInvalidate::runOnMachineFunction(MachineFunction &MF) {
     }
   }
   Changed |= clearDeadCaps(MF);
+  Changed |= clearMovedAddresses(MF);
   return Changed;
 }
 
 bool RISCVCheriCapInvalidate::doFinalization(Module &) {
   memannot::flushSpillInvalidateStats();
+  if (MovedAddressInts || HeapFreeUntags || MovedDeadClears) {
+    SmallString<96> Buf;
+    raw_svector_ostream OS(Buf);
+    OS << "cheri-capreg-m72c: heap_free_untag=" << HeapFreeUntags
+       << " moved_address_int=" << MovedAddressInts
+       << " moved_dead_clear=" << MovedDeadClears;
+    memannot::appendInvalidateStatsLine(OS.str());
+    MovedAddressInts = 0;
+    HeapFreeUntags = 0;
+    MovedDeadClears = 0;
+  }
   flushDeadCapStats();
   return false;
 }

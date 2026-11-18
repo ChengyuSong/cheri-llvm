@@ -1,0 +1,190 @@
+# [LLM-generated] M7.2c gap fixes round 1, late MIR pass part.
+# Kind 3 (heap free): a register still read after the free has its tag
+# cleared in place (CClearTag), keeping address and bounds. A dead one is
+# nulled as before. Kind 0 (loan/free) still drops a live invalidate.
+# ra/sp/gp/tp are never touched, whatever the kind.
+# At a moved-Box call (callee has a "mem.box_family" parameter and the call
+# is tagged riscv-cheri-mayfree), a saved register later read only through
+# its integer view becomes that integer (PseudoCGetAddr, the cgetaddr form);
+# a dead one is nulled; one read later as a capability is left alone.
+# REMINDER: speculative-execution semantics of these clears are deferred
+# (e.g. treating ccleartag as a barrier); this test checks committed code.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
+# RUN: FileCheck %s --check-prefix=STATS < %t.stats
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-moved-address-int=false -o - %s | FileCheck %s --check-prefix=OFF
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate=none -o - %s | FileCheck %s --check-prefix=NONE
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @heap_live() addrspace(200) { ret void }
+  define void @heap_dead() addrspace(200) { ret void }
+  define void @loan_live() addrspace(200) { ret void }
+  define void @heap_sp() addrspace(200) { ret void }
+  define void @moved_int() addrspace(200) { ret void }
+  define void @moved_dead() addrspace(200) { ret void }
+  define void @moved_cap() addrspace(200) { ret void }
+  define void @plain_call_int() addrspace(200) { ret void }
+  declare void @eat(ptr addrspace(200) "mem.box_family"="__rust_alloc") addrspace(200)
+  declare void @later() addrspace(200)
+...
+---
+name:            heap_live
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 3
+    $x11_y = CIncOffsetImm $x10_y, 16
+    PseudoCRET implicit $x11_y
+
+# CHECK-LABEL: name: heap_live
+# CHECK: $x10_y = CClearTag $x10_y
+# CHECK-NEXT: $x11_y = CIncOffsetImm $x10_y, 16
+---
+name:            heap_dead
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 3
+    PseudoCRET
+
+# CHECK-LABEL: name: heap_dead
+# CHECK: $x10_y = PseudoCheriCapClear $x10_y
+# CHECK-NOT: CClearTag
+---
+name:            loan_live
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    PseudoCheriCapInvalidate $x10_y, 0
+    $x11_y = CIncOffsetImm $x10_y, 16
+    PseudoCRET implicit $x11_y
+
+# CHECK-LABEL: name: loan_live
+# CHECK-NOT: CClearTag
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: $x11_y = CIncOffsetImm $x10_y, 16
+---
+name:            heap_sp
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    PseudoCheriCapInvalidate $x2_y, 3
+    PseudoCheriCapInvalidate $x3_y, 3
+    PseudoCRET implicit $x2_y, implicit $x3_y
+
+# CHECK-LABEL: name: heap_sp
+# CHECK-NOT: CClearTag
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: PseudoCRET
+---
+name:            moved_int
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @eat, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    PseudoCCALL target-flags(riscv-call) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    $x11_y = CIncOffset $x0_y, $x9, implicit killed $x9_y
+    PseudoCRET implicit $x11_y
+
+# Read only as an address after the moved-Box call: integer before the call.
+# CHECK-LABEL: name: moved_int
+# CHECK: $x9 = PseudoCGetAddr $x9_y
+# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @eat
+# OFF-LABEL: name: moved_int
+# OFF-NOT: PseudoCGetAddr
+# NONE-LABEL: name: moved_int
+# NONE-NOT: PseudoCGetAddr
+---
+name:            moved_dead
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    BEQ $x9, $x0, %bb.2
+  bb.1:
+    liveins: $x10_y
+    PseudoCRET
+  bb.2:
+    liveins: $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @eat, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    PseudoCRET
+
+# Last read is an integer-view branch, which the dead callee-saved clear
+# does not cover. Dead at the moved-Box call: nulled right before it.
+# CHECK-LABEL: name: moved_dead
+# CHECK: bb.2:
+# CHECK: $x9_y = PseudoCheriCapClear undef $x9_y
+# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @eat
+# NONE-LABEL: name: moved_dead
+# NONE: bb.2:
+# NONE-NOT: PseudoCheriCapClear
+# NONE: PseudoCCALL
+# OFF-LABEL: name: moved_dead
+# OFF: bb.2:
+# OFF-NOT: PseudoCheriCapClear
+# OFF: PseudoCCALL
+---
+name:            moved_cap
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @eat, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    $x10_y = COPY $x9_y
+    PseudoCRET implicit $x10_y
+
+# Still read as a capability: untouched.
+# CHECK-LABEL: name: moved_cap
+# CHECK-NOT: PseudoCGetAddr
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: PseudoCRET
+---
+name:            plain_call_int
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y
+    $x9_y = COPY $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @later, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    $x11_y = CIncOffset $x0_y, $x9, implicit killed $x9_y
+    PseudoCRET implicit $x11_y
+
+# A may-free call that is not a moved-Box call does not trigger rule 5.
+# CHECK-LABEL: name: plain_call_int
+# CHECK-NOT: PseudoCGetAddr
+# CHECK: PseudoCRET
+
+# STATS: cheri-capreg-m72c: heap_free_untag=1 moved_address_int=1 moved_dead_clear=1

@@ -299,6 +299,10 @@ LLVM_ABI bool cheriFreeZeroRegsEnabled();
 /// that takes a moved owner. All: the previous C1 rule, any call or return.
 enum class CheriDeadCapMode { Off, MayFree, All };
 LLVM_ABI CheriDeadCapMode cheriDeadCapMode();
+/// [LLM-generated] M7.2c fixes r2. True when -cheri-invalidate=none. The
+/// round-1 gap-fix transforms are off then, so the none ablation stays
+/// byte-identical to builds without them.
+LLVM_ABI bool cheriInvalidateNone();
 } // namespace memannot
 } // namespace llvm
 #endif
