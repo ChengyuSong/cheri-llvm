@@ -256,6 +256,19 @@ static cl::opt<bool> InvWipeCapWords(
 // 42/46 calls at typic-const 2 or 5 words; 8 covers those plus slightly
 // larger ADTs, while 12/60/64-word variable Vecs stay on the helper.
 // 0 disables unroll (every fact becomes a helper call).
+// [LLM-generated] M7.2c lb register gaps, fix 1. rustc emits
+// mem.wipe_cap_words(P, len) for the whole buffer after element drop and
+// right before its final dealloc. A mem.loan_into scan of that buffer after
+// the wipe is subsumed (the wipe nulled every capability word) and, when the
+// dealloc is out of line (no mem.free bundle in this function), would run
+// through the stale buffer cap after the block may have been reused. Lowered
+// wipe: drop the scan. Wipe lowering off: run the scan at the wipe instead.
+// Off is byte-identical to 5b8f6c01 (eb81fda9a).
+static cl::opt<bool> InvLoanIntoWipeFree(
+    "cheri-invalidate-loan-into-wipe-free", cl::init(true), cl::Hidden,
+    cl::desc("M7.2c: treat mem.wipe_cap_words as the free point of its "
+             "buffer for mem.loan_into scans (drop the subsumed scan, or "
+             "anchor it at the wipe when wipe lowering is off)"));
 static cl::opt<unsigned> InvWipeCapWordsUnroll(
     "cheri-invalidate-wipe-cap-words-unroll", cl::init(8), cl::Hidden,
     cl::desc("Inline/unroll mem.wipe_cap_words for constant len of at "
@@ -348,6 +361,9 @@ struct Inv {
   unsigned LoanIntoSkippedFreed = 0, LoanIntoSkippedMoved = 0;
   unsigned LoanIntoMovedLive = 0;
   unsigned LoanIntoFreedWipe = 0;
+  // M7.2c fix 1: scans dropped because a lowered mem.wipe_cap_words of the
+  // buffer lies between the fact and the last use, or re-anchored at it.
+  unsigned LoanIntoSkippedWiped = 0, LoanIntoWipeAnchored = 0;
   unsigned LoanIntoExitAnchors = 0, StoreIntoIntCompares = 0;
   unsigned LoanIntoSkippedPromoted = 0, LoanIntoSkippedNoval = 0;
   unsigned LoanIntoValFacts = 0, LoanIntoSkippedValFreed = 0;
@@ -2132,6 +2148,76 @@ struct Inv {
     return true;
   }
 
+  // M7.2c fix 1. A mem.wipe_cap_words fact of Buf on every path from Fact
+  // to At. Buf is the buffer cap itself (Direct) or, when Buf is null, the
+  // cap currently held in frame slot A+Off (no store between wipe and At).
+  CallBase *wipeOfBufBetween(Value *Buf, AllocaInst *A, int64_t Off,
+                             Instruction *Fact, Instruction *At,
+                             ArrayRef<CallBase *> Wipes,
+                             DominatorTree &DT) const {
+    CallBase *Found = nullptr;
+    for (CallBase *W : Wipes) {
+      auto OB = W->getOperandBundle(memannot::TagWipeCapWords);
+      if (!OB || OB->Inputs.size() < 2)
+        continue;
+      Value *P = OB->Inputs[0];
+      if (!P->getType()->isPointerTy() || isa<UndefValue>(P))
+        continue;
+      if (!dominatesBetween(Fact, W, At, DT))
+        continue;
+      bool This = false;
+      if (Buf) {
+        This = mayBeThisBuffer(P, Buf);
+        // Two loads of the same frame slot with no store in between.
+        if (!This)
+          if (auto *BL = dyn_cast<LoadInst>(Buf->stripPointerCasts())) {
+            AllocaInst *BA = nullptr;
+            int64_t BOff = 0;
+            if (frameSlot(BL->getPointerOperand(), BA, BOff) &&
+                loadFromSlot(P, BA, BOff)) {
+              if (DT.dominates(BL, W))
+                This = !storeToSlotBetween(BL, W, BA, BOff, DT);
+              else if (DT.dominates(W, BL))
+                This = !storeToSlotBetween(W, BL, BA, BOff, DT);
+            }
+          }
+      } else if (A) {
+        This = loadFromSlot(P, A, Off) && !storeToSlotBetween(W, At, A, Off, DT);
+      }
+      if (This)
+        Found = W;
+    }
+    return Found;
+  }
+  // Returns true when the scan was handled (dropped or re-anchored).
+  bool loanIntoWipeFree(Value *Buf, AllocaInst *A, int64_t Off, Value *Loan,
+                        Instruction *Fact, Instruction *At,
+                        ArrayRef<CallBase *> Wipes, DominatorTree &DT) {
+    if (!InvLoanIntoWipeFree || Wipes.empty())
+      return false;
+    CallBase *W = wipeOfBufBetween(Buf, A, Off, Fact, At, Wipes, DT);
+    if (!W)
+      return false;
+    if (InvWipeCapWords) {
+      ++LoanIntoSkippedWiped;
+      return true;
+    }
+    Value *WBuf = W->getOperandBundle(memannot::TagWipeCapWords)->Inputs[0];
+    if (!DL.isFatPointer(WBuf->getType()) || !loanValAvailable(Loan, W, DT) ||
+        !loanValAvailable(WBuf, W, DT))
+      return false;
+    ++LoanIntoWipeAnchored;
+    PendingLoanInto.push_back({W, WBuf, Loan, true});
+    return true;
+  }
+  void collectWipes(Function &F, SmallVectorImpl<CallBase *> &Wipes) const {
+    if (!InvLoanIntoWipeFree)
+      return;
+    for (Instruction &I : instructions(F))
+      if (memannot::isMemWipeCapWordsFact(&I))
+        Wipes.push_back(cast<CallBase>(&I));
+  }
+
   void loanIntoPlan(Function &F, DominatorTree &DT) {
     unsigned LUKind = M.getContext().getMDKindID(memannot::LastUseMD);
     SmallVector<Instruction *, 8> Carriers;
@@ -2158,6 +2244,8 @@ struct Inv {
       if (CB->getOperandBundle(memannot::TagFree))
         Frees.push_back(CB);
     }
+    SmallVector<CallBase *, 4> Wipes;
+    collectWipes(F, Wipes);
     for (CallBase *Fact : Facts) {
       auto OB = Fact->getOperandBundle(memannot::TagLoanInto);
       if (!OB || OB->Inputs.size() < 3)
@@ -2209,6 +2297,21 @@ struct Inv {
           bool Direct = false;
           if (loanIntoMovedLiveTarget(A, Off, Slot, Loan, Id, Fact, At, DT,
                                       Moves, Frees, Tgt, Direct)) {
+            if (!Wipes.empty()) {
+              AllocaInst *TA = nullptr;
+              int64_t TOff = 0;
+              bool Handled =
+                  Direct ? loanIntoWipeFree(Tgt, nullptr, 0, Loan, Fact, At,
+                                            Wipes, DT)
+                         : frameSlot(Tgt, TA, TOff) &&
+                               loanIntoWipeFree(nullptr, TA, TOff, Loan, Fact,
+                                                At, Wipes, DT);
+              if (!Handled)
+                Handled = loanIntoWipeFree(nullptr, A, Off, Loan, Fact, At,
+                                           Wipes, DT);
+              if (Handled)
+                continue;
+            }
             ++LoanIntoMovedLive;
             PendingLoanInto.push_back({At, Tgt, Loan, Direct});
             continue;
@@ -2248,6 +2351,8 @@ struct Inv {
           ++LoanIntoSkippedNoval;
           continue;
         }
+        if (loanIntoWipeFree(nullptr, A, Off, Loan, Fact, At, Wipes, DT))
+          continue;
         PendingLoanInto.push_back({At, Slot, Loan, false});
       }
     }
@@ -2353,6 +2458,8 @@ struct Inv {
       if (CB->getOperandBundle(memannot::TagFree))
         Frees.push_back(CB);
     }
+    SmallVector<CallBase *, 4> Wipes;
+    collectWipes(F, Wipes);
     for (CallBase *Fact : Facts) {
       auto OB = Fact->getOperandBundle(memannot::TagLoanIntoVal);
       if (!OB || OB->Inputs.size() < 3)
@@ -2406,6 +2513,8 @@ struct Inv {
             ++LoanIntoSkippedValFreed;
           continue;
         }
+        if (loanIntoWipeFree(Buf, nullptr, 0, Loan, Fact, At, Wipes, DT))
+          continue;
         PendingLoanInto.push_back({At, Buf, Loan, true});
       }
     }
@@ -4232,6 +4341,8 @@ struct Inv {
          << " loan_into_skipped_moved=" << LoanIntoSkippedMoved
          << " loan_into_moved_live=" << LoanIntoMovedLive
          << " loan_into_freed_wipe=" << LoanIntoFreedWipe
+         << " loan_into_skipped_wiped=" << LoanIntoSkippedWiped
+         << " loan_into_wipe_anchored=" << LoanIntoWipeAnchored
          << " loan_into_skipped_promoted=" << LoanIntoSkippedPromoted
          << " loan_into_skipped_noval=" << LoanIntoSkippedNoval
          << " loan_into_val_facts=" << LoanIntoValFacts
@@ -4700,6 +4811,10 @@ static void lowerWipeCapWords(Module &M) {
   SmallVector<CallBase *, 16> Facts;
   collectWipeCapWordsFacts(M, Facts);
   if (!InvWipeCapWords) {
+    // M7.2c fix 1: keep the facts through Inv so a loan_into scan can be
+    // anchored at the wipe; runCheriInvalidate erases them afterwards.
+    if (InvLoanIntoWipeFree)
+      return;
     WipeCapWordsFacts += Facts.size();
     for (CallBase *CB : Facts)
       CB->eraseFromParent();
@@ -4826,6 +4941,10 @@ bool memannot::runCheriInvalidate(Module &M) {
     I.AFLog = Mode.contains("aflog");
     I.run();
   }
+  // M7.2c fix 1: wipe lowering off kept the facts for Inv; drop them now,
+  // exactly as lowerWipeCapWords would have.
+  if (Mode != "none" && !InvWipeCapWords && InvLoanIntoWipeFree)
+    dropWipeCapWordsFacts(M);
   // After invalidation, before stripAnnotations drops mem.free bundles and
   // mem.move facts. The attribute is copied when a bundled call is rebuilt.
   if (cheriDeadCapMode() == CheriDeadCapMode::MayFree)
