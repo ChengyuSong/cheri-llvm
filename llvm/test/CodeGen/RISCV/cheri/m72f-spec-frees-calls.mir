@@ -2,13 +2,16 @@
 # becomes its integer, a dead one is nulled) also fires at a may-free call to
 # a function marked "mem.spec_frees" (rustc: its library spec frees or
 # relocates a block, e.g. RawVec::grow_one, or drop glue that reaches one).
+# The dead clear at these calls is behind -cheri-invalidate-spec-free-dead-clear
+# (off by default; the integer rewrite gave every lb closure).
 # Committed-path clears only; ra/sp are never touched.
 # REMINDER: speculative-execution semantics of these clears are deferred.
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
 # RUN: FileCheck %s --check-prefix=STATS < %t.stats
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-address-int=false -o - %s | FileCheck %s --check-prefix=OFF
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate=none -o - %s | FileCheck %s --check-prefix=OFF
-# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-clear-entry-values -o - %s | FileCheck %s --check-prefix=ENTRY
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-dead-clear -cheri-invalidate-spec-free-clear-entry-values -o - %s | FileCheck %s --check-prefix=ENTRY
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-dead-clear -o - %s | FileCheck %s --check-prefix=DEAD
 
 --- |
   target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
@@ -65,8 +68,12 @@ body:             |
 
 # CHECK-LABEL: name: grow_dead
 # CHECK: bb.2:
-# CHECK: $x9_y = PseudoCheriCapClear undef $x9_y
-# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: PseudoCCALL
+# DEAD-LABEL: name: grow_dead
+# DEAD: bb.2:
+# DEAD: $x9_y = PseudoCheriCapClear undef $x9_y
+# DEAD-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
 # OFF-LABEL: name: grow_dead
 # OFF: bb.2:
 # OFF-NOT: PseudoCheriCapClear
@@ -131,15 +138,19 @@ body:             |
     PseudoCRET
 
 # On the path to the call x9 still holds the caller's value: the dead clear
-# skips it at a spec-only call (drop glue makes these common). The switch
+# (when on) skips it at a spec-only call (drop glue makes these common). The switch
 # restores the clear.
 # CHECK-LABEL: name: grow_dead_entry
 # CHECK: bb.2:
 # CHECK-NOT: PseudoCheriCapClear
 # CHECK: PseudoCCALL
+# DEAD-LABEL: name: grow_dead_entry
+# DEAD: bb.2:
+# DEAD-NOT: PseudoCheriCapClear
+# DEAD: PseudoCCALL
 # ENTRY-LABEL: name: grow_dead_entry
 # ENTRY: bb.2:
 # ENTRY: $x9_y = PseudoCheriCapClear undef $x9_y
 # ENTRY-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
 
-# STATS: cheri-capreg-m72c: heap_free_untag=0 moved_address_int=1 moved_dead_clear=1
+# STATS: cheri-capreg-m72c: heap_free_untag=0 moved_address_int=1 moved_dead_clear=0

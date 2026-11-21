@@ -549,12 +549,20 @@ static cl::opt<bool> MovedAddressInt(
 // reserve, shrink, Box/Vec drop glue, __rust_dealloc/__rust_realloc).
 static cl::opt<bool> SpecFreeAddressInt(
     "cheri-invalidate-spec-free-address-int", cl::init(true), cl::Hidden,
-    cl::desc("M7.2f: apply the moved-address integer rewrite and dead clear "
-             "also at may-free calls to functions marked mem.spec_frees"));
+    cl::desc("M7.2f: apply the moved-address integer rewrite (and, with "
+             "-cheri-invalidate-spec-free-dead-clear, the dead clear) also "
+             "at may-free calls to functions marked mem.spec_frees"));
 // [LLM-generated] M7.2f: at a mem.spec_frees call that does not also take a
 // moved Box, the dead clear skips a register that can only hold the value it
 // had on entry (the caller's). Those calls include drop glue, which is
 // common, and nulling every saved register there cost up to 0.7% .text.
+// [LLM-generated] M7.2f: the dead clear at these calls is off by default.
+// On the lb witnesses every closure came from the integer rewrite, and the
+// dead clears alone cost up to 0.36% .text (heapbench, pool_zero).
+static cl::opt<bool> SpecFreeDeadClear(
+    "cheri-invalidate-spec-free-dead-clear", cl::init(false), cl::Hidden,
+    cl::desc("M7.2f: at mem.spec_frees calls (no moved Box), also null dead "
+             "saved registers; off keeps only the integer rewrite"));
 static cl::opt<bool> SpecFreeClearEntryValues(
     "cheri-invalidate-spec-free-clear-entry-values", cl::init(false),
     cl::Hidden,
@@ -1057,9 +1065,12 @@ static bool clearMovedAddresses(MachineFunction &MF) {
         if (LR == LaterReads::Capability)
           continue;
         if (LR == LaterReads::None) {
-          // [LLM-generated] M7.2f: see SpecFreeClearEntryValues.
-          if (!SpecFreeClearEntryValues && isSpecOnlyFreeCall(Call) &&
-              !mayHoldTagged(Call, R, TRI, /*EntryMayHold=*/false))
+          // [LLM-generated] M7.2f: see SpecFreeDeadClear and
+          // SpecFreeClearEntryValues.
+          if (isSpecOnlyFreeCall(Call) &&
+              (!SpecFreeDeadClear ||
+               (!SpecFreeClearEntryValues &&
+                !mayHoldTagged(Call, R, TRI, /*EntryMayHold=*/false))))
             continue;
           // Dead across the call. The dead callee-saved clear has usually
           // nulled it after its last use already; it skips a last use that
