@@ -200,6 +200,13 @@ static cl::opt<bool> InvBoxFamilyMayFree(
     "cheri-invalidate-box-family-mayfree", cl::init(true), cl::Hidden,
     cl::desc("M7.2c: tag a call that takes a mem.box_family capability "
              "argument as may-free for the dead callee-saved clear"));
+// [LLM-generated] M7.2f: a call to a function marked "mem.spec_frees" (its
+// library spec frees or relocates a block) may free.
+static cl::opt<bool> InvSpecFreesMayFree(
+    "cheri-invalidate-spec-frees-mayfree", cl::init(true), cl::Hidden,
+    cl::desc("M7.2f: tag a call to a function marked mem.spec_frees as "
+             "may-free for the dead callee-saved clear and the late "
+             "address-only rewrite"));
 static cl::opt<bool> InvLoanIntoExitAnchor(
     "cheri-invalidate-loan-into-exit-anchor", cl::init(true), cl::Hidden,
     cl::desc("M7.2c: invalidate the loan_into comparison cap at the scan "
@@ -4489,6 +4496,11 @@ static void tagMayFreeCalls(Module &M) {
         if (!MayFree && memannot::isDeallocCall(*CB))
           MayFree = true;
         if (!MayFree && takesMoved(*CB))
+          MayFree = true;
+        // [LLM-generated] M7.2f: the callee frees or relocates by spec.
+        if (!MayFree && InvSpecFreesMayFree &&
+            !memannot::cheriInvalidateNone() && CB->getCalledFunction() &&
+            CB->getCalledFunction()->hasFnAttribute(memannot::SpecFreesAttr))
           MayFree = true;
         // [LLM-generated] M7.2c: an owned Box can be moved in SSA,
         // without a moved alloca. Its callee may free it.

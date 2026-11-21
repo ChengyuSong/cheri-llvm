@@ -117,6 +117,11 @@ inline constexpr StringRef TagFfiRetain = "mem.ffi_retain";
 /// through an outlined non-volatile helper. Not droppable: losing it
 /// loses the wipe. Generic passes must preserve base and len SSA.
 inline constexpr StringRef TagWipeCapWords = "mem.wipe_cap_words";
+/// [LLM-generated] M7.2f: "mem.spec_frees"="frees"|"relocates"|"drop" function
+/// attribute. rustc puts it on functions whose library spec frees or relocates a
+/// heap block (and on drop glue that reaches one). Generic LLVM keeps it like any
+/// string attribute; the late CHERI machine pass reads it at direct calls.
+inline constexpr StringRef SpecFreesAttr = "mem.spec_frees";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";

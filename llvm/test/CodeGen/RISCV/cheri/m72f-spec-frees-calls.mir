@@ -1,0 +1,112 @@
+# [LLM-generated] M7.2f: the M7.2c moved-Box rule (address-only register
+# becomes its integer, a dead one is nulled) also fires at a may-free call to
+# a function marked "mem.spec_frees" (rustc: its library spec frees or
+# relocates a block, e.g. RawVec::grow_one, or drop glue that reaches one).
+# Committed-path clears only; ra/sp are never touched.
+# REMINDER: speculative-execution semantics of these clears are deferred.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-stats-out=%t.stats -o - %s | FileCheck %s
+# RUN: FileCheck %s --check-prefix=STATS < %t.stats
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-address-int=false -o - %s | FileCheck %s --check-prefix=OFF
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate=none -o - %s | FileCheck %s --check-prefix=OFF
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @grow_int() addrspace(200) { ret void }
+  define void @grow_dead() addrspace(200) { ret void }
+  define void @grow_cap() addrspace(200) { ret void }
+  define void @grow_not_mayfree() addrspace(200) { ret void }
+  declare void @grow_one(ptr addrspace(200)) addrspace(200) "mem.spec_frees"="frees"
+  declare void @plain(ptr addrspace(200)) addrspace(200)
+...
+---
+name:            grow_int
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y
+    $x9_y = COPY $x11_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    $x11_y = CIncOffset $x0_y, $x9, implicit killed $x9_y
+    PseudoCRET implicit $x11_y
+
+# `v.as_ptr()` kept for an address compare across a growing call: integer
+# before the call, so the callee cannot save the tagged copy.
+# CHECK-LABEL: name: grow_int
+# CHECK: $x9 = PseudoCGetAddr $x9_y
+# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
+# OFF-LABEL: name: grow_int
+# OFF-NOT: PseudoCGetAddr
+# OFF: PseudoCRET
+---
+name:            grow_dead
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y
+    $x9_y = COPY $x11_y
+    BEQ $x9, $x0, %bb.2
+  bb.1:
+    liveins: $x10_y
+    PseudoCRET
+  bb.2:
+    liveins: $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    PseudoCRET
+
+# CHECK-LABEL: name: grow_dead
+# CHECK: bb.2:
+# CHECK: $x9_y = PseudoCheriCapClear undef $x9_y
+# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
+# OFF-LABEL: name: grow_dead
+# OFF: bb.2:
+# OFF-NOT: PseudoCheriCapClear
+# OFF: PseudoCCALL
+---
+name:            grow_cap
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y
+    $x9_y = COPY $x11_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    $x10_y = COPY $x9_y
+    PseudoCRET implicit $x10_y
+
+# Still used as a capability after the call: untouched.
+# CHECK-LABEL: name: grow_cap
+# CHECK-NOT: PseudoCGetAddr
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: PseudoCRET
+---
+name:            grow_not_mayfree
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y
+    $x9_y = COPY $x11_y
+    PseudoCCALL target-flags(riscv-call) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @plain, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit-def $x2_y
+    $x11_y = CIncOffset $x0_y, $x9, implicit killed $x9_y
+    PseudoCRET implicit $x11_y
+
+# The marked call without the may-free flag (late IR pass off), and a
+# may-free call to an unmarked function: no rewrite.
+# CHECK-LABEL: name: grow_not_mayfree
+# CHECK-NOT: PseudoCGetAddr
+# CHECK: PseudoCRET
+
+# STATS: cheri-capreg-m72c: heap_free_untag=0 moved_address_int=1 moved_dead_clear=1

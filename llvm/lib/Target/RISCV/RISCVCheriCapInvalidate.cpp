@@ -544,6 +544,13 @@ static cl::opt<bool> MovedAddressInt(
     "cheri-invalidate-moved-address-int", cl::init(true), cl::Hidden,
     cl::desc("M7.2c: at a may-free call, turn a moved Box saved register "
              "whose later reads are all integer-view reads into an integer"));
+// [LLM-generated] M7.2f: also at calls to functions that free or relocate a
+// heap block by their library spec ("mem.spec_frees", e.g. RawVec::grow_one,
+// reserve, shrink, Box/Vec drop glue, __rust_dealloc/__rust_realloc).
+static cl::opt<bool> SpecFreeAddressInt(
+    "cheri-invalidate-spec-free-address-int", cl::init(true), cl::Hidden,
+    cl::desc("M7.2f: apply the moved-address integer rewrite and dead clear "
+             "also at may-free calls to functions marked mem.spec_frees"));
 // D101. A dead register overwritten this soon, with no call and no branch
 // in between, is not saved by a callee and has no path that skips the
 // overwrite. Eight instructions covers the move/offset/bounds setup that
@@ -960,6 +967,7 @@ static unsigned HeapFreeUntags = 0;
 static unsigned MovedDeadClears = 0;
 // A direct call to a function that takes an owned Box (rustc marks the
 // parameter "mem.box_family"). Only these calls trigger the integer rewrite.
+// [LLM-generated] M7.2f: so does a call to a function marked "mem.spec_frees".
 static bool isMovedBoxCall(const MachineInstr &MI) {
   if (!isMayFreeCall(MI))
     return false;
@@ -972,6 +980,9 @@ static bool isMovedBoxCall(const MachineInstr &MI) {
     for (unsigned I = 0, E = F->arg_size(); I != E; ++I)
       if (F->getAttributes().getParamAttr(I, "mem.box_family").isValid())
         return true;
+    // [LLM-generated] M7.2f: a call that frees or relocates a block by spec.
+    if (SpecFreeAddressInt && F->hasFnAttribute(memannot::SpecFreesAttr))
+      return true;
     return false;
   }
   return false;
