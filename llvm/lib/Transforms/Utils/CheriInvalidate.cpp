@@ -3542,9 +3542,13 @@ struct Inv {
         Value *High = B.CreateCall(
             decl(Intrinsic::cheri_cap_high_get, {I64}), {Got});
         Value *Tag = B.CreateCall(decl(Intrinsic::cheri_cap_tag_get), {Got});
-        Eq = B.CreateAnd(B.CreateICmpEQ(Addr, OldAddr),
-                         B.CreateAnd(B.CreateICmpEQ(High, OldHigh),
-                                     B.CreateICmpEQ(Tag, OldTag)));
+        // [LLM-generated] Named steps: C++ leaves the order of nested call
+        // arguments unspecified, so GCC and Clang builds emitted the three
+        // compares in different orders.
+        Value *EqAddr = B.CreateICmpEQ(Addr, OldAddr);
+        Value *EqHigh = B.CreateICmpEQ(High, OldHigh);
+        Value *EqTag = B.CreateICmpEQ(Tag, OldTag);
+        Eq = B.CreateAnd(EqAddr, B.CreateAnd(EqHigh, EqTag));
         ++StoreIntoIntCompares;
       } else
         Eq = B.CreateCall(decl(Intrinsic::cheri_cap_equal_exact),
