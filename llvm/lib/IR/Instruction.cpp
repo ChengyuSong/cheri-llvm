@@ -176,7 +176,9 @@ static void anchorLastUse(Instruction &InsertBefore, MDNode *LU);
 
 // Erase hooks re-enter if an anchor insertion or a CFG walk deletes another
 // carrier. Nested transfers see a half-updated block and must not run.
-static bool InLastUseTransfer = false;
+// [LLM-generated] M7.2e: per thread. rustc optimizes several modules at once on
+// different threads; a shared flag made one thread skip another's transfers.
+static thread_local bool InLastUseTransfer = false;
 
 static void transferLastUse(Instruction &I) {
   if (InLastUseTransfer || !MemLastUseTransfer ||

@@ -31,17 +31,17 @@ x:
 
 define i32 @caller(ptr %p, i1 %b) {
 ; CHECK-LABEL: define i32 @caller(
-; CHECK-SAME: ptr [[P:%.*]], i1 [[B:%.*]]) {
+; CHECK-SAME: ptr [[P:%.*]], i1 [[B:%.*]]) !mem.inline.seq [[META0:![0-9]+]] {
 ; CHECK-NEXT:    br i1 [[B]], label %[[L_I:.*]], label %[[R_I:.*]]
 ; CHECK:       [[L_I]]:
-; CHECK-NEXT:    [[V_I:%.*]] = load i32, ptr [[P]], align 4, !mem.last_use [[META0:![0-9]+]]
+; CHECK-NEXT:    [[V_I:%.*]] = load i32, ptr [[P]], align 4, !mem.last_use [[META1:![0-9]+]]
 ; CHECK-NEXT:    br label %[[TWO_PATHS_EXIT:.*]]
 ; CHECK:       [[R_I]]:
-; CHECK-NEXT:    store i32 0, ptr [[P]], align 4, !mem.last_use [[META1:![0-9]+]]
+; CHECK-NEXT:    store i32 0, ptr [[P]], align 4, !mem.last_use [[META2:![0-9]+]]
 ; CHECK-NEXT:    br label %[[TWO_PATHS_EXIT]]
 ; CHECK:       [[TWO_PATHS_EXIT]]:
 ; CHECK-NEXT:    [[R1:%.*]] = phi i32 [ [[V_I]], %[[L_I]] ], [ 0, %[[R_I]] ]
-; CHECK-NEXT:    call void @g(), !mem.last_use [[META2:![0-9]+]]
+; CHECK-NEXT:    call void @g(), !mem.last_use [[META3:![0-9]+]]
 ; CHECK-NEXT:    ret i32 [[R1]]
 ;
   %r = call i32 @two_paths(ptr %p, i1 %b), !mem.last_use !0
@@ -54,7 +54,8 @@ define i32 @caller(ptr %p, i1 %b) {
 !1 = !{i64 3}
 !2 = !{i64 8}
 ;.
-; CHECK: [[META0]] = !{i64 {{[0-9]+}}, i64 7}
-; CHECK: [[META1]] = !{i64 7}
-; CHECK: [[META2]] = !{i64 8, i64 7}
+; CHECK: [[META0]] = !{i64 1}
+; CHECK: [[META1]] = !{i64 {{[0-9]+}}, i64 7}
+; CHECK: [[META2]] = !{i64 7}
+; CHECK: [[META3]] = !{i64 8, i64 7}
 ;.
