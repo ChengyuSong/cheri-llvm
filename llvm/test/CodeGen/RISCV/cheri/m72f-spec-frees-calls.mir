@@ -8,6 +8,7 @@
 # RUN: FileCheck %s --check-prefix=STATS < %t.stats
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-address-int=false -o - %s | FileCheck %s --check-prefix=OFF
 # RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate=none -o - %s | FileCheck %s --check-prefix=OFF
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spec-free-clear-entry-values -o - %s | FileCheck %s --check-prefix=ENTRY
 
 --- |
   target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
@@ -17,6 +18,7 @@
   define void @grow_dead() addrspace(200) { ret void }
   define void @grow_cap() addrspace(200) { ret void }
   define void @grow_not_mayfree() addrspace(200) { ret void }
+  define void @grow_dead_entry() addrspace(200) { ret void }
   declare void @grow_one(ptr addrspace(200)) addrspace(200) "mem.spec_frees"="frees"
   declare void @plain(ptr addrspace(200)) addrspace(200)
 ...
@@ -108,5 +110,36 @@ body:             |
 # CHECK-LABEL: name: grow_not_mayfree
 # CHECK-NOT: PseudoCGetAddr
 # CHECK: PseudoCRET
+---
+name:            grow_dead_entry
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y
+    BEQ $x11, $x0, %bb.2
+  bb.1:
+    liveins: $x10_y, $x11_y
+    $x9_y = COPY $x11_y
+    $x10_y = COPY $x9_y
+    PseudoCRET implicit $x10_y
+  bb.2:
+    liveins: $x10_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    PseudoCRET
+
+# On the path to the call x9 still holds the caller's value: the dead clear
+# skips it at a spec-only call (drop glue makes these common). The switch
+# restores the clear.
+# CHECK-LABEL: name: grow_dead_entry
+# CHECK: bb.2:
+# CHECK-NOT: PseudoCheriCapClear
+# CHECK: PseudoCCALL
+# ENTRY-LABEL: name: grow_dead_entry
+# ENTRY: bb.2:
+# ENTRY: $x9_y = PseudoCheriCapClear undef $x9_y
+# ENTRY-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
 
 # STATS: cheri-capreg-m72c: heap_free_untag=0 moved_address_int=1 moved_dead_clear=1
