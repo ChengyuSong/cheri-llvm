@@ -72,6 +72,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -2069,11 +2070,11 @@ static bool isLastUseCarrier(const Instruction &I) {
 // loan-end of one copy never names the slots of another copy. Runs before
 // the call site's own ids (caller loans) are moved into the body.
 // [LLM-generated] M5r R15: tests pin the salt to hit a high-bits-zero mix and a
-// collision with an id already live in the caller. 0 keeps the counter.
+// collision with an id already live in the caller. 0 keeps the per-caller counter.
 static cl::opt<uint64_t> InlineLoanSalt(
     "mem-inline-loan-salt", cl::init(0), cl::Hidden,
     cl::desc("If non-zero, every inlined loan rekey uses this salt. "
-             "0 uses the per-inline counter."));
+             "0 uses the per-caller counter."));
 
 // [LLM-generated] M5r R16: production width is 21. A smaller width is how a
 // test fills the packed field without inventing 2^21 caller ids. 0 means 21.
@@ -2088,8 +2089,30 @@ static cl::opt<uint64_t> InlineLoanDisambigMax(
     cl::desc("If non-zero, inlined loan copies may only use disambiguators "
              "1..N. 0 uses the full 64-bit space."));
 
+// [LLM-generated] M7.2e: the salt of the next inline into Caller. It is derived
+// from the caller's name and a per-caller count kept on the function, so it does
+// not depend on what other modules (other threads) inlined before. A process-wide
+// counter made the ids, and through them the optimized IR, vary between builds.
+static uint64_t nextInlineSalt(Function &Caller) {
+  LLVMContext &Ctx = Caller.getContext();
+  unsigned K = Ctx.getMDKindID("mem.inline.seq");
+  uint64_t N = 0;
+  if (MDNode *MD = Caller.getMetadata(K))
+    if (MD->getNumOperands() == 1)
+      if (auto *C = mdconst::dyn_extract_or_null<ConstantInt>(MD->getOperand(0)))
+        N = C->getZExtValue();
+  ++N;
+  Caller.setMetadata(
+      K, MDNode::get(Ctx, ConstantAsMetadata::get(
+                              ConstantInt::get(Type::getInt64Ty(Ctx), N))));
+  uint64_t H = xxh3_64bits(Caller.getName()) ^ (N * 0x9e3779b97f4a7c15ULL);
+  H ^= H >> 31;
+  H *= 0xbf58476d1ce4e5b9ULL;
+  H ^= H >> 29;
+  return H;
+}
+
 static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller) {
-  static std::atomic<uint64_t> Salt{0};
   LLVMContext &Ctx = Caller->getContext();
   unsigned Kinds[2] = {Ctx.getMDKindID(memannot::LastUseMD),
                        Ctx.getMDKindID(memannot::LoanMD)};
@@ -2138,8 +2161,9 @@ static void rekeyInlinedLoans(Function::iterator FirstNewBlock, Function *Caller
       S = Fixed;
       return;
     }
-    while (!(S = ++Salt & 0x1fffff))
-      ;
+    uint64_t H = nextInlineSalt(*Caller);
+    while (!(S = H & 0x1fffff))
+      H = H * 0x9e3779b97f4a7c15ULL + 1;
   };
   // [LLM-generated] M5r R15/R16: mix the previous high bits with this inline's
   // salt so two already-rekeyed copies do not collapse. High 0 aliases an
