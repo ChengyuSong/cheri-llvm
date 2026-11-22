@@ -122,6 +122,16 @@ inline constexpr StringRef TagWipeCapWords = "mem.wipe_cap_words";
 /// heap block (and on drop glue that reaches one). Generic LLVM keeps it like any
 /// string attribute; the late CHERI machine pass reads it at direct calls.
 inline constexpr StringRef SpecFreesAttr = "mem.spec_frees";
+/// [LLM-generated] M7.2g: callee store marks, parameter string attributes. rustc
+/// puts "mem.stores_into"="<key>:<off>[:*<d>];..." on a pointer parameter the body
+/// stores (or, with ":*d", the pointer it reads at byte offset d through that
+/// parameter) into the slot at byte offset off from the parameter marked
+/// "mem.stores_into_dst"="<key>;...". The key only pairs the two. Generic LLVM keeps
+/// them like any string attribute (a removed parameter loses its own mark); the
+/// late CHERI pass turns a mark at a direct call into a caller-side
+/// "mem.store_into_slot" fact.
+inline constexpr StringRef StoresIntoAttr = "mem.stores_into";
+inline constexpr StringRef StoresIntoDstAttr = "mem.stores_into_dst";
 inline constexpr StringRef TagDropped = "mem.dropped";
 inline constexpr StringRef TagCheck = "mem.check";
 inline constexpr StringRef GuardMD = "mem.guard";

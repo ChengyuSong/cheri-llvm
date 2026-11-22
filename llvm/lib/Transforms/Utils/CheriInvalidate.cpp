@@ -226,6 +226,17 @@ static cl::opt<bool> InvStoreInto(
              "when dest is a ready fat pointer (alloca or GlobalVariable, "
              "or a constant GEP of one) still holding that cap "
              "(default on; false is byte-identical to 0c127e28)"));
+// [LLM-generated] M7.2g: callee store marks. At a direct call to a function
+// whose parameter carries "mem.stores_into", add the caller-side
+// "mem.store_into_slot"(dst arg, off, stored cap) fact after the call. The
+// store_into plan then treats it like a local fact: compare and null at the
+// free of the stored pointer's target. Off (or -cheri-invalidate=none, or
+// -cheri-invalidate-store-into=false) adds nothing.
+static cl::opt<bool> InvStoresIntoMarks(
+    "cheri-invalidate-stores-into-marks", cl::init(true), cl::Hidden,
+    cl::desc("M7.2g: add a caller store_into fact at direct calls to "
+             "functions with mem.stores_into parameter marks (default on; "
+             "false adds nothing)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -3355,6 +3366,29 @@ struct Inv {
     Reload = LI->getPointerOperand();
   }
 
+  // [LLM-generated] M7.2g: whether the buffer of Base may be freed between
+  // From and To (a mem.free of it, or a call that consumes it).
+  bool baseFreedBetween(Value *Base, Instruction *From, Instruction *To,
+                        ArrayRef<CallBase *> Frees, DominatorTree &DT) const {
+    Value *P = peelRepresent(Base);
+    for (CallBase *Fr : Frees) {
+      if (Fr == To || !dominatesBetween(From, Fr, To, DT))
+        continue;
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (FB && !FB->Inputs.empty() && capRefersToFreed(P, FB->Inputs[0], &DT))
+        return true;
+    }
+    for (Instruction &I : instructions(*To->getFunction())) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB == To || memannot::isMemFact(CB) ||
+          CB->isLifetimeStartOrEnd())
+        continue;
+      if (dominatesBetween(From, CB, To, DT) && callConsumesCap(CB, P, &DT))
+        return true;
+    }
+    return false;
+  }
+
   void storeIntoPlan(Function &F, DominatorTree &DT) {
     if (!InvStoreInto)
       return;
@@ -3446,6 +3480,16 @@ struct Inv {
           }
           if (slotReassignedBetween(Base, Index, Scale, Add, Fact, At, DT)) {
             ++StoreIntoSkippedReassigned;
+            continue;
+          }
+          // [LLM-generated] M7.2g: a caller-side fact from a callee store mark
+          // names a slot in memory the caller does not own. Skip it when that
+          // memory may already be freed (a free of it, or a call that consumes
+          // it, between the fact and this free): the slot load could go
+          // through a revoked capability.
+          if (Fact->getMetadata("mem.stores_into.mark") &&
+              baseFreedBetween(Base, Fact, At, Frees, DT)) {
+            ++StoreIntoSkippedUnready;
             continue;
           }
           W.Base = Base;
@@ -4679,6 +4723,111 @@ static void insertFfiNarrow(Module &M) {
   }
 }
 
+// [LLM-generated] M7.2g: lower callee store marks at direct calls (see
+// InvStoresIntoMarks). A mark "<key>:<off>" on parameter P, paired with the
+// parameter Q that carries "mem.stores_into_dst" with the same key, becomes
+//   call @llvm.mem.fact() [ "mem.store_into_slot"(argQ, i64 off, argP) ]
+// right after the call. With ":*<d>" the stored value is the pointer read at
+// byte offset d through argP (a shared reference in the callee, so the value
+// read after the call is the one it stored); that load is added after the call
+// and is only used by the fact. Invokes, indirect calls, non-capability
+// arguments and null destinations are skipped. No clear is planted here.
+// Each added fact carries !mem.stores_into.mark, so the store_into plan can
+// apply the extra rule for caller-side facts (the destination base must not be
+// freed before the free that triggers the clear). Counts are returned, not kept
+// in globals: rustc runs this pass on several codegen units at once.
+static constexpr StringRef StoresIntoMarkMD = "mem.stores_into.mark";
+static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+  unsigned StoresIntoMarkCalls = 0, StoresIntoMarkFacts = 0;
+  Function *FactFn = nullptr;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (Function *Callee = CI->getCalledFunction())
+          if (!Callee->isIntrinsic() && !CI->isInlineAsm() &&
+              !CI->isMustTailCall())
+            Calls.push_back(CI);
+    for (CallInst *CI : Calls) {
+      Function *Callee = CI->getCalledFunction();
+      AttributeList AL = Callee->getAttributes();
+      unsigned N = std::min<unsigned>(Callee->arg_size(), CI->arg_size());
+      bool Any = false;
+      Instruction *InsertAfter = CI;
+      for (unsigned P = 0; P != N; ++P) {
+        Attribute A = AL.getParamAttr(P, memannot::StoresIntoAttr);
+        if (!A.isValid() || !A.isStringAttribute())
+          continue;
+        SmallVector<StringRef, 4> Items;
+        A.getValueAsString().split(Items, ';', -1, false);
+        for (StringRef Item : Items) {
+          SmallVector<StringRef, 3> Parts;
+          Item.split(Parts, ':', -1, false);
+          if (Parts.size() < 2 || Parts.size() > 3)
+            continue;
+          StringRef Key = Parts[0];
+          int64_t Off = 0, Deref = -1;
+          if (Parts[1].getAsInteger(10, Off) || Off < 0)
+            continue;
+          if (Parts.size() == 3) {
+            if (!Parts[2].consume_front("*") ||
+                Parts[2].getAsInteger(10, Deref) || Deref < 0)
+              continue;
+          }
+          int Q = -1;
+          for (unsigned J = 0; J != N && Q < 0; ++J) {
+            if (J == P)
+              continue;
+            Attribute D = AL.getParamAttr(J, memannot::StoresIntoDstAttr);
+            if (!D.isValid() || !D.isStringAttribute())
+              continue;
+            SmallVector<StringRef, 4> Keys;
+            D.getValueAsString().split(Keys, ';', -1, false);
+            if (llvm::is_contained(Keys, Key))
+              Q = J;
+          }
+          if (Q < 0)
+            continue;
+          Value *Dst = CI->getArgOperand(Q);
+          Value *Src = CI->getArgOperand(P);
+          if (!Dst->getType()->isPointerTy() || !DL.isFatPointer(Dst->getType()) ||
+              !Src->getType()->isPointerTy() || !DL.isFatPointer(Src->getType()))
+            continue;
+          if (isa<ConstantPointerNull>(Dst) || isa<UndefValue>(Dst) ||
+              isa<ConstantPointerNull>(Src) || isa<UndefValue>(Src))
+            continue;
+          IRBuilder<> B(InsertAfter->getNextNode());
+          Value *Cap = Src;
+          if (Deref >= 0) {
+            Value *Addr = Src;
+            if (Deref)
+              Addr = B.CreateInBoundsGEP(B.getInt8Ty(), Src,
+                                         B.getInt64(Deref), "storesinto.addr");
+            Cap = B.CreateAlignedLoad(Src->getType(), Addr, Align(16),
+                                      "storesinto.cap");
+          }
+          if (!FactFn)
+            FactFn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::mem_fact);
+          OperandBundleDef OB(memannot::TagStoreIntoSlot.str(),
+                              std::vector<Value *>{Dst, B.getInt64(Off), Cap});
+          CallInst *FactCI = B.CreateCall(FactFn, {}, {OB});
+          FactCI->setMetadata(StoresIntoMarkMD,
+                              MDNode::get(M.getContext(), {}));
+          InsertAfter = FactCI;
+          ++StoresIntoMarkFacts;
+          Any = true;
+        }
+      }
+      if (Any)
+        ++StoresIntoMarkCalls;
+    }
+  }
+  return {StoresIntoMarkCalls, StoresIntoMarkFacts};
+}
+
 // [LLM-generated] M7.2a-w1-opt. Outlined non-volatile helper: for every
 // cap-sized slot wholly in [ptr, ptr+len), store a null capability.
 // len==0 returns before the pointer is used. llvm.sideeffect plus unknown
@@ -4929,6 +5078,7 @@ bool memannot::runCheriInvalidate(Module &M) {
     }
   }
   StringRef Mode = InvalidateOpt;
+  std::pair<unsigned, unsigned> MarkCounts = {0, 0};
   if (Mode == "none") {
     // None disables every LLVM invalidation half, including wipe:
     // drop the fact, do not lower it to stores. rustc typic/grow
@@ -4937,6 +5087,8 @@ bool memannot::runCheriInvalidate(Module &M) {
   } else {
     insertFfiNarrow(M);
     lowerWipeCapWords(M);
+    if (InvStoresIntoMarks && InvStoreInto)
+      MarkCounts = lowerStoresIntoMarks(M);
   }
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
@@ -4957,6 +5109,14 @@ bool memannot::runCheriInvalidate(Module &M) {
     I.AFLog = Mode.contains("aflog");
     I.run();
   }
+  // [LLM-generated] M7.2g: a separate line, only when a mark fired, so stats
+  // files of builds without marks stay unchanged.
+  if (MarkCounts.second)
+    memannot::appendInvalidateStatsLine(
+        ("cheri-stores-into-marks: " + M.getModuleIdentifier() +
+         " calls=" + Twine(MarkCounts.first) +
+         " facts=" + Twine(MarkCounts.second))
+            .str());
   // M7.2c fix 1: wipe lowering off kept the facts for Inv; drop them now,
   // exactly as lowerWipeCapWords would have.
   if (Mode != "none" && !InvWipeCapWords && InvLoanIntoWipeFree)
