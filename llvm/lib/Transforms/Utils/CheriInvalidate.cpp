@@ -237,6 +237,13 @@ static cl::opt<bool> InvStoresIntoMarks(
     cl::desc("M7.2g: add a caller store_into fact at direct calls to "
              "functions with mem.stores_into parameter marks (default on; "
              "false adds nothing)"));
+// [LLM-generated] M7.2h: also lower the marks at invokes (calls that can
+// unwind). The fact goes at the start of the normal destination, only when the
+// invoke is that block's single predecessor; the unwind path gets no fact.
+static cl::opt<bool> InvStoresIntoMarksInvoke(
+    "cheri-invalidate-stores-into-marks-invoke", cl::init(true), cl::Hidden,
+    cl::desc("M7.2h: lower mem.stores_into marks at invokes too, on the normal "
+             "path (default on; false is the M7.2g output)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -4730,8 +4737,11 @@ static void insertFfiNarrow(Module &M) {
 // right after the call. With ":*<d>" the stored value is the pointer read at
 // byte offset d through argP (a shared reference in the callee, so the value
 // read after the call is the one it stored); that load is added after the call
-// and is only used by the fact. Invokes, indirect calls, non-capability
-// arguments and null destinations are skipped. No clear is planted here.
+// and is only used by the fact. Indirect calls, non-capability arguments and
+// null destinations are skipped. M7.2h: an invoke gets the fact (and load) at
+// the start of its normal destination when the invoke is that block's single
+// predecessor, and is skipped otherwise (and with
+// -cheri-invalidate-stores-into-marks-invoke=false). No clear is planted here.
 // Each added fact carries !mem.stores_into.mark, so the store_into plan can
 // apply the extra rule for caller-side facts (the destination base must not be
 // freed before the free that triggers the clear). Counts are returned, not kept
@@ -4744,19 +4754,31 @@ static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
-    SmallVector<CallInst *, 8> Calls;
-    for (Instruction &I : instructions(F))
-      if (auto *CI = dyn_cast<CallInst>(&I))
-        if (Function *Callee = CI->getCalledFunction())
-          if (!Callee->isIntrinsic() && !CI->isInlineAsm() &&
-              !CI->isMustTailCall())
-            Calls.push_back(CI);
-    for (CallInst *CI : Calls) {
+    SmallVector<CallBase *, 8> Calls;
+    for (Instruction &I : instructions(F)) {
+      auto *CI = dyn_cast<CallBase>(&I);
+      if (!CI || !(isa<CallInst>(CI) ||
+                   (InvStoresIntoMarksInvoke && isa<InvokeInst>(CI))))
+        continue;
+      if (Function *Callee = CI->getCalledFunction())
+        if (!Callee->isIntrinsic() && !CI->isInlineAsm() &&
+            !CI->isMustTailCall())
+          Calls.push_back(CI);
+    }
+    for (CallBase *CI : Calls) {
       Function *Callee = CI->getCalledFunction();
       AttributeList AL = Callee->getAttributes();
       unsigned N = std::min<unsigned>(Callee->arg_size(), CI->arg_size());
       bool Any = false;
-      Instruction *InsertAfter = CI;
+      // New instructions go before InsertPt, in order: right after a call, or
+      // at the start of an invoke's normal destination.
+      Instruction *InsertPt = CI->getNextNode();
+      if (auto *II = dyn_cast<InvokeInst>(CI)) {
+        BasicBlock *Normal = II->getNormalDest();
+        if (Normal->getSinglePredecessor() != II->getParent())
+          continue;
+        InsertPt = &*Normal->getFirstInsertionPt();
+      }
       for (unsigned P = 0; P != N; ++P) {
         Attribute A = AL.getParamAttr(P, memannot::StoresIntoAttr);
         if (!A.isValid() || !A.isStringAttribute())
@@ -4799,7 +4821,7 @@ static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
           if (isa<ConstantPointerNull>(Dst) || isa<UndefValue>(Dst) ||
               isa<ConstantPointerNull>(Src) || isa<UndefValue>(Src))
             continue;
-          IRBuilder<> B(InsertAfter->getNextNode());
+          IRBuilder<> B(InsertPt);
           Value *Cap = Src;
           if (Deref >= 0) {
             Value *Addr = Src;
@@ -4816,7 +4838,6 @@ static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
           CallInst *FactCI = B.CreateCall(FactFn, {}, {OB});
           FactCI->setMetadata(StoresIntoMarkMD,
                               MDNode::get(M.getContext(), {}));
-          InsertAfter = FactCI;
           ++StoresIntoMarkFacts;
           Any = true;
         }
