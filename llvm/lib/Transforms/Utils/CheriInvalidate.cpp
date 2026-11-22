@@ -438,8 +438,14 @@ struct Inv {
     int64_t Scale = 1;
     int64_t Add = 0;
     Value *Cap = nullptr;
+    // [LLM-generated] M7.2i: the fact came from a callee store mark (stats).
+    bool Mark = false;
   };
   SmallVector<StoreIntoWipe, 4> PendingStoreInto;
+  // [LLM-generated] M7.2i: clears planted from callee store mark facts, and the
+  // functions they sit in (stats only; the census of where marks fire).
+  unsigned StoreIntoMarkNulls = 0;
+  SmallVector<std::string, 4> StoreIntoMarkFns;
   // [LLM-generated] M7.2c: one address/high/tag snapshot per fact and cap.
   DenseMap<std::pair<Instruction *, Value *>, std::array<Value *, 3>>
       StoreIntoSnaps;
@@ -3471,6 +3477,7 @@ struct Inv {
         }
         StoreIntoWipe W;
         W.Free = At;
+        W.Mark = Fact->getMetadata("mem.stores_into.mark") != nullptr;
         // The integer snapshot sits at the fact, so it must dominate.
         if (DT.dominates(Fact, At))
           W.Fact = Fact;
@@ -3619,6 +3626,12 @@ struct Inv {
       markClear(St, "cheri_inv_store_into");
       B.CreateBr(Cont);
       ++StoreIntoNulls;
+      if (S.Mark) {
+        ++StoreIntoMarkNulls;
+        std::string Name = Fn->getName().str();
+        if (!llvm::is_contained(StoreIntoMarkFns, Name))
+          StoreIntoMarkFns.push_back(Name);
+      }
     }
     PendingStoreInto.clear();
     StoreIntoSnaps.clear();
@@ -4435,6 +4448,17 @@ struct Inv {
          << " loan_into_exit_anchor=" << LoanIntoExitAnchors
          << " store_into_int=" << StoreIntoIntCompares
          << "\n";
+    }
+    // [LLM-generated] M7.2i: a separate line, only when a mark clear was
+    // planted, so stats files of builds without one stay unchanged.
+    if (StoreIntoMarkNulls) {
+      std::string Line = "cheri-stores-into-mark-nulls: " +
+                         M.getModuleIdentifier() +
+                         " nulls=" + std::to_string(StoreIntoMarkNulls) +
+                         " fns=";
+      for (size_t I = 0; I != StoreIntoMarkFns.size(); ++I)
+        Line += (I ? "," : "") + StoreIntoMarkFns[I];
+      memannot::appendInvalidateStatsLine(Line);
     }
   }
 };
