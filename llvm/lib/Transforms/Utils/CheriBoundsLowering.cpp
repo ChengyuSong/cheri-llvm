@@ -351,8 +351,11 @@ static void runNarrowTagCheck(Module &M) {
         Then = SplitBlockAndInsertIfThen(CB.CreateCall(TagF, {In}), Cold, true);
         ++NarrowTagLazy;
       } else {
-        Value *Lost = B.CreateAnd(B.CreateCall(TagF, {In}),
-                                  B.CreateNot(B.CreateCall(TagF, {N})));
+        // [LLM-generated] Named steps: nested call arguments have no fixed
+        // evaluation order in C++, so the IR order depended on the host compiler.
+        Value *InTag = B.CreateCall(TagF, {In});
+        Value *NoTag = B.CreateNot(B.CreateCall(TagF, {N}));
+        Value *Lost = B.CreateAnd(InTag, NoTag);
         Then = SplitBlockAndInsertIfThen(Lost, After, true);
       }
       IRBuilder<> TB(Then);
@@ -1468,8 +1471,11 @@ struct Lowering {
           Value *NP = narrow(B, Mk.ParentBase, PL, false);
           Function *AG = Intrinsic::getOrInsertDeclaration(
               &M, Intrinsic::cheri_cap_address_get, {B.getInt64Ty()});
-          Value *Off = B.CreateSub(B.CreateCall(AG, {Mk.Base}),
-                                   B.CreateCall(AG, {Mk.ParentBase}));
+          // [LLM-generated] Named steps: fixed order independent of the host
+          // compiler (see the narrow tag check above).
+          Value *BaseA = B.CreateCall(AG, {Mk.Base});
+          Value *ParentA = B.CreateCall(AG, {Mk.ParentBase});
+          Value *Off = B.CreateSub(BaseA, ParentA);
           Base = B.CreateGEP(B.getInt8Ty(), NP, Off);
           ++S.ParentFirst;
         }

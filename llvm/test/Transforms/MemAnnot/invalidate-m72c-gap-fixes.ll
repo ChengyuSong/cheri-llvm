@@ -85,9 +85,9 @@ define void @loan_into_exit(ptr addrspace(200) %buf, ptr addrspace(200) %loan) {
 ; CHECK-NEXT: call {{.*}}@use(ptr addrspace(200) %dest)
 ; CHECK: %storeinto.got = load ptr addrspace(200), ptr addrspace(200) %dest
 ; CHECK-NOT: @llvm.cheri.cap.equal.exact
-; CHECK: icmp eq i1 {{.*}}, [[T]]
-; CHECK: icmp eq i64 {{.*}}, [[H]]
 ; CHECK: icmp eq i64 {{.*}}, [[A]]
+; CHECK: icmp eq i64 {{.*}}, [[H]]
+; CHECK: icmp eq i1 {{.*}}, [[T]]
 ; CHECK: store volatile ptr addrspace(200) null, ptr addrspace(200) %dest
 ; CHECK: call {{.*}}@free(
 ; OFF-LABEL: define void @store_into_int(

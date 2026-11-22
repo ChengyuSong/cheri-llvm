@@ -544,6 +544,30 @@ static cl::opt<bool> MovedAddressInt(
     "cheri-invalidate-moved-address-int", cl::init(true), cl::Hidden,
     cl::desc("M7.2c: at a may-free call, turn a moved Box saved register "
              "whose later reads are all integer-view reads into an integer"));
+// [LLM-generated] M7.2f: also at calls to functions that free or relocate a
+// heap block by their library spec ("mem.spec_frees", e.g. RawVec::grow_one,
+// reserve, shrink, Box/Vec drop glue, __rust_dealloc/__rust_realloc).
+static cl::opt<bool> SpecFreeAddressInt(
+    "cheri-invalidate-spec-free-address-int", cl::init(true), cl::Hidden,
+    cl::desc("M7.2f: apply the moved-address integer rewrite (and, with "
+             "-cheri-invalidate-spec-free-dead-clear, the dead clear) also "
+             "at may-free calls to functions marked mem.spec_frees"));
+// [LLM-generated] M7.2f: at a mem.spec_frees call that does not also take a
+// moved Box, the dead clear skips a register that can only hold the value it
+// had on entry (the caller's). Those calls include drop glue, which is
+// common, and nulling every saved register there cost up to 0.7% .text.
+// [LLM-generated] M7.2f: the dead clear at these calls is off by default.
+// On the lb witnesses every closure came from the integer rewrite, and the
+// dead clears alone cost up to 0.36% .text (heapbench, pool_zero).
+static cl::opt<bool> SpecFreeDeadClear(
+    "cheri-invalidate-spec-free-dead-clear", cl::init(false), cl::Hidden,
+    cl::desc("M7.2f: at mem.spec_frees calls (no moved Box), also null dead "
+             "saved registers; off keeps only the integer rewrite"));
+static cl::opt<bool> SpecFreeClearEntryValues(
+    "cheri-invalidate-spec-free-clear-entry-values", cl::init(false),
+    cl::Hidden,
+    cl::desc("M7.2f: at mem.spec_frees calls, also dead-clear saved "
+             "registers that hold only their entry value"));
 // D101. A dead register overwritten this soon, with no call and no branch
 // in between, is not saved by a callee and has no path that skips the
 // overwrite. Eight instructions covers the move/offset/bounds setup that
@@ -921,8 +945,11 @@ static LaterReads laterReads(MachineInstr &MI, Register R,
 // [LLM-generated] M7.2c: do not add an address rewrite for a register
 // already defined through its integer view. A bounded backward search
 // returns true when it cannot prove that the tag is gone.
+// [LLM-generated] M7.2f: EntryMayHold is the answer when the search reaches
+// the function entry with no definition, i.e. R holds the caller's value.
 static bool mayHoldTagged(MachineInstr &At, Register R,
-                           const TargetRegisterInfo &TRI) {
+                           const TargetRegisterInfo &TRI,
+                           bool EntryMayHold = true) {
   SmallPtrSet<MachineBasicBlock *, 16> Seen;
   unsigned Budget = 256;
   auto Walk = [&](auto &Self, MachineBasicBlock &BB,
@@ -943,7 +970,7 @@ static bool mayHoldTagged(MachineInstr &At, Register R,
       return true;
     }
     if (BB.pred_empty())
-      return true;
+      return EntryMayHold;
     for (MachineBasicBlock *P : BB.predecessors()) {
       if (!Seen.insert(P).second)
         continue;
@@ -960,6 +987,7 @@ static unsigned HeapFreeUntags = 0;
 static unsigned MovedDeadClears = 0;
 // A direct call to a function that takes an owned Box (rustc marks the
 // parameter "mem.box_family"). Only these calls trigger the integer rewrite.
+// [LLM-generated] M7.2f: so does a call to a function marked "mem.spec_frees".
 static bool isMovedBoxCall(const MachineInstr &MI) {
   if (!isMayFreeCall(MI))
     return false;
@@ -972,7 +1000,27 @@ static bool isMovedBoxCall(const MachineInstr &MI) {
     for (unsigned I = 0, E = F->arg_size(); I != E; ++I)
       if (F->getAttributes().getParamAttr(I, "mem.box_family").isValid())
         return true;
+    // [LLM-generated] M7.2f: a call that frees or relocates a block by spec.
+    if (SpecFreeAddressInt && F->hasFnAttribute(memannot::SpecFreesAttr))
+      return true;
     return false;
+  }
+  return false;
+}
+
+// [LLM-generated] M7.2f: a moved-address call only because of
+// "mem.spec_frees" (no parameter marked "mem.box_family").
+static bool isSpecOnlyFreeCall(const MachineInstr &MI) {
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isGlobal())
+      continue;
+    const auto *F = dyn_cast<Function>(MO.getGlobal());
+    if (!F)
+      return false;
+    for (unsigned I = 0, E = F->arg_size(); I != E; ++I)
+      if (F->getAttributes().getParamAttr(I, "mem.box_family").isValid())
+        return false;
+    return F->hasFnAttribute(memannot::SpecFreesAttr);
   }
   return false;
 }
@@ -1017,6 +1065,13 @@ static bool clearMovedAddresses(MachineFunction &MF) {
         if (LR == LaterReads::Capability)
           continue;
         if (LR == LaterReads::None) {
+          // [LLM-generated] M7.2f: see SpecFreeDeadClear and
+          // SpecFreeClearEntryValues.
+          if (isSpecOnlyFreeCall(Call) &&
+              (!SpecFreeDeadClear ||
+               (!SpecFreeClearEntryValues &&
+                !mayHoldTagged(Call, R, TRI, /*EntryMayHold=*/false))))
+            continue;
           // Dead across the call. The dead callee-saved clear has usually
           // nulled it after its last use already; it skips a last use that
           // is a branch. Do not add a second clear in the same block.
