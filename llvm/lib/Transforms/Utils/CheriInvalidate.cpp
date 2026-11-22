@@ -3366,6 +3366,29 @@ struct Inv {
     Reload = LI->getPointerOperand();
   }
 
+  // [LLM-generated] M7.2g: whether the buffer of Base may be freed between
+  // From and To (a mem.free of it, or a call that consumes it).
+  bool baseFreedBetween(Value *Base, Instruction *From, Instruction *To,
+                        ArrayRef<CallBase *> Frees, DominatorTree &DT) const {
+    Value *P = peelRepresent(Base);
+    for (CallBase *Fr : Frees) {
+      if (Fr == To || !dominatesBetween(From, Fr, To, DT))
+        continue;
+      auto FB = Fr->getOperandBundle(memannot::TagFree);
+      if (FB && !FB->Inputs.empty() && capRefersToFreed(P, FB->Inputs[0], &DT))
+        return true;
+    }
+    for (Instruction &I : instructions(*To->getFunction())) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB == To || memannot::isMemFact(CB) ||
+          CB->isLifetimeStartOrEnd())
+        continue;
+      if (dominatesBetween(From, CB, To, DT) && callConsumesCap(CB, P, &DT))
+        return true;
+    }
+    return false;
+  }
+
   void storeIntoPlan(Function &F, DominatorTree &DT) {
     if (!InvStoreInto)
       return;
@@ -3457,6 +3480,16 @@ struct Inv {
           }
           if (slotReassignedBetween(Base, Index, Scale, Add, Fact, At, DT)) {
             ++StoreIntoSkippedReassigned;
+            continue;
+          }
+          // [LLM-generated] M7.2g: a caller-side fact from a callee store mark
+          // names a slot in memory the caller does not own. Skip it when that
+          // memory may already be freed (a free of it, or a call that consumes
+          // it, between the fact and this free): the slot load could go
+          // through a revoked capability.
+          if (Fact->getMetadata("mem.stores_into.mark") &&
+              baseFreedBetween(Base, Fact, At, Frees, DT)) {
+            ++StoreIntoSkippedUnready;
             continue;
           }
           W.Base = Base;
@@ -4699,10 +4732,14 @@ static void insertFfiNarrow(Module &M) {
 // read after the call is the one it stored); that load is added after the call
 // and is only used by the fact. Invokes, indirect calls, non-capability
 // arguments and null destinations are skipped. No clear is planted here.
-static unsigned StoresIntoMarkCalls = 0, StoresIntoMarkFacts = 0;
-static void lowerStoresIntoMarks(Module &M) {
+// Each added fact carries !mem.stores_into.mark, so the store_into plan can
+// apply the extra rule for caller-side facts (the destination base must not be
+// freed before the free that triggers the clear). Counts are returned, not kept
+// in globals: rustc runs this pass on several codegen units at once.
+static constexpr StringRef StoresIntoMarkMD = "mem.stores_into.mark";
+static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
   const DataLayout &DL = M.getDataLayout();
-  StoresIntoMarkCalls = StoresIntoMarkFacts = 0;
+  unsigned StoresIntoMarkCalls = 0, StoresIntoMarkFacts = 0;
   Function *FactFn = nullptr;
   for (Function &F : M) {
     if (F.isDeclaration())
@@ -4776,7 +4813,10 @@ static void lowerStoresIntoMarks(Module &M) {
             FactFn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::mem_fact);
           OperandBundleDef OB(memannot::TagStoreIntoSlot.str(),
                               std::vector<Value *>{Dst, B.getInt64(Off), Cap});
-          InsertAfter = B.CreateCall(FactFn, {}, {OB});
+          CallInst *FactCI = B.CreateCall(FactFn, {}, {OB});
+          FactCI->setMetadata(StoresIntoMarkMD,
+                              MDNode::get(M.getContext(), {}));
+          InsertAfter = FactCI;
           ++StoresIntoMarkFacts;
           Any = true;
         }
@@ -4785,6 +4825,7 @@ static void lowerStoresIntoMarks(Module &M) {
         ++StoresIntoMarkCalls;
     }
   }
+  return {StoresIntoMarkCalls, StoresIntoMarkFacts};
 }
 
 // [LLM-generated] M7.2a-w1-opt. Outlined non-volatile helper: for every
@@ -5037,6 +5078,7 @@ bool memannot::runCheriInvalidate(Module &M) {
     }
   }
   StringRef Mode = InvalidateOpt;
+  std::pair<unsigned, unsigned> MarkCounts = {0, 0};
   if (Mode == "none") {
     // None disables every LLVM invalidation half, including wipe:
     // drop the fact, do not lower it to stores. rustc typic/grow
@@ -5046,7 +5088,7 @@ bool memannot::runCheriInvalidate(Module &M) {
     insertFfiNarrow(M);
     lowerWipeCapWords(M);
     if (InvStoresIntoMarks && InvStoreInto)
-      lowerStoresIntoMarks(M);
+      MarkCounts = lowerStoresIntoMarks(M);
   }
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
@@ -5069,11 +5111,11 @@ bool memannot::runCheriInvalidate(Module &M) {
   }
   // [LLM-generated] M7.2g: a separate line, only when a mark fired, so stats
   // files of builds without marks stay unchanged.
-  if (StoresIntoMarkFacts)
+  if (MarkCounts.second)
     memannot::appendInvalidateStatsLine(
         ("cheri-stores-into-marks: " + M.getModuleIdentifier() +
-         " calls=" + Twine(StoresIntoMarkCalls) +
-         " facts=" + Twine(StoresIntoMarkFacts))
+         " calls=" + Twine(MarkCounts.first) +
+         " facts=" + Twine(MarkCounts.second))
             .str());
   // M7.2c fix 1: wipe lowering off kept the facts for Inv; drop them now,
   // exactly as lowerWipeCapWords would have.

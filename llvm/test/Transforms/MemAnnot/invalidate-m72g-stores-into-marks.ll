@@ -69,4 +69,16 @@ define void @unpaired(ptr addrspace(200) %heap, ptr addrspace(200) %buf) {
 ; CHECK-NOT: store volatile ptr addrspace(200) null
 ; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
 
-; STATS: cheri-stores-into-marks: {{.*}} calls=2 facts=2
+; The destination block is freed before the stored pointer's target: the slot
+; may sit in freed (soon revoked) memory, so no compare and clear.
+define void @dst_freed(ptr addrspace(200) %heap, ptr addrspace(200) %buf) {
+  call void @put(ptr addrspace(200) %heap, ptr addrspace(200) %buf)
+  call void @free(ptr addrspace(200) %heap) [ "mem.free"(ptr addrspace(200) %heap) ]
+  call void @free(ptr addrspace(200) %buf) [ "mem.free"(ptr addrspace(200) %buf) ]
+  ret void
+}
+; CHECK-LABEL: define void @dst_freed(
+; CHECK-NOT: store volatile ptr addrspace(200) null
+; CHECK: call {{.*}}@free(ptr addrspace(200) %buf)
+
+; STATS: cheri-stores-into-marks: {{.*}} calls=3 facts=3
