@@ -1,0 +1,71 @@
+# [LLM-generated] M7.2l: the M7.2c/M7.2f moved-address integer rewrite at a
+# may-free "mem.spec_frees" call also fires when the address-only register is
+# later spilled to a stack spill slot whose reloads are all integer-view reads
+# (lb2 O2: `v.as_ptr()` in s8 across `grow_one`, spilled, reload only feeds an
+# address compare). A reload read as a capability keeps today's behaviour.
+# Committed-path rewrite only (no ccleartag/cgetaddr on a speculative path);
+# ra/sp are never touched.
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -target-abi l64pc128d -mattr=+m,+a,+f,+d,+c,+xcheri,+xcheripurecap -verify-machineinstrs -run-pass=riscv-cheri-cap-invalidate -cheri-invalidate-spill-address-int=false -o - %s | FileCheck %s --check-prefix=OFF
+
+--- |
+  target datalayout = "e-m:e-p:64:64-pf200:128:128:128:64-i64:64-i128:128-n32:64-S128-A200-P200-G200"
+  target triple = "riscv64"
+
+  define void @spill_int() addrspace(200) { ret void }
+  define void @spill_cap() addrspace(200) { ret void }
+  declare void @grow_one(ptr addrspace(200)) addrspace(200) "mem.spec_frees"="frees"
+...
+---
+name:            spill_int
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y, $x9
+    $x24_y = COPY $x11_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    CSC_128 killed $x24_y, %stack.0, 0
+    $x24_y = COPY $x0_y
+    $x13_y = CLC_128 %stack.0, 0
+    $x11 = XOR killed $x13, $x9
+    PseudoCRET implicit $x11
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# CHECK-LABEL: name: spill_int
+# CHECK: $x24 = PseudoCGetAddr $x24_y
+# CHECK-NEXT: PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one
+# OFF-LABEL: name: spill_int
+# OFF-NOT: PseudoCGetAddr
+# OFF: PseudoCRET
+---
+name:            spill_cap
+alignment:       2
+tracksRegLiveness: true
+noVRegs:         true
+isSSA:           false
+body:             |
+  bb.0:
+    liveins: $x10_y, $x11_y, $x9
+    $x24_y = COPY $x11_y
+    PseudoCCALL target-flags(riscv-call, riscv-cheri-mayfree) @grow_one, csr_il32pc64d_l64pc128d, implicit-def dead $x1_y, implicit $x10_y, implicit-def $x2_y
+    CSC_128 killed $x24_y, %stack.0, 0
+    $x24_y = COPY $x0_y
+    $x10_y = CLC_128 %stack.0, 0
+    PseudoCRET implicit $x10_y
+
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 16,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+
+# The reload is returned as a capability: no rewrite.
+# CHECK-LABEL: name: spill_cap
+# CHECK-NOT: PseudoCGetAddr
+# CHECK: PseudoCRET
