@@ -35,6 +35,9 @@
 //     -cheri-invalidate-wipe-cap-words=false and -cheri-invalidate=none
 //     drop the fact and plant no stores. The rustc typic/grow path is
 //     a separate rustc flag (-Zcheri-wipe-cap-words=no).
+//   * M7.2n: llvm.mem.fact ["mem.escape_unknown"(ptr cap)] becomes a call to
+//     the runtime's cheri_note_escape(cap) under -cheri-invalidate-noreuse
+//     (a lost operand: cheri_note_escape_anywhere()). Off: dropped.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -266,6 +269,17 @@ static cl::opt<bool> InvStoreIntoBytes(
     "cheri-invalidate-store-into-bytes", cl::init(true), cl::Hidden,
     cl::desc("M7.2m: honor rustc's !mem.store_into.bytes store_into facts "
              "(byte copies of pointers; default on; false ignores them)"));
+// [LLM-generated] M7.2n: rustc's "mem.escape_unknown"(cap) facts (a pointer
+// left to a place no fact names). On: each becomes a call to the runtime's
+// cheri_note_escape(cap), so the heap block holding cap is never reused; a
+// fact whose operand was lost (poison/undef or the ".lost" tag) becomes
+// cheri_note_escape_anywhere() (global no-reuse). The note reads no address
+// and clears no tag; the runtime decides at its epoch. Off (default), and
+// with -cheri-invalidate=none, the facts are dropped: no call, no symbol.
+static cl::opt<bool> InvNoReuse(
+    "cheri-invalidate-noreuse", cl::init(false), cl::Hidden,
+    cl::desc("M7.2n: lower mem.escape_unknown facts to cheri_note_escape "
+             "runtime calls (default off: drop them)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -5188,6 +5202,54 @@ static void lowerWipeCapWords(Module &M) {
   }
 }
 
+// [LLM-generated] M7.2n: lower (On) or drop every mem.escape_unknown fact.
+// Runs after the invalidation planning, so the inserted calls do not change
+// any clear decision. Returns {notes, global notes, dropped}.
+static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On) {
+  SmallVector<CallBase *, 16> Facts;
+  for (Function &Fn : M) {
+    if (Fn.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(Fn))
+      if (memannot::isMemEscapeUnknownFact(&I))
+        Facts.push_back(cast<CallBase>(&I));
+  }
+  std::array<unsigned, 3> N = {0, 0, 0};
+  if (Facts.empty())
+    return N;
+  // The runtime's own module (it defines cheri_note_escape) is never noted:
+  // its indirect calls hand it the arena and list heads, not escaping caps.
+  if (Function *RT = M.getFunction("cheri_note_escape"); RT && !RT->isDeclaration())
+    On = false;
+  LLVMContext &C = M.getContext();
+  Type *Void = Type::getVoidTy(C);
+  for (CallBase *CB : Facts) {
+    if (!On) {
+      ++N[2];
+      CB->eraseFromParent();
+      continue;
+    }
+    Value *Cap = nullptr;
+    if (auto OB = CB->getOperandBundle(memannot::TagEscapeUnknown))
+      if (OB->Inputs.size() == 1)
+        Cap = OB->Inputs[0];
+    IRBuilder<> B(CB);
+    if (!Cap || !Cap->getType()->isPointerTy() || isa<UndefValue>(Cap)) {
+      FunctionCallee F =
+          M.getOrInsertFunction("cheri_note_escape_anywhere", Void);
+      B.CreateCall(F);
+      ++N[1];
+    } else {
+      FunctionCallee F =
+          M.getOrInsertFunction("cheri_note_escape", Void, Cap->getType());
+      B.CreateCall(F, {Cap});
+      ++N[0];
+    }
+    CB->eraseFromParent();
+  }
+  return N;
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -5281,6 +5343,14 @@ bool memannot::runCheriInvalidate(Module &M) {
   // exactly as lowerWipeCapWords would have.
   if (Mode != "none" && !InvWipeCapWords && InvLoanIntoWipeFree)
     dropWipeCapWordsFacts(M);
+  // [LLM-generated] M7.2n: after planning, before the strip. -cheri-invalidate=none
+  // drops the facts like every other LLVM half. Stats line only when a fact existed.
+  std::array<unsigned, 3> NR = lowerEscapeUnknown(M, InvNoReuse && Mode != "none");
+  if (NR[0] || NR[1] || NR[2])
+    memannot::appendInvalidateStatsLine(
+        ("cheri-noreuse: " + M.getModuleIdentifier() + " notes=" + Twine(NR[0]) +
+         " global=" + Twine(NR[1]) + " dropped=" + Twine(NR[2]))
+            .str());
   // After invalidation, before stripAnnotations drops mem.free bundles and
   // mem.move facts. The attribute is copied when a bundled call is rebuilt.
   if (cheriDeadCapMode() == CheriDeadCapMode::MayFree)

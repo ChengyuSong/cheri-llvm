@@ -252,6 +252,11 @@ void Value::dropDroppableUse(Use &U) {
     StringRef NewTag = memannot::TagDropped;
     if (Cur == memannot::TagLoanInto || Cur == memannot::TagLoanIntoPromoted)
       NewTag = memannot::TagLoanIntoPromoted;
+    // [LLM-generated] M7.2n: a lost escape operand must not become mem.dropped
+    // (InstCombine deletes those); the late pass turns ".lost" into the global
+    // no-reuse note.
+    if (Cur == memannot::TagEscapeUnknown || Cur == memannot::TagEscapeUnknownLost)
+      NewTag = memannot::TagEscapeUnknownLost;
     BOI.Tag = II->getContext().pImpl->getOrInsertBundleTag(NewTag);
     return;
   }
