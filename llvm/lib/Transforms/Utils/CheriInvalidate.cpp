@@ -244,6 +244,17 @@ static cl::opt<bool> InvStoresIntoMarksInvoke(
     "cheri-invalidate-stores-into-marks-invoke", cl::init(true), cl::Hidden,
     cl::desc("M7.2h: lower mem.stores_into marks at invokes too, on the normal "
              "path (default on; false is the M7.2g output)"));
+// [LLM-generated] M7.2j: rustc emits the caller-side fact for a callee store
+// mark itself, right after the call at codegen time, tagged
+// !mem.stores_into.at_call (and !mem.stores_into.mark), so it is still there
+// when the callee is inlined before this pass. On: the store_into plan uses
+// those facts like the ones lowerStoresIntoMarks adds, and lowerStoresIntoMarks
+// does not add a second fact for the same mark at a call that survives. Off:
+// the at-call facts are erased before planning (the M7.2i plan).
+static cl::opt<bool> InvStoresIntoMarksAtCall(
+    "cheri-invalidate-stores-into-marks-at-call", cl::init(true), cl::Hidden,
+    cl::desc("M7.2j: honor rustc's !mem.stores_into.at_call store_into facts "
+             "(default on; false erases them, the M7.2i plan)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -438,8 +449,14 @@ struct Inv {
     int64_t Scale = 1;
     int64_t Add = 0;
     Value *Cap = nullptr;
+    // [LLM-generated] M7.2i: the fact came from a callee store mark (stats).
+    bool Mark = false;
   };
   SmallVector<StoreIntoWipe, 4> PendingStoreInto;
+  // [LLM-generated] M7.2i: clears planted from callee store mark facts, and the
+  // functions they sit in (stats only; the census of where marks fire).
+  unsigned StoreIntoMarkNulls = 0;
+  SmallVector<std::string, 4> StoreIntoMarkFns;
   // [LLM-generated] M7.2c: one address/high/tag snapshot per fact and cap.
   DenseMap<std::pair<Instruction *, Value *>, std::array<Value *, 3>>
       StoreIntoSnaps;
@@ -3471,6 +3488,7 @@ struct Inv {
         }
         StoreIntoWipe W;
         W.Free = At;
+        W.Mark = Fact->getMetadata("mem.stores_into.mark") != nullptr;
         // The integer snapshot sits at the fact, so it must dominate.
         if (DT.dominates(Fact, At))
           W.Fact = Fact;
@@ -3619,6 +3637,12 @@ struct Inv {
       markClear(St, "cheri_inv_store_into");
       B.CreateBr(Cont);
       ++StoreIntoNulls;
+      if (S.Mark) {
+        ++StoreIntoMarkNulls;
+        std::string Name = Fn->getName().str();
+        if (!llvm::is_contained(StoreIntoMarkFns, Name))
+          StoreIntoMarkFns.push_back(Name);
+      }
     }
     PendingStoreInto.clear();
     StoreIntoSnaps.clear();
@@ -4436,6 +4460,17 @@ struct Inv {
          << " store_into_int=" << StoreIntoIntCompares
          << "\n";
     }
+    // [LLM-generated] M7.2i: a separate line, only when a mark clear was
+    // planted, so stats files of builds without one stay unchanged.
+    if (StoreIntoMarkNulls) {
+      std::string Line = "cheri-stores-into-mark-nulls: " +
+                         M.getModuleIdentifier() +
+                         " nulls=" + std::to_string(StoreIntoMarkNulls) +
+                         " fns=";
+      for (size_t I = 0; I != StoreIntoMarkFns.size(); ++I)
+        Line += (I ? "," : "") + StoreIntoMarkFns[I];
+      memannot::appendInvalidateStatsLine(Line);
+    }
   }
 };
 } // namespace
@@ -4747,7 +4782,55 @@ static void insertFfiNarrow(Module &M) {
 // freed before the free that triggers the clear). Counts are returned, not kept
 // in globals: rustc runs this pass on several codegen units at once.
 static constexpr StringRef StoresIntoMarkMD = "mem.stores_into.mark";
-static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
+static constexpr StringRef StoresIntoAtCallMD = "mem.stores_into.at_call";
+
+// [LLM-generated] M7.2j: is there a rustc at-call fact for the same mark (same
+// destination and offset, and the same source for a mark without ":*d") from
+// From to the end of its block? Then lowerStoresIntoMarks adds nothing.
+static bool hasAtCallFact(Instruction *From, Value *Dst, int64_t Off,
+                          Value *Src, bool Deref) {
+  for (Instruction *I = From; I; I = I->getNextNode()) {
+    auto *CI = dyn_cast<CallInst>(I);
+    if (!CI || !CI->getMetadata(StoresIntoAtCallMD))
+      continue;
+    auto OB = CI->getOperandBundle(memannot::TagStoreIntoSlot);
+    if (!OB || OB->Inputs.size() != 3)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(OB->Inputs[1].get());
+    if (!C || C->getSExtValue() != Off ||
+        OB->Inputs[0]->stripPointerCasts() != Dst->stripPointerCasts())
+      continue;
+    if (Deref || OB->Inputs[2]->stripPointerCasts() == Src->stripPointerCasts())
+      return true;
+  }
+  return false;
+}
+
+// [LLM-generated] M7.2j: -cheri-invalidate-stores-into-marks-at-call=false.
+static unsigned dropAtCallFacts(Module &M) {
+  SmallVector<Instruction *, 16> Dead;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getMetadata(StoresIntoAtCallMD))
+          Dead.push_back(CI);
+  for (Instruction *I : Dead)
+    I->eraseFromParent();
+  return Dead.size();
+}
+
+static unsigned countAtCallFacts(Module &M) {
+  unsigned N = 0;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getMetadata(StoresIntoAtCallMD))
+          ++N;
+  return N;
+}
+
+static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M,
+                                                          unsigned &Deduped) {
   const DataLayout &DL = M.getDataLayout();
   unsigned StoresIntoMarkCalls = 0, StoresIntoMarkFacts = 0;
   Function *FactFn = nullptr;
@@ -4821,6 +4904,11 @@ static std::pair<unsigned, unsigned> lowerStoresIntoMarks(Module &M) {
           if (isa<ConstantPointerNull>(Dst) || isa<UndefValue>(Dst) ||
               isa<ConstantPointerNull>(Src) || isa<UndefValue>(Src))
             continue;
+          if (InvStoresIntoMarksAtCall &&
+              hasAtCallFact(InsertPt, Dst, Off, Src, Deref >= 0)) {
+            ++Deduped;
+            continue;
+          }
           IRBuilder<> B(InsertPt);
           Value *Cap = Src;
           if (Deref >= 0) {
@@ -5100,6 +5188,7 @@ bool memannot::runCheriInvalidate(Module &M) {
   }
   StringRef Mode = InvalidateOpt;
   std::pair<unsigned, unsigned> MarkCounts = {0, 0};
+  unsigned AtCallFacts = 0, AtCallDropped = 0, AtCallDeduped = 0;
   if (Mode == "none") {
     // None disables every LLVM invalidation half, including wipe:
     // drop the fact, do not lower it to stores. rustc typic/grow
@@ -5108,8 +5197,12 @@ bool memannot::runCheriInvalidate(Module &M) {
   } else {
     insertFfiNarrow(M);
     lowerWipeCapWords(M);
+    if (!InvStoresIntoMarksAtCall)
+      AtCallDropped = dropAtCallFacts(M);
+    else
+      AtCallFacts = countAtCallFacts(M);
     if (InvStoresIntoMarks && InvStoreInto)
-      MarkCounts = lowerStoresIntoMarks(M);
+      MarkCounts = lowerStoresIntoMarks(M, AtCallDeduped);
   }
   bool All = Mode == "all";
   // [LLM-generated] R10 (D73 default): "slite" = scope without own nulls.
@@ -5137,6 +5230,13 @@ bool memannot::runCheriInvalidate(Module &M) {
         ("cheri-stores-into-marks: " + M.getModuleIdentifier() +
          " calls=" + Twine(MarkCounts.first) +
          " facts=" + Twine(MarkCounts.second))
+            .str());
+  // [LLM-generated] M7.2j: likewise only when the module had at-call facts.
+  if (AtCallFacts || AtCallDropped)
+    memannot::appendInvalidateStatsLine(
+        ("cheri-stores-into-marks-at-call: " + M.getModuleIdentifier() +
+         " facts=" + Twine(AtCallFacts) + " dropped=" + Twine(AtCallDropped) +
+         " deduped=" + Twine(AtCallDeduped))
             .str());
   // M7.2c fix 1: wipe lowering off kept the facts for Inv; drop them now,
   // exactly as lowerWipeCapWords would have.
