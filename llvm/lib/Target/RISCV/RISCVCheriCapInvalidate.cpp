@@ -890,8 +890,47 @@ static bool canClearRegister(Register R, const MachineFunction &MF,
 // Walk result: Capability (a capability-view read, or unknown), Integer
 // (only integer-view reads), or None (no read before a def or return).
 enum class LaterReads { Capability, Integer, None };
+// [LLM-generated] M7.2l: a spill of R to a stack spill slot whose reloads are
+// all read only through their integer view is an integer read of R (lb2 O2:
+// `v.as_ptr()` lives in s8 across `grow_one`, is spilled, and its reload only
+// feeds an address compare). Off: a spill is a capability read, as before.
+static cl::opt<bool> SpillAddressInt(
+    "cheri-invalidate-spill-address-int", cl::init(true), cl::Hidden,
+    cl::desc("M7.2l: in the moved-address integer rewrite, treat a spill to "
+             "a stack slot whose reloads are all integer-view reads as an "
+             "integer read"));
 static LaterReads laterReads(MachineInstr &MI, Register R,
-                             const TargetRegisterInfo &TRI) {
+                             const TargetRegisterInfo &TRI,
+                             bool FollowSpills = true);
+
+// [LLM-generated] M7.2l: every access of spill slot FI is a spill store or a
+// spill reload (at most 8) whose loaded value is never read as a capability.
+static bool spillSlotIntegerOnly(MachineFunction &MF, int FI,
+                                 const TargetRegisterInfo &TRI) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  if (FI < 0 || !MFI.isSpillSlotObjectIndex(FI) || isCalleeSavedSlot(MFI, FI))
+    return false;
+  unsigned Reloads = 0;
+  for (MachineBasicBlock &BB : MF)
+    for (MachineInstr &I : BB) {
+      std::optional<int> Got = frameIndexOf(I);
+      if (!Got || *Got != FI)
+        continue;
+      if (isSpillStore(I.getOpcode()))
+        continue;
+      if (!isSpillReload(I.getOpcode()) || !I.getOperand(0).isReg() ||
+          ++Reloads > 8)
+        return false;
+      if (laterReads(I, I.getOperand(0).getReg(), TRI,
+                     /*FollowSpills=*/false) == LaterReads::Capability)
+        return false;
+    }
+  return true;
+}
+
+static LaterReads laterReads(MachineInstr &MI, Register R,
+                             const TargetRegisterInfo &TRI,
+                             bool FollowSpills) {
   SmallPtrSet<MachineBasicBlock *, 16> Seen;
   unsigned Budget = 2048;
   bool Read = false;
@@ -909,6 +948,16 @@ static LaterReads laterReads(MachineInstr &MI, Register R,
       if (It->getOpcode() == RISCV::PseudoCheriCapClear &&
           definesOverlap(*It, R, TRI))
         return true;
+      // [LLM-generated] M7.2l: see SpillAddressInt.
+      if (FollowSpills && SpillAddressInt && isSpillStore(It->getOpcode()) &&
+          It->getOperand(0).isReg() &&
+          TRI.regsOverlap(It->getOperand(0).getReg(), R)) {
+        std::optional<int> FI = frameIndexOf(*It);
+        if (FI && spillSlotIntegerOnly(*It->getMF(), *FI, TRI)) {
+          Read = true;
+          continue;
+        }
+      }
       bool IntRead = false, CapRead = false, ImplicitCap = false;
       for (const MachineOperand &MO : It->operands()) {
         if (!MO.isReg() || !MO.isUse() || !MO.getReg() || MO.isUndef() ||
