@@ -255,6 +255,17 @@ static cl::opt<bool> InvStoresIntoMarksAtCall(
     "cheri-invalidate-stores-into-marks-at-call", cl::init(true), cl::Hidden,
     cl::desc("M7.2j: honor rustc's !mem.stores_into.at_call store_into facts "
              "(default on; false erases them, the M7.2i plan)"));
+// [LLM-generated] M7.2m: rustc tags a store_into_slot fact for a byte copy out
+// of a pointer-holding value (copy_nonoverlapping::<u8> of a pointer, or of a
+// byte buffer an earlier such copy filled) with !mem.store_into.bytes. The
+// destination of a byte copy has no alignment guarantee, so at the free the
+// slot is compared and nulled only when its address is capability-aligned (a
+// misaligned copy carries no tag). Like a mark fact, it is skipped when the
+// destination buffer may already be freed. Off: those facts are not planned.
+static cl::opt<bool> InvStoreIntoBytes(
+    "cheri-invalidate-store-into-bytes", cl::init(true), cl::Hidden,
+    cl::desc("M7.2m: honor rustc's !mem.store_into.bytes store_into facts "
+             "(byte copies of pointers; default on; false ignores them)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -451,11 +462,16 @@ struct Inv {
     Value *Cap = nullptr;
     // [LLM-generated] M7.2i: the fact came from a callee store mark (stats).
     bool Mark = false;
+    // [LLM-generated] M7.2m: the fact came from a byte copy (!mem.store_into.bytes):
+    // the slot may be misaligned, so check its address before the load.
+    bool Bytes = false;
   };
   SmallVector<StoreIntoWipe, 4> PendingStoreInto;
   // [LLM-generated] M7.2i: clears planted from callee store mark facts, and the
   // functions they sit in (stats only; the census of where marks fire).
   unsigned StoreIntoMarkNulls = 0;
+  // [LLM-generated] M7.2m: clears planted from byte-copy facts (stats only).
+  unsigned StoreIntoBytesNulls = 0;
   SmallVector<std::string, 4> StoreIntoMarkFns;
   // [LLM-generated] M7.2c: one address/high/tag snapshot per fact and cap.
   DenseMap<std::pair<Instruction *, Value *>, std::array<Value *, 3>>
@@ -3474,6 +3490,10 @@ struct Inv {
       }
       if (!Cap || (SlotFact && (!Base || !Index)) || (!SlotFact && !Dest))
         continue;
+      // [LLM-generated] M7.2m: see InvStoreIntoBytes.
+      bool Bytes = Fact->getMetadata("mem.store_into.bytes") != nullptr;
+      if (Bytes && (!InvStoreIntoBytes || !SlotFact))
+        continue;
       bool AnyEnd = false;
       // Consuming call first: mem.free of the referent may live in a
       // callee (eat_u64 / drop of a Box). Only a call known to free that
@@ -3489,6 +3509,7 @@ struct Inv {
         StoreIntoWipe W;
         W.Free = At;
         W.Mark = Fact->getMetadata("mem.stores_into.mark") != nullptr;
+        W.Bytes = Bytes;
         // The integer snapshot sits at the fact, so it must dominate.
         if (DT.dominates(Fact, At))
           W.Fact = Fact;
@@ -3512,7 +3533,7 @@ struct Inv {
           // memory may already be freed (a free of it, or a call that consumes
           // it, between the fact and this free): the slot load could go
           // through a revoked capability.
-          if (Fact->getMetadata("mem.stores_into.mark") &&
+          if ((W.Mark || W.Bytes) &&
               baseFreedBetween(Base, Fact, At, Frees, DT)) {
             ++StoreIntoSkippedUnready;
             continue;
@@ -3609,6 +3630,17 @@ struct Inv {
         B.CreateBr(Cont);
         continue;
       }
+      // [LLM-generated] M7.2m: a byte-copy slot is loaded and nulled only when
+      // capability-aligned (committed path, before the free; an address read).
+      if (S.Bytes) {
+        Value *A = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {I64}),
+                                {Dest});
+        Value *Ok = B.CreateICmpEQ(B.CreateAnd(A, ConstantInt::get(I64, 15)),
+                                   ConstantInt::get(I64, 0));
+        auto *ChkBB = BasicBlock::Create(Ctx, "storeinto.bytes", Fn, NullBB);
+        B.CreateCondBr(Ok, ChkBB, Cont);
+        B.SetInsertPoint(ChkBB);
+      }
       Value *Got =
           B.CreateAlignedLoad(CapTy, Dest, Align(16), "storeinto.got");
       Value *Eq;
@@ -3637,6 +3669,8 @@ struct Inv {
       markClear(St, "cheri_inv_store_into");
       B.CreateBr(Cont);
       ++StoreIntoNulls;
+      if (S.Bytes)
+        ++StoreIntoBytesNulls;
       if (S.Mark) {
         ++StoreIntoMarkNulls;
         std::string Name = Fn->getName().str();
@@ -4471,6 +4505,11 @@ struct Inv {
         Line += (I ? "," : "") + StoreIntoMarkFns[I];
       memannot::appendInvalidateStatsLine(Line);
     }
+    // [LLM-generated] M7.2m: same, for byte-copy clears.
+    if (StoreIntoBytesNulls)
+      memannot::appendInvalidateStatsLine(
+          "cheri-store-into-bytes-nulls: " + M.getModuleIdentifier() +
+          " nulls=" + std::to_string(StoreIntoBytesNulls));
   }
 };
 } // namespace
