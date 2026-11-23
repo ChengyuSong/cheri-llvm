@@ -4208,6 +4208,16 @@ void Verifier::visitCallBase(CallBase &Call) {
               Call);
         continue;
       }
+      if (T == memannot::TagEscapeUnknown ||
+          T == memannot::TagEscapeUnknownLost) {
+        // [LLM-generated] M7.2n: the pointer that escaped to an unknown place
+        // (poison in the ".lost" form).
+        Check(IsFact && In.size() == 1 && IsPtr(In[0]),
+              "\"mem.escape_unknown\" bundle must be (ptr cap) on "
+              "llvm.mem.fact",
+              Call);
+        continue;
+      }
       if (T == memannot::LastUseMD) {
         // R15: anchor when a last-use program point has no carrier left.
         bool Ids = !In.empty();

@@ -54,6 +54,13 @@ bool memannot::isMemWipeCapWordsFact(const Instruction *I) {
   return CB && isMemFact(CB) && CB->getOperandBundle(TagWipeCapWords);
 }
 
+bool memannot::isMemEscapeUnknownFact(const Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  return CB && isMemFact(CB) &&
+         (CB->getOperandBundle(TagEscapeUnknown) ||
+          CB->getOperandBundle(TagEscapeUnknownLost));
+}
+
 const Value *memannot::slotClobber(const Instruction *I) {
   auto *CB = dyn_cast<CallBase>(I);
   if (!CB || !isMemFact(CB))

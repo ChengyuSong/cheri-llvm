@@ -117,6 +117,15 @@ inline constexpr StringRef TagFfiRetain = "mem.ffi_retain";
 /// through an outlined non-volatile helper. Not droppable: losing it
 /// loses the wipe. Generic passes must preserve base and len SSA.
 inline constexpr StringRef TagWipeCapWords = "mem.wipe_cap_words";
+/// [LLM-generated] M7.2n: "mem.escape_unknown"(ptr cap) on llvm.mem.fact. rustc
+/// saw cap leave to a place it cannot name (a byte copy of unknown length, a
+/// raw-pointer argument of an indirect call). The late CHERI pass lowers it to
+/// a runtime note so the heap block holding cap is never reused. Not droppable:
+/// losing it loses the note. If a generic pass drops the operand, the tag
+/// becomes "mem.escape_unknown.lost" (operand poison) and the late pass falls
+/// back to the global no-reuse note.
+inline constexpr StringRef TagEscapeUnknown = "mem.escape_unknown";
+inline constexpr StringRef TagEscapeUnknownLost = "mem.escape_unknown.lost";
 /// [LLM-generated] M7.2f: "mem.spec_frees"="frees"|"relocates"|"drop" function
 /// attribute. rustc puts it on functions whose library spec frees or relocates a
 /// heap block (and on drop glue that reaches one). Generic LLVM keeps it like any
@@ -246,6 +255,9 @@ LLVM_ABI bool isMemStoreIntoFact(const Instruction *I);
 LLVM_ABI bool isMemStoreIntoSlotFact(const Instruction *I);
 /// [LLM-generated] M7.2a-w1: llvm.mem.fact ["mem.wipe_cap_words"(ptr, i64 len)].
 LLVM_ABI bool isMemWipeCapWordsFact(const Instruction *I);
+/// [LLM-generated] M7.2n: llvm.mem.fact ["mem.escape_unknown"(ptr)] or its
+/// ".lost" form.
+LLVM_ABI bool isMemEscapeUnknownFact(const Instruction *I);
 /// Frame slot clobbered by a mem.move or mem.loan_into fact, otherwise null.
 /// Header copies must not be reordered across that program point.
 LLVM_ABI const Value *slotClobber(const Instruction *I);
