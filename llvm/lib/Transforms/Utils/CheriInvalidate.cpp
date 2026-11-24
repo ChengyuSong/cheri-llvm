@@ -38,6 +38,10 @@
 //   * M7.2n: llvm.mem.fact ["mem.escape_unknown"(ptr cap)] becomes a call to
 //     the runtime's cheri_note_escape(cap) under -cheri-invalidate-noreuse
 //     (a lost operand: cheri_note_escape_anywhere()). Off: dropped.
+//   * M7.2o: under -cheri-invalidate-noreuse-slots, the two-operand form
+//     "mem.escape_unknown"(cap, slot) and every store_into / store_into_slot
+//     fact the free-time planning could not fully plan become calls to
+//     cheri_note_escape_slot(cap, slot) at the fact. Off: unchanged.
 // Only capabilities into dead storage (or of an ended loan) are touched
 // (fail-safe). -cheri-invalidate=none|scope|slite|free|loan|all, or a
 // '+'-list. Default is loan+free+scope+aflog (M7.1c: own-slot nulls on).
@@ -280,6 +284,21 @@ static cl::opt<bool> InvNoReuse(
     "cheri-invalidate-noreuse", cl::init(false), cl::Hidden,
     cl::desc("M7.2n: lower mem.escape_unknown facts to cheri_note_escape "
              "runtime calls (default off: drop them)"));
+// [LLM-generated] M7.2o: (cap, slot) runtime notes. On: a
+// "mem.escape_unknown"(cap, slot) fact becomes cheri_note_escape_slot(cap,
+// slot) (the runtime nulls slot at the epoch that quarantines cap's block, then
+// may reuse the block), and so does each store_into / store_into_slot fact the
+// planning skipped (slot address not ready at the free, no free in this
+// function, or a byte-copy fact it does not plan). A fact whose slot is a frame
+// alloca of the same function gets no call (the frame clears own it). The call
+// reads no address and clears no tag. Off (default): the two-operand fact
+// follows -cheri-invalidate-noreuse as a plain block note, and store facts get
+// nothing.
+static cl::opt<bool> InvNoReuseSlots(
+    "cheri-invalidate-noreuse-slots", cl::init(false), cl::Hidden,
+    cl::desc("M7.2o: lower slot-bearing escape facts and unplanned store_into "
+             "facts to cheri_note_escape_slot(cap, slot) runtime calls "
+             "(default off)"));
 static cl::opt<bool> InvFfiNarrow(
     "cheri-invalidate-ffi-narrow", cl::init(true), cl::Hidden,
     cl::desc("M7.1d B3a: drop Global on mem.ffi_borrow cap arguments at "
@@ -3509,6 +3528,9 @@ struct Inv {
       if (Bytes && (!InvStoreIntoBytes || !SlotFact))
         continue;
       bool AnyEnd = false;
+      // [LLM-generated] M7.2o: a fact all of whose ends were planned is marked
+      // "mem.store_into.planned"; any other gets a slot note (InvNoReuseSlots).
+      unsigned SkipBefore = StoreIntoSkippedUnready;
       // Consuming call first: mem.free of the referent may live in a
       // callee (eat_u64 / drop of a Box). Only a call known to free that
       // box (drop / dealloc) is the source end of life; Box::leak is not.
@@ -3577,6 +3599,9 @@ struct Inv {
       }
       if (!AnyEnd)
         ++StoreIntoSkippedUnready;
+      else if (InvNoReuseSlots && StoreIntoSkippedUnready == SkipBefore)
+        Fact->setMetadata("mem.store_into.planned",
+                          MDNode::get(Fact->getContext(), {}));
     }
   }
 
@@ -5205,7 +5230,11 @@ static void lowerWipeCapWords(Module &M) {
 // [LLM-generated] M7.2n: lower (On) or drop every mem.escape_unknown fact.
 // Runs after the invalidation planning, so the inserted calls do not change
 // any clear decision. Returns {notes, global notes, dropped}.
-static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On) {
+// [LLM-generated] M7.2o: Slots lowers the two-operand form to
+// cheri_note_escape_slot(cap, slot) (SlotNotes counts them).
+static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On,
+                                                  bool Slots,
+                                                  unsigned &SlotNotes) {
   SmallVector<CallBase *, 16> Facts;
   for (Function &Fn : M) {
     if (Fn.isDeclaration())
@@ -5221,9 +5250,35 @@ static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On) {
   // its indirect calls hand it the arena and list heads, not escaping caps.
   if (Function *RT = M.getFunction("cheri_note_escape"); RT && !RT->isDeclaration())
     On = false;
+  // [LLM-generated] M7.2o: likewise for the slot note.
+  if (Function *RT = M.getFunction("cheri_note_escape_slot");
+      RT && !RT->isDeclaration())
+    On = Slots = false;
   LLVMContext &C = M.getContext();
   Type *Void = Type::getVoidTy(C);
   for (CallBase *CB : Facts) {
+    // [LLM-generated] M7.2o: the (cap, slot) form. A lost slot keeps the block
+    // note on cap (below); a lost cap keeps the global note.
+    Value *SCap = nullptr, *SSlot = nullptr;
+    if (auto OB = CB->getOperandBundle(memannot::TagEscapeUnknown))
+      if (OB->Inputs.size() == 2) {
+        SCap = OB->Inputs[0];
+        SSlot = OB->Inputs[1];
+      }
+    if (auto OB = CB->getOperandBundle(memannot::TagEscapeUnknownLost))
+      if (OB->Inputs.size() == 2 && !isa<UndefValue>(OB->Inputs[0]))
+        SCap = OB->Inputs[0];
+    bool CapOk = SCap && SCap->getType()->isPointerTy() && !isa<UndefValue>(SCap);
+    if (Slots && CapOk && SSlot && SSlot->getType()->isPointerTy() &&
+        !isa<UndefValue>(SSlot)) {
+      IRBuilder<> B(CB);
+      FunctionCallee F = M.getOrInsertFunction(
+          "cheri_note_escape_slot", Void, SCap->getType(), SSlot->getType());
+      B.CreateCall(F, {SCap, SSlot});
+      ++SlotNotes;
+      CB->eraseFromParent();
+      continue;
+    }
     if (!On) {
       ++N[2];
       CB->eraseFromParent();
@@ -5233,6 +5288,8 @@ static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On) {
     if (auto OB = CB->getOperandBundle(memannot::TagEscapeUnknown))
       if (OB->Inputs.size() == 1)
         Cap = OB->Inputs[0];
+    if (CapOk)
+      Cap = SCap;
     IRBuilder<> B(CB);
     if (!Cap || !Cap->getType()->isPointerTy() || isa<UndefValue>(Cap)) {
       FunctionCallee F =
@@ -5248,6 +5305,101 @@ static std::array<unsigned, 3> lowerEscapeUnknown(Module &M, bool On) {
     CB->eraseFromParent();
   }
   return N;
+}
+
+// [LLM-generated] M7.2o: each store_into / store_into_slot fact not marked
+// "mem.store_into.planned" by the planning becomes
+// cheri_note_escape_slot(cap, slot) at the fact (slot = dest, or
+// GEP(i8, base, off)). Not for a slot in a frame alloca of this function, a
+// lost or non-pointer operand, or the runtime's own module. Runs after the
+// planning, so the calls change no clear decision. Returns {notes, frame,
+// planned, lost}.
+static std::array<unsigned, 4> lowerUnplannedStoreInto(Module &M) {
+  std::array<unsigned, 4> N = {0, 0, 0, 0};
+  if (Function *RT = M.getFunction("cheri_note_escape_slot");
+      RT && !RT->isDeclaration())
+    return N;
+  SmallVector<CallBase *, 16> Facts;
+  for (Function &Fn : M) {
+    if (Fn.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(Fn))
+      if (memannot::isMemStoreIntoFact(&I) || memannot::isMemStoreIntoSlotFact(&I))
+        Facts.push_back(cast<CallBase>(&I));
+  }
+  LLVMContext &C = M.getContext();
+  Type *Void = Type::getVoidTy(C);
+  Type *I8 = Type::getInt8Ty(C);
+  for (CallBase *CB : Facts) {
+    if (CB->getMetadata("mem.store_into.planned")) {
+      ++N[2];
+      continue;
+    }
+    Value *Cap = nullptr, *Dest = nullptr, *Base = nullptr, *Off = nullptr;
+    if (auto OB = CB->getOperandBundle(memannot::TagStoreIntoSlot)) {
+      if (OB->Inputs.size() >= 3) {
+        Base = OB->Inputs[0];
+        Off = OB->Inputs[1];
+        Cap = OB->Inputs[2];
+      }
+    } else if (auto OB = CB->getOperandBundle(memannot::TagStoreInto)) {
+      if (OB->Inputs.size() >= 2) {
+        Dest = OB->Inputs[0];
+        Cap = OB->Inputs[1];
+      }
+    }
+    Value *Root = Dest ? Dest : Base;
+    if (!Cap || !Root || !Cap->getType()->isPointerTy() ||
+        !Root->getType()->isPointerTy() || isa<UndefValue>(Cap) ||
+        isa<UndefValue>(Root) || isa<ConstantPointerNull>(Cap) ||
+        (Off && (!Off->getType()->isIntegerTy() || isa<UndefValue>(Off)))) {
+      ++N[3];
+      continue;
+    }
+    if (isa<AllocaInst>(getUnderlyingObject(Root))) {
+      ++N[1];
+      continue;
+    }
+    IRBuilder<> B(CB);
+    Value *Slot = Dest ? Dest : B.CreateGEP(I8, Base, Off, "cheri.note.slot");
+    FunctionCallee F = M.getOrInsertFunction("cheri_note_escape_slot", Void,
+                                             Cap->getType(), Slot->getType());
+    B.CreateCall(F, {Cap, Slot});
+    ++N[0];
+  }
+  return N;
+}
+
+// [LLM-generated] M7.2o: weak no-op fallbacks for the runtime note hooks. A
+// module where the pass lowered at least one call to cheri_note_escape,
+// cheri_note_escape_anywhere or cheri_note_escape_slot gets a weak definition
+// of that hook whose body only returns, so a program that does not link the
+// cheri_revoke runtime still links (the notes then do nothing; without the
+// runtime no freed block is reused, so there is nothing to protect). When the
+// runtime object is linked, its strong definition wins and the stub's section
+// is dropped by --gc-sections. Weak (interposable) linkage keeps every caller
+// from inlining or dropping the call. Only hooks the pass itself called get a
+// stub: a module that declares and calls a hook on its own, or lowered no
+// note, is left as is (no new symbol), and the runtime's module (which defines
+// the hooks) never gets here as a declaration.
+static void emitWeakNoteStub(Module &M, StringRef Name) {
+  Function *F = M.getFunction(Name);
+  if (!F || !F->isDeclaration() || F->isIntrinsic())
+    return;
+  LLVMContext &C = M.getContext();
+  F->setLinkage(GlobalValue::WeakAnyLinkage);
+  F->addFnAttr(Attribute::NoUnwind);
+  // Same code generation settings as the module's own functions.
+  for (Function &Fn : M) {
+    if (Fn.isDeclaration() || &Fn == F)
+      continue;
+    for (StringRef A : {"target-cpu", "target-features", "frame-pointer"})
+      if (Fn.hasFnAttribute(A) && !F->hasFnAttribute(A))
+        F->addFnAttr(Fn.getFnAttribute(A));
+    break;
+  }
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  ReturnInst::Create(C, BB);
 }
 
 bool memannot::runCheriInvalidate(Module &M) {
@@ -5345,11 +5497,34 @@ bool memannot::runCheriInvalidate(Module &M) {
     dropWipeCapWordsFacts(M);
   // [LLM-generated] M7.2n: after planning, before the strip. -cheri-invalidate=none
   // drops the facts like every other LLVM half. Stats line only when a fact existed.
-  std::array<unsigned, 3> NR = lowerEscapeUnknown(M, InvNoReuse && Mode != "none");
+  bool Slots = InvNoReuseSlots && Mode != "none";
+  unsigned EscSlotNotes = 0;
+  std::array<unsigned, 3> NR =
+      lowerEscapeUnknown(M, InvNoReuse && Mode != "none", Slots, EscSlotNotes);
   if (NR[0] || NR[1] || NR[2])
     memannot::appendInvalidateStatsLine(
         ("cheri-noreuse: " + M.getModuleIdentifier() + " notes=" + Twine(NR[0]) +
          " global=" + Twine(NR[1]) + " dropped=" + Twine(NR[2]))
+            .str());
+  // [LLM-generated] M7.2o: store facts are only planned when Inv ran its
+  // store_into planning (loan or free); otherwise nothing is noted. Its own
+  // stats line, only when something was counted.
+  std::array<unsigned, 4> SN = {0, 0, 0, 0};
+  if (Slots && InvStoreInto && (Loan || Free))
+    SN = lowerUnplannedStoreInto(M);
+  // [LLM-generated] M7.2o: weak no-op fallbacks, only for hooks lowered here.
+  if (NR[0])
+    emitWeakNoteStub(M, "cheri_note_escape");
+  if (NR[1])
+    emitWeakNoteStub(M, "cheri_note_escape_anywhere");
+  if (EscSlotNotes || SN[0])
+    emitWeakNoteStub(M, "cheri_note_escape_slot");
+  if (EscSlotNotes || SN[0] || SN[1] || SN[3])
+    memannot::appendInvalidateStatsLine(
+        ("cheri-noreuse-slots: " + M.getModuleIdentifier() +
+         " escape_slot_notes=" + Twine(EscSlotNotes) +
+         " store_notes=" + Twine(SN[0]) + " store_frame=" + Twine(SN[1]) +
+         " store_planned=" + Twine(SN[2]) + " store_lost=" + Twine(SN[3]))
             .str());
   // After invalidation, before stripAnnotations drops mem.free bundles and
   // mem.move facts. The attribute is copied when a bundled call is rebuilt.

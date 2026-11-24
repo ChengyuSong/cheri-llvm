@@ -124,6 +124,12 @@ inline constexpr StringRef TagWipeCapWords = "mem.wipe_cap_words";
 /// losing it loses the note. If a generic pass drops the operand, the tag
 /// becomes "mem.escape_unknown.lost" (operand poison) and the late pass falls
 /// back to the global no-reuse note.
+/// [LLM-generated] M7.2o: an optional second operand names the 16-byte slot
+/// the pointer was copied into ("mem.escape_unknown"(ptr cap, ptr slot), from an
+/// unknown-length byte copy). With -cheri-invalidate-noreuse-slots the late pass
+/// lowers that form to cheri_note_escape_slot(cap, slot): the runtime nulls the
+/// slot at the epoch and may still reuse the block. A lost slot keeps the
+/// block note; a lost cap keeps the global note.
 inline constexpr StringRef TagEscapeUnknown = "mem.escape_unknown";
 inline constexpr StringRef TagEscapeUnknownLost = "mem.escape_unknown.lost";
 /// [LLM-generated] M7.2f: "mem.spec_frees"="frees"|"relocates"|"drop" function
