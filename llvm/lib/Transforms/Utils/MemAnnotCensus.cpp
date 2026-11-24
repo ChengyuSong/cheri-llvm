@@ -770,9 +770,11 @@ bool memannot::stripAnnotations(Module &M) {
   unsigned LastUseKind = M.getContext().getMDKindID(memannot::LastUseMD);
   unsigned IdKind = M.getContext().getMDKindID(memannot::IdMD);
   unsigned LoanKind = M.getContext().getMDKindID(memannot::LoanMD);
+  // [LLM-generated] M7.3: the owning-slot fact is read by CheriInvalidate only.
+  unsigned OwningKind = M.getContext().getMDKindID(memannot::OwningMD);
   for (Function &F : M)
     for (Instruction &I : instructions(F)) {
-      for (unsigned MK : {GuardKind, LastUseKind, IdKind, LoanKind})
+      for (unsigned MK : {GuardKind, LastUseKind, IdKind, LoanKind, OwningKind})
         if (I.getMetadata(MK)) {
           I.setMetadata(MK, nullptr);
           Changed = true;

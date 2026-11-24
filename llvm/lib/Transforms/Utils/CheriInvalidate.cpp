@@ -183,6 +183,16 @@ static cl::opt<bool> InvLoanEscape(
 static cl::opt<bool> InvLoanDebug(
     "cheri-invalidate-loan-debug", cl::init(false), cl::Hidden,
     cl::desc("M5r R6: print why each !mem.loan slot is (not) a loan slot"));
+// [LLM-generated] M7.3: rustc marks a frame slot !mem.owning when its type can
+// only hold owning heap pointers, pointers to statics or function pointers
+// (-Zcheri-owning-slots). No capability to a frame object can be in it, so the
+// scope-end range check of that slot against a dying frame object is dropped.
+// Own-nulls of the slot itself and range checks at frees stay. A slot that the
+// IR visibly stores a frame address into keeps its checks (IR beats the fact).
+static cl::opt<bool> InvOwningSlots(
+    "cheri-invalidate-owning-slots", cl::init(true), cl::Hidden,
+    cl::desc("M7.3: skip scope-end range checks of !mem.owning slots against "
+             "dying frame objects (default on; false ignores the fact)"));
 static cl::opt<bool> InvAsmNoEscape(
     "cheri-invalidate-asm-noescape", cl::init(true), cl::Hidden,
     cl::desc("R5 (D37): an inline asm with an empty template (black_box) does "
@@ -432,6 +442,9 @@ struct Inv {
            AsmNoEscape = 0;
   // M6.1 D90: register clears emitted, by kind.
   unsigned CapRegLoan = 0, CapRegFree = 0, CapRegScope = 0;
+  // [LLM-generated] M7.3: scope range checks skipped for !mem.owning slots, and
+  // marked slots whose IR stores show a frame address (fact ignored).
+  unsigned OwningSkipped = 0, OwningIgnored = 0;
   // M7.1a: source slots nulled at a "mem.move" fact, and facts skipped
   // because the slot may still be read after the fact.
   unsigned MoveNulls = 0, MoveNullSkippedLive = 0;
@@ -803,6 +816,23 @@ struct Inv {
   // R4 filter: can slot S hold a capability into the frame object A?
   // An argument or global cannot (A is created in this frame); an unknown
   // origin (a load, a call result) can only if A's address escapes.
+  // [LLM-generated] M7.3: slot S (every offset in Offs) is !mem.owning and no
+  // capability store into it is visibly derived from a frame object: it cannot
+  // hold a capability to the dying frame object, so it gets no range check.
+  bool owningSkip(AllocaInst *S, ArrayRef<int64_t> Offs) {
+    if (!InvOwningSlots || !S->hasMetadata(memannot::OwningMD))
+      return false;
+    for (int64_t Off : Offs) {
+      auto PI = SlotProv.find({S, Off});
+      if (PI != SlotProv.end() &&
+          any_of(PI->second.Objs, [](const Value *O) { return isa<AllocaInst>(O); })) {
+        ++OwningIgnored;
+        return false;
+      }
+    }
+    OwningSkipped += Offs.size();
+    return true;
+  }
   bool mayHoldFrame(Slot S, AllocaInst *A) {
     if (!InvFilter)
       return true;
@@ -4254,6 +4284,8 @@ struct Inv {
             for (auto &[S, Offs] : CapSlots) {
               if (S == A || !liveAt(S, E, DT) || !readLater(S, E, DT))
                 continue;
+              if (owningSkip(S, Offs))
+                continue;
               if (!Lo)
                 Lo = B.CreateCall(decl(Intrinsic::cheri_cap_address_get, {B.getInt64Ty()}), {A});
               for (int64_t Off : Offs)
@@ -4531,6 +4563,8 @@ struct Inv {
          << " sret_slots=" << SretSlots
          << " loan_into_exit_anchor=" << LoanIntoExitAnchors
          << " store_into_int=" << StoreIntoIntCompares
+         << " owning_skipped=" << OwningSkipped
+         << " owning_ignored=" << OwningIgnored
          << "\n";
     }
     // [LLM-generated] M7.2i: a separate line, only when a mark clear was
