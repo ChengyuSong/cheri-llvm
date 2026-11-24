@@ -59,23 +59,55 @@ bool memannot::censusAtPipelineStart() { return CensusAtStart; }
 bool memannot::censusPerPass() { return CensusPerPass; }
 
 namespace {
-constexpr unsigned NumCensusKindsLocal = 8;
+constexpr unsigned NumCensusKindsLocal = 14;
+// [LLM-generated] M7.3: K_Move..K_LifetimeEnd are flow kinds. They are
+// counted at both census points and per pass, and a lost fact is classified
+// (dropped, erased, block-deleted, unreachable) with the pass that erased
+// it, but a loss is never fatal: a promoted slot needs no fact.
 enum Kind : unsigned {
   K_Check, K_Guard, K_Claim, K_AllocInbounds, K_Inbounds, K_Free,
-  K_LastUse, K_Dropped, K_NumKinds
+  K_LastUse, K_Dropped, K_Move, K_StoreInto, K_LoanInto, K_Wipe, K_Escape,
+  K_LifetimeEnd, K_NumKinds
 };
+static_assert(K_NumKinds == memannot::NumCensusKinds, "census kinds");
 const char *KindName[K_NumKinds] = {"check",    "guard",  "claim",
                                     "alloc_inbounds", "inbounds", "free",
-                                    "last_use", "dropped"};
+                                    "last_use", "dropped", "move",
+                                    "store_into", "loan_into", "wipe",
+                                    "escape", "lifetime_end"};
 // Kinds counted only (fail-safe hints; cloning may add some).
 bool isHintKind(unsigned K) { return K == K_Guard || K == K_LastUse; }
+// [LLM-generated] M7.3: fact kinds tracked for flow only.
+bool isFlowKind(unsigned K) { return K >= K_Move && K < K_NumKinds; }
 
 bool kindFromTag(StringRef T, Kind &K) {
   if (T == memannot::TagAllocInbounds) K = K_AllocInbounds;
   else if (T == memannot::TagInbounds) K = K_Inbounds;
   else if (T == memannot::TagDropped) K = K_Dropped;
+  // [LLM-generated] M7.3: the inliner turns a "mem.free" call bundle into a
+  // standalone llvm.mem.fact ["mem.free"] (it keeps the census id), so the
+  // fact form is the same free, not a loss.
+  else if (T == memannot::TagFree) K = K_Free;
+  else if (T == memannot::TagMove) K = K_Move;
+  else if (T == memannot::TagStoreInto || T == memannot::TagStoreIntoSlot)
+    K = K_StoreInto;
+  else if (T == memannot::TagLoanInto || T == memannot::TagLoanIntoVal ||
+           T == memannot::TagLoanIntoPromoted)
+    K = K_LoanInto;
+  else if (T == memannot::TagWipeCapWords) K = K_Wipe;
+  else if (T == memannot::TagEscapeUnknown ||
+           T == memannot::TagEscapeUnknownLost)
+    K = K_Escape;
   else return false;
   return true;
+}
+
+// [LLM-generated] M7.3: lifetime.end markers are counted (no id: tagging
+// them would add metadata to every marker).
+bool isLifetimeEnd(const Instruction &I) {
+  if (auto *II = dyn_cast<IntrinsicInst>(&I))
+    return II->getIntrinsicID() == Intrinsic::lifetime_end;
+  return false;
 }
 
 // Watches a claim: a RAUW to a non-claim value means a pass folded the claim
@@ -103,6 +135,20 @@ struct ClaimVH final : CallbackVH {
     setValPtr(New);
   }
   void deleted() override { setValPtr(nullptr); }
+};
+
+// [LLM-generated] M7.3: watches one flow-kind fact so the late census can
+// name the pass that erased it.
+struct FactVH final : CallbackVH {
+  bool Deleted = false;
+  std::string DelPass;
+  explicit FactVH(Value *V) : CallbackVH(V) {}
+  void deleted() override {
+    Deleted = true;
+    DelPass = CurrentPass.empty() ? std::string("?") : CurrentPass;
+    setValPtr(nullptr);
+  }
+  void allUsesReplacedWith(Value *) override {}
 };
 
 struct Entry {
@@ -199,6 +245,7 @@ struct State {
     W = std::make_unique<LUWatch>(&I, LU);
   }
   std::map<uint64_t, std::unique_ptr<ClaimVH>> Claims; // id -> watcher
+  std::map<uint64_t, std::unique_ptr<FactVH>> FlowFacts; // M7.3: id -> watcher
   uint64_t NextId = 1;
   unsigned Start[K_NumKinds] = {};
   DenseSet<uint64_t> Redundant;      // fact ids erased as redundant
@@ -266,6 +313,8 @@ bool memannot::runCensusStart(Module &M) {
       Site = constSite(cast<CallBase>(I));
     if (K == K_Claim)
       S.Claims[Id] = std::make_unique<ClaimVH>(&I);
+    if (isFlowKind(K))
+      S.FlowFacts[Id] = std::make_unique<FactVH>(&I);
     S.Entries[Id] = Entry{K, WeakVH(I.getParent()),
                           I.getFunction()->getName().str(), Site};
     ++S.Start[K];
@@ -283,6 +332,8 @@ bool memannot::runCensusStart(Module &M) {
     for (Instruction &I : instructions(F)) {
       if (I.getMetadata(memannot::GuardMD))
         ++S.Start[K_Guard];
+      if (isLifetimeEnd(I))
+        ++S.Start[K_LifetimeEnd];
       CountLoans(I, StartLoans);
       S.watch(I);
       auto *CB = dyn_cast<CallBase>(&I);
@@ -361,6 +412,8 @@ static void runCensusLateImpl(Module &M) {
         }
       if (I.getMetadata(memannot::GuardMD))
         ++Late[K_Guard];
+      if (isLifetimeEnd(I))
+        ++Late[K_LifetimeEnd];
       if (MDNode *LU = I.getMetadata(memannot::LastUseMD))
         for (const MDOperand &Op : LU->operands())
           LateLoans.insert(loanKey(Op.get()));
@@ -452,7 +505,26 @@ static void runCensusLateImpl(Module &M) {
     return RI->second.count(BB) != 0;
   };
   std::vector<std::string> Unexplained;
+  // [LLM-generated] M7.3: flow-kind losses: reason and the erasing pass.
+  unsigned FlowLost[K_NumKinds][R_Num] = {};
+  std::map<std::string, unsigned> FlowByPass[K_NumKinds];
   for (auto &[Id, E] : SP->Entries) {
+    if (isFlowKind(E.K)) {
+      if (Seen.count(Id) && !SeenDropped.count(Id))
+        continue;
+      BasicBlock *FB = cast_or_null<BasicBlock>((Value *)E.BB);
+      unsigned R = SeenDropped.count(Id)      ? R_Dropped
+                   : !FB || !FB->getParent()  ? R_BlockDeleted
+                   : !Reachable(FB)           ? R_Unreachable
+                                              : R_Dead;
+      ++FlowLost[E.K][R];
+      // The pass is the one that erased the start instance; only reported
+      // for "erased" (an inlined copy keeps the id after its original goes).
+      auto FI = SP->FlowFacts.find(Id);
+      if (R == R_Dead && FI != SP->FlowFacts.end() && FI->second->Deleted)
+        ++FlowByPass[E.K][FI->second->DelPass];
+      continue;
+    }
     if (SeenDropped.count(Id)) {
       ++Lost[E.K][R_Dropped];
       continue;
@@ -574,6 +646,8 @@ static void runCensusLateImpl(Module &M) {
             << ",md-dropped=" << LUDropped << ")";
       continue;
     }
+    if (isFlowKind(K))
+      continue; // M7.3: reported on the "flow:" line
     if (isHintKind(K)) {
       // Hints are not tracked individually (cloning may add some); a net
       // decrease is reported as fail-safe.
@@ -624,6 +698,34 @@ static void runCensusLateImpl(Module &M) {
   }
   OS << "mem-annot-census: " << M.getModuleIdentifier() << " lost:"
      << (LostStr.empty() ? std::string(" none") : LostStr) << "\n";
+  // [LLM-generated] M7.3: flow kinds: start -> late, each lost fact's reason
+  // ("dead" = the fact itself was erased in a live block) and the passes
+  // that erased facts ("promoted" = the fact became a mem.dropped
+  // placeholder because its slot was promoted). lifetime_end has no ids
+  // (counts only).
+  OS << "mem-annot-census: " << M.getModuleIdentifier() << " flow:";
+  for (unsigned K = K_Move; K < K_NumKinds; ++K) {
+    OS << " " << KindName[K] << "=" << SP->Start[K] << "->" << Late[K];
+    unsigned Sum = 0;
+    for (unsigned R = 0; R < R_Num; ++R)
+      Sum += FlowLost[K][R];
+    if (!Sum && FlowByPass[K].empty())
+      continue;
+    OS << "(";
+    bool First = true;
+    for (unsigned R = 0; R < R_Num; ++R)
+      if (FlowLost[K][R]) {
+        OS << (First ? "" : ",")
+           << (R == R_Dead ? "erased" : R == R_Dropped ? "promoted" : RName[R])
+           << "="
+           << FlowLost[K][R];
+        First = false;
+      }
+    for (auto &[P, N] : FlowByPass[K])
+      OS << ";" << P << "=" << N;
+    OS << ")";
+  }
+  OS << "\n";
   for (const std::string &U : Unexplained)
     OS << "mem-annot-census: unexplained loss: " << U << "\n";
   OS.flush();
@@ -777,6 +879,8 @@ void memannot::countAnnotations(const Function &F, unsigned *Out) {
   for (const Instruction &I : instructions(F)) {
     if (I.getMetadata(memannot::GuardMD))
       ++Out[K_Guard];
+    if (isLifetimeEnd(I))
+      ++Out[K_LifetimeEnd];
     if (I.getMetadata(memannot::LastUseMD)) {
       ++Out[K_LastUse];
       if (St) {
