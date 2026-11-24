@@ -12,6 +12,8 @@ define void @cheri_note_escape_slot(ptr addrspace(200) %p, ptr addrspace(200) %s
   ret void
 }
 
+; [LLM-generated] M7.2o: its own definition stays strong; no weak stub.
+; CHECK: define void @cheri_note_escape_slot(
 ; CHECK-LABEL: define void @epoch(
 ; CHECK-NOT: call {{.*}}@cheri_note_escape
 ; CHECK-NOT: mem.escape_unknown
@@ -22,3 +24,5 @@ define void @epoch(ptr addrspace(200) %arena, ptr addrspace(200) %heap) {
   call void @llvm.mem.fact() [ "mem.store_into"(ptr addrspace(200) %heap, ptr addrspace(200) %arena) ]
   ret void
 }
+
+; CHECK-NOT: weak

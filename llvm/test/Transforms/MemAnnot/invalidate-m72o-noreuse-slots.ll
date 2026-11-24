@@ -148,7 +148,10 @@ define void @store_frame(ptr addrspace(200) %buf) {
   ret void
 }
 
-; SLOTS: declare void @cheri_note_escape_slot(ptr addrspace(200), ptr addrspace(200))
+; [LLM-generated] M7.2o: weak no-op fallback for the lowered hook.
+; SLOTS: define weak void @cheri_note_escape_slot(ptr addrspace(200) %0, ptr addrspace(200) %1){{.*}} {
+; SLOTS-NEXT: entry:
+; SLOTS-NEXT: ret void
 ; OFF-NOT: declare {{.*}}cheri_note_escape
 ; NONE-NOT: cheri_note
 

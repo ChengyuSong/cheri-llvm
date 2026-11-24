@@ -59,8 +59,13 @@ define void @lost() {
   ret void
 }
 
-; ON: declare void @cheri_note_escape(ptr addrspace(200))
-; ON: declare void @cheri_note_escape_anywhere()
+; [LLM-generated] M7.2o: each lowered hook gets a weak no-op fallback.
+; ON: define weak void @cheri_note_escape(ptr addrspace(200) %0){{.*}} {
+; ON-NEXT: entry:
+; ON-NEXT: ret void
+; ON: define weak void @cheri_note_escape_anywhere(){{.*}} {
+; ON-NEXT: entry:
+; ON-NEXT: ret void
 ; OFF-NOT: declare {{.*}}cheri_note_escape
 
 ; STATS: cheri-noreuse: {{.*}} notes=2 global=2 dropped=0

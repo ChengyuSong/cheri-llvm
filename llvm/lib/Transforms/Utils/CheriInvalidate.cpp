@@ -5370,6 +5370,38 @@ static std::array<unsigned, 4> lowerUnplannedStoreInto(Module &M) {
   return N;
 }
 
+// [LLM-generated] M7.2o: weak no-op fallbacks for the runtime note hooks. A
+// module where the pass lowered at least one call to cheri_note_escape,
+// cheri_note_escape_anywhere or cheri_note_escape_slot gets a weak definition
+// of that hook whose body only returns, so a program that does not link the
+// cheri_revoke runtime still links (the notes then do nothing; without the
+// runtime no freed block is reused, so there is nothing to protect). When the
+// runtime object is linked, its strong definition wins and the stub's section
+// is dropped by --gc-sections. Weak (interposable) linkage keeps every caller
+// from inlining or dropping the call. Only hooks the pass itself called get a
+// stub: a module that declares and calls a hook on its own, or lowered no
+// note, is left as is (no new symbol), and the runtime's module (which defines
+// the hooks) never gets here as a declaration.
+static void emitWeakNoteStub(Module &M, StringRef Name) {
+  Function *F = M.getFunction(Name);
+  if (!F || !F->isDeclaration() || F->isIntrinsic())
+    return;
+  LLVMContext &C = M.getContext();
+  F->setLinkage(GlobalValue::WeakAnyLinkage);
+  F->addFnAttr(Attribute::NoUnwind);
+  // Same code generation settings as the module's own functions.
+  for (Function &Fn : M) {
+    if (Fn.isDeclaration() || &Fn == F)
+      continue;
+    for (StringRef A : {"target-cpu", "target-features", "frame-pointer"})
+      if (Fn.hasFnAttribute(A) && !F->hasFnAttribute(A))
+        F->addFnAttr(Fn.getFnAttribute(A));
+    break;
+  }
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  ReturnInst::Create(C, BB);
+}
+
 bool memannot::runCheriInvalidate(Module &M) {
   // [LLM-generated] M7.1c. An out-of-line "mem.free" call is the end of that
   // free: zero after it returns. A helper that only inherited the bundle
@@ -5480,6 +5512,13 @@ bool memannot::runCheriInvalidate(Module &M) {
   std::array<unsigned, 4> SN = {0, 0, 0, 0};
   if (Slots && InvStoreInto && (Loan || Free))
     SN = lowerUnplannedStoreInto(M);
+  // [LLM-generated] M7.2o: weak no-op fallbacks, only for hooks lowered here.
+  if (NR[0])
+    emitWeakNoteStub(M, "cheri_note_escape");
+  if (NR[1])
+    emitWeakNoteStub(M, "cheri_note_escape_anywhere");
+  if (EscSlotNotes || SN[0])
+    emitWeakNoteStub(M, "cheri_note_escape_slot");
   if (EscSlotNotes || SN[0] || SN[1] || SN[3])
     memannot::appendInvalidateStatsLine(
         ("cheri-noreuse-slots: " + M.getModuleIdentifier() +
