@@ -4212,8 +4212,11 @@ void Verifier::visitCallBase(CallBase &Call) {
           T == memannot::TagEscapeUnknownLost) {
         // [LLM-generated] M7.2n: the pointer that escaped to an unknown place
         // (poison in the ".lost" form).
-        Check(IsFact && In.size() == 1 && IsPtr(In[0]),
-              "\"mem.escape_unknown\" bundle must be (ptr cap) on "
+        // [LLM-generated] M7.2o: optionally (ptr cap, ptr slot), the slot an
+        // unknown-length byte copy put cap in.
+        Check(IsFact && (In.size() == 1 || In.size() == 2) && IsPtr(In[0]) &&
+                  (In.size() == 1 || IsPtr(In[1])),
+              "\"mem.escape_unknown\" bundle must be (ptr cap [, ptr slot]) on "
               "llvm.mem.fact",
               Call);
         continue;
