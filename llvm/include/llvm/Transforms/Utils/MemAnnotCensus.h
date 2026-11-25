@@ -70,9 +70,13 @@ LLVM_ABI bool censusPerPass();
 /// The pass now running (set by the per-pass instrumentation; for loss reports).
 LLVM_ABI void setCurrentPass(StringRef Pass);
 /// Number of annotation kinds counted by countAnnotations.
-inline constexpr unsigned NumCensusKinds = 8;
+/// [LLM-generated] M7.3: 8 -> 14 (move, store_into, loan_into, wipe, escape,
+/// lifetime_end are flow kinds: counted and attributed, never fatal).
+inline constexpr unsigned NumCensusKinds = 14;
 /// Count annotations in \p F (check, guard, claim, alloc_inbounds, inbounds,
-/// free, last_use, dropped), adding to \p Out.
+/// free, last_use, dropped, move, store_into, loan_into, wipe, escape,
+/// lifetime_end), adding to \p Out. A free counts in both forms: the call
+/// bundle and the standalone fact the inliner leaves.
 LLVM_ABI void countAnnotations(const Function &F, unsigned *Out);
 /// Record that pass \p Pass changed the counts of \p M by Before -> After.
 LLVM_ABI void notePassDelta(const Module *M, StringRef Pass,

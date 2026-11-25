@@ -159,6 +159,10 @@ inline constexpr StringRef LastUseExt = "mem.last_use.ext";
 /// [LLM-generated] M5r R5 (D35): rustc slot fact on a store: the stored value
 /// is the reference of borrowck loan(s) !{i64 L, ...} (Track B loan-end).
 inline constexpr StringRef LoanMD = "mem.loan";
+/// [LLM-generated] M7.3: `!mem.owning !{}` on an alloca: rustc's type says the
+/// slot can only hold owning heap pointers, pointers to statics or function
+/// pointers (never a capability to a frame object).
+inline constexpr StringRef OwningMD = "mem.owning";
 /// R5: the LLVM inliner re-keys a cloned body's loan ids in bits 42..62; the
 /// low bits keep the original id (census key). R16: if every non-zero high
 /// value is already used for that census key, the copy is an extended operand
